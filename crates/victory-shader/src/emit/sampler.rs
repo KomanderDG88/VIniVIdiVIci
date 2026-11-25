@@ -33,7 +33,30 @@ pub struct StaticSampler {
 // The floats come from fixed-point fields: never NaN.
 impl Eq for StaticSampler {}
 
+/// `VICTORY_CMP_SAMPLER_FIX` (on unless `0`): [`StaticSampler::make_comparison`] replaces
+/// the reduction; `0` ORs the comparison bit in as before. Read by the translator, so it joins
+/// the shader cache key (`build.rs`).
+fn cmp_sampler_fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CMP_SAMPLER_FIX").is_none_or(|v| v != "0"))
+}
+
 impl StaticSampler {
+    /// Makes this a comparison sampler. D3D12 keeps the reduction in filter
+    /// bits 7-8 (0 standard, 1 comparison, 2 minimum, 3 maximum), so the
+    /// comparison replaces whatever reduction the words carried: OR-ing
+    /// 0x80 in would turn a minimum sampler (0x100) into a maximum one
+    /// (0x180).
+    pub fn make_comparison(&mut self) {
+        self.replace_reduction(cmp_sampler_fix());
+    }
+
+    /// [`Self::make_comparison`], `fix` saying whether the reduction is replaced
+    /// (`VICTORY_CMP_SAMPLER_FIX`) or the comparison bit OR-ed in.
+    fn replace_reduction(&mut self, fix: bool) {
+        self.filter = if fix { self.filter & !0x180 | 0x80 } else { self.filter | 0x80 };
+    }
+
     /// Decodes the four sampler words.
     pub fn from_words(w: [u32; 4]) -> Self {
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
@@ -121,5 +144,27 @@ mod tests {
             ),
             (0x1D5, 16, 15.0)
         );
+    }
+
+    #[test]
+    fn comparison_replaces_the_reduction() {
+        // (decoded filter, after make_comparison): standard, minimum and
+        // maximum reductions, with point, linear and anisotropic filters.
+        for (filter, want, old) in [
+            (0x00, 0x80, 0x80),
+            (0x14, 0x94, 0x94),
+            (0x115, 0x95, 0x195),
+            (0x1D5, 0xD5, 0x1D5),
+            (0x95, 0x95, 0x95),
+        ] {
+            let mut s = StaticSampler::from_words([0, 0, 0, 0]);
+            s.filter = filter;
+            s.replace_reduction(true);
+            assert_eq!(s.filter, want, "filter {filter:#x}");
+            // `VICTORY_CMP_SAMPLER_FIX=0`: OR-ed in, as before.
+            s.filter = filter;
+            s.replace_reduction(false);
+            assert_eq!(s.filter, old, "filter {filter:#x}, switch off");
+        }
     }
 }
