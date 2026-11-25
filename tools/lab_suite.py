@@ -202,6 +202,49 @@ def code_checks(args, directory, owner):
     return results
 
 
+# Switches another case key or the runtime adapter already governs: a case's
+# `settings` may not set them (a second source would make the run ambiguous).
+RESERVED_SETTINGS = {'VICTORY_HEAP_SYNC_TABLES', 'VICTORY_INDIRECT_WINDOW', 'VICTORY_PROFILE',
+                     'VICTORY_FRAME_LOG', 'VICTORY_CAPTURE', 'VICTORY_KEYS', 'VICTORY_CARD_METER',
+                     'VICTORY_STACKS'}
+
+
+def case_settings(case):
+    """A case's optional `settings` ({"VICTORY_X": value}), validated, as name -> text.
+
+    Names are VICTORY_ switches; values are strings or integers whose text has no
+    spaces, quotes or semicolons (it travels in one `-Settings "N=V;..."` argument).
+    """
+    settings = case.get('settings', {})
+    if not isinstance(settings, dict):
+        raise ValueError('settings must be an object of VICTORY_ switches: ' + case['name'])
+    checked = {}
+    for name, value in settings.items():
+        if not isinstance(name, str) or not re.fullmatch(r'VICTORY_[A-Z0-9_]+', name):
+            raise ValueError(f'Invalid setting name {name!r} in case {case["name"]}')
+        if name in RESERVED_SETTINGS or name.startswith('VICTORY_PROFILE_'):
+            raise ValueError(f'Setting {name} is governed by another case key or the runner: {case["name"]}')
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError(f'Setting {name} must be a string or an integer: {case["name"]}')
+        text = str(value)
+        if not re.fullmatch(r'[A-Za-z0-9_.,:-]{0,64}', text):
+            raise ValueError(f'Invalid value {text!r} for setting {name} in case {case["name"]}')
+        checked[name] = text
+    return dict(sorted(checked.items()))
+
+
+def settings_argument(settings):
+    """`N1=V1;N2=V2` ordered by name, or None when a case asks for none."""
+    return ';'.join(f'{name}={value}' for name, value in sorted(settings.items())) or None
+
+
+def settings_mismatch(requested, launched):
+    """Requested settings the runner did not declare as applied (launch.json `settings`)."""
+    launched = launched if isinstance(launched, dict) else {}
+    return [f'{name} (asked {value!r}, launch.json {launched.get(name)!r})'
+            for name, value in requested.items() if str(launched.get(name)) != value]
+
+
 def runtime_checks(args, directory, owner):
     manifest = json.loads(Path(args.manifest).read_text(encoding='utf-8-sig'))
     runner = Path(manifest['runner']).resolve()
@@ -211,6 +254,8 @@ def runtime_checks(args, directory, owner):
         cases = [case for case in cases if case['name'] == args.case]
     if not cases:
         raise ValueError('No runtime cases selected')
+    # Every case's settings are checked before any GPU reservation or launch.
+    requested = {case['name']: case_settings(case) for case in cases}
     for index, case in enumerate(cases):
         if not re.fullmatch(r'[a-z0-9-]+', case['name']):
             raise ValueError('Case names use lowercase letters, digits and hyphens')
@@ -233,9 +278,12 @@ def runtime_checks(args, directory, owner):
             command.append('-Profile')
         if case.get('indirect_window'):
             command.append('-IndirectWindow')
+        settings = requested[case['name']]
+        if settings:
+            command.extend(['-Settings', settings_argument(settings)])
         with gpu_lease(manifest['lease_script'], owner):
             row = run_command(command, args.repo, folder, duration + 120)
-        row.update(name=case['name'], runner_sha256=sha256(runner))
+        row.update(name=case['name'], runner_sha256=sha256(runner), requested_settings=settings)
         runs = list(run_root.glob(label + '-*')) if run_root.exists() else []
         if row['status'] == 'passed' and len(runs) == 1:
             try:
@@ -243,6 +291,10 @@ def runtime_checks(args, directory, owner):
                 end = row['runtime']['end']
                 failed = end['reason'] not in ('time_limit', 'exited') or (end['reason'] == 'exited' and end['exit_code'] != 0)
                 row['status'] = 'failed' if failed else 'inconclusive'
+                # A setting asked for and not applied cannot pass for measured.
+                missing = settings_mismatch(settings, row['runtime'].get('settings'))
+                if missing:
+                    row.update(status='failed', reason='Requested settings not applied by the runner: ' + ', '.join(missing))
             except (OSError, ValueError, KeyError) as error:
                 row.update(status='failed', error='Missing or invalid runtime evidence: ' + str(error))
         elif row['status'] == 'passed':

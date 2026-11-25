@@ -37,13 +37,28 @@ python -B tools/lab_suite.py runtime --manifest C:\Temp\runtime-cases.json --out
 The manifest is a local file, not an artifact to publish. Its top-level keys are
 `runner` (a trusted PowerShell runtime runner), `lease_script` and `cases`.
 Each case contains `name`, `binary`, `commit`, `sha256`, and optionally `console`
-(`series-x` or `series-s`), `heap_sync_tables`, `max_seconds`, `profile`, and
-`indirect_window`. `--case NAME` selects one case. Use the same build and scene
+(`series-x` or `series-s`), `heap_sync_tables`, `max_seconds`, `profile`,
+`indirect_window` and `settings`. `--case NAME` selects one case. Use the same build and scene
 when testing a single setting; declare cold caches and competing applications.
+
+`settings` is an object of further switches, one measurement per manifest line:
+`{"VICTORY_TEXTURE_NO_WAIT": "1"}`. Names match `^VICTORY_[A-Z0-9_]+$`; values
+are strings or integers whose text matches `^[A-Za-z0-9_.,:-]{0,64}$` (no spaces,
+quotes or semicolons). Switches another key or the adapter already governs are
+refused: `VICTORY_HEAP_SYNC_TABLES`, `VICTORY_INDIRECT_WINDOW`, `VICTORY_PROFILE`
+and any `VICTORY_PROFILE_*`, `VICTORY_FRAME_LOG`, `VICTORY_CAPTURE`,
+`VICTORY_KEYS`, `VICTORY_CARD_METER` and `VICTORY_STACKS`. Every selected case's
+settings are checked before any GPU reservation or launch. They reach the
+adapter as one argument, `-Settings "NAME1=V1;NAME2=V2"`, ordered by name, and
+the argument is left out when a case has none. The report keeps
+`requested_settings`; a requested setting that the adapter's `launch.json` does
+not declare with the same value under `settings` fails the case, so a setting
+asked for and not applied never passes for measured.
 
 The runtime adapter accepts `-Binary`, `-Commit`, `-ExpectedSha256`, `-Label`,
 `-HeapSyncTables`, `-ConsoleMode`, `-MaxSeconds`, `-RunRoot`, `-LeaseOwner` and
-`-LeaseManagedExternally`, plus optional `-Profile` and `-IndirectWindow`.
+`-LeaseManagedExternally`, plus optional `-Profile`, `-IndirectWindow` and
+`-Settings` (applied as environment variables and declared in launch.json).
 It must verify the externally held lease without releasing it, retain its
 memory guards, stop its own child, and create exactly one fresh directory
 under RunRoot with launch.json, result.json, stderr.log and memory.jsonl.

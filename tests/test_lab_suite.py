@@ -1,4 +1,7 @@
 """Synthetic runner tests; no game files, GPU or Rust compilation required."""
+import argparse
+import contextlib
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -110,6 +113,89 @@ class SuiteTests(unittest.TestCase):
         self.assertFalse(result['comparison_eligible'])
         self.assertEqual(result['visual_quality'], 'unverified')
         self.assertEqual(result['max_dropped_draws'], 7)
+
+    def test_settings_names_values_and_reserved_switches_are_checked(self):
+        for name in ('VICTORY_lower', 'OTHER_SWITCH', 'VICTORY_', 'VICTORY_A B'):
+            with self.assertRaisesRegex(ValueError, 'name'):
+                lab.case_settings({'name': 'c', 'settings': {name: '1'}})
+        for value in ('a b', 'x;y', '"q"', "it's", 'v' * 65, True, 1.5, None, ['1']):
+            with self.assertRaisesRegex(ValueError, 'VICTORY_X'):
+                lab.case_settings({'name': 'c', 'settings': {'VICTORY_X': value}})
+        for name in ('VICTORY_HEAP_SYNC_TABLES', 'VICTORY_INDIRECT_WINDOW', 'VICTORY_PROFILE',
+                     'VICTORY_PROFILE_OUT', 'VICTORY_FRAME_LOG', 'VICTORY_CAPTURE', 'VICTORY_KEYS',
+                     'VICTORY_CARD_METER', 'VICTORY_STACKS'):
+            with self.assertRaisesRegex(ValueError, name):
+                lab.case_settings({'name': 'c', 'settings': {name: '1'}})
+        with self.assertRaises(ValueError):
+            lab.case_settings({'name': 'c', 'settings': ['VICTORY_X=1']})
+        self.assertEqual(lab.case_settings({'name': 'c', 'settings': {'VICTORY_X': -3, 'VICTORY_Y': ''}}),
+                         {'VICTORY_X': '-3', 'VICTORY_Y': ''})
+
+    def test_settings_argument_is_ordered_and_absent_without_settings(self):
+        settings = lab.case_settings({'name': 'c', 'settings': {'VICTORY_B': 2, 'VICTORY_A': 'x', 'VICTORY_C': 'a,b:1.5'}})
+        self.assertEqual(lab.settings_argument(settings), 'VICTORY_A=x;VICTORY_B=2;VICTORY_C=a,b:1.5')
+        self.assertEqual(lab.case_settings({'name': 'c'}), {})
+        self.assertIsNone(lab.settings_argument({}))
+
+    def runtime_case(self, settings, launched):
+        """runtime_checks over a fake runner: returns (commands run, result rows)."""
+        root = Path(tempfile.mkdtemp(dir=self.root))  # one per call: a test may run several cases
+        binary = root / 'victory.exe'
+        binary.write_bytes(b'synthetic')
+        runner = root / 'runner.ps1'
+        runner.write_text('# synthetic')
+        case = {'name': 'one', 'binary': str(binary), 'commit': 'synthetic',
+                'sha256': hashlib.sha256(b'synthetic').hexdigest(), 'max_seconds': 120}
+        if settings is not None:
+            case['settings'] = settings
+        manifest = root / 'manifest.json'
+        lab.write_json(manifest, {'runner': str(runner), 'lease_script': 'unused', 'cases': [case]})
+        commands = []
+
+        def fake_run(command, cwd, output, timeout):
+            commands.append(command)
+            label = command[command.index('-Label') + 1]
+            run = Path(command[command.index('-RunRoot') + 1]) / (label + '-1')
+            run.mkdir(parents=True)
+            lab.write_json(run / 'launch.json', {'commit': 'synthetic', 'sha256': 'synthetic', 'settings': launched})
+            lab.write_json(run / 'result.json', {'reason': 'time_limit', 'exit_code': -1})
+            (run / 'stderr.log').write_text('')
+            (run / 'memory.jsonl').write_text(json.dumps({'ram_mb': 1024, 'process_private_gib': 2}) + '\n')
+            return {'status': 'passed', 'exit_code': 0}
+
+        saved = lab.run_command, lab.gpu_lease
+        lab.run_command, lab.gpu_lease = fake_run, lambda script, owner: contextlib.nullcontext()
+        try:
+            args = argparse.Namespace(manifest=str(manifest), case=None, repo=root)
+            rows = lab.runtime_checks(args, root / 'out', 'synthetic-owner')
+        finally:
+            lab.run_command, lab.gpu_lease = saved
+        return commands, rows
+
+    def test_settings_reach_the_runner_in_one_argument_and_must_be_applied(self):
+        commands, rows = self.runtime_case({'VICTORY_TEXTURE_NO_WAIT': 1, 'VICTORY_JOIN_PARTS': '1'},
+                                           {'VICTORY_JOIN_PARTS': '1', 'VICTORY_TEXTURE_NO_WAIT': '1', 'VICTORY_FRAME_LOG': '1'})
+        command = commands[0]
+        self.assertEqual(command[command.index('-Settings') + 1], 'VICTORY_JOIN_PARTS=1;VICTORY_TEXTURE_NO_WAIT=1')
+        self.assertEqual(rows[0]['requested_settings'], {'VICTORY_JOIN_PARTS': '1', 'VICTORY_TEXTURE_NO_WAIT': '1'})
+        self.assertEqual(rows[0]['status'], 'inconclusive')
+        # Asked for and not declared by the runner: failed, with the setting named.
+        _, rows = self.runtime_case({'VICTORY_TEXTURE_NO_WAIT': '1'}, {'VICTORY_FRAME_LOG': '1'})
+        self.assertEqual(rows[0]['status'], 'failed')
+        self.assertIn('VICTORY_TEXTURE_NO_WAIT', rows[0]['reason'])
+        _, rows = self.runtime_case({'VICTORY_TEXTURE_NO_WAIT': '1'}, {'VICTORY_TEXTURE_NO_WAIT': '0'})
+        self.assertEqual(rows[0]['status'], 'failed')
+
+    def test_a_case_without_settings_adds_no_argument(self):
+        commands, rows = self.runtime_case(None, {'VICTORY_FRAME_LOG': '1'})
+        self.assertNotIn('-Settings', commands[0])
+        self.assertEqual(rows[0]['requested_settings'], {})
+        self.assertEqual(rows[0]['status'], 'inconclusive')
+
+    def test_invalid_settings_stop_before_any_launch(self):
+        with self.assertRaisesRegex(ValueError, 'VICTORY_STACKS'):
+            self.runtime_case({'VICTORY_STACKS': '1'}, {})
+        self.assertFalse(list(self.root.glob('*/out')), 'a case ran before its settings were checked')
 
 
 if __name__ == '__main__':
