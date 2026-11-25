@@ -16,12 +16,17 @@ El repositorio no incluye archivos del juego, sus recursos ni material del SDK d
 
 ## Qué aporta
 
+El fork sigue a victory-fork y está fusionado hasta su `3973179` (25 de noviembre de 2026). Lo de abajo es lo que añadimos encima.
+
 | Área | Corrección | Procedencia |
 | :--- | :--- | :--- |
 | **64 lanes → 32 hilos** | Ejecución por parejas de programas compute wave64 en GPU de 32 lanes, junto con los demás cambios de esa PR. | [#854](https://github.com/fxceless/victory-fork/pull/854), PiloteCode |
 | **Límites de memoria** | Las lecturas y escrituras anchas que cruzan una página de 64 KiB usan el mapeo de cada página. | [#846](https://github.com/fxceless/victory-fork/pull/846), gomeaw |
 | **Píxeles auxiliares** | Corrige `v_readfirstlane` para que las helper lanes completen el bucle probado en la primera pasada. | [0601955](https://github.com/Marvisak/VIctory/commit/0601955361c77fd8e306631784ed084a31e5ad8f), Vax |
 | **Actualización de texturas** | Si se desborda la lista de avisos de remapeo, se revisan las texturas colocadas. Conservamos el límite de memoria y sincronizamos la marca de desbordamiento con la lista. | [74315e7](https://github.com/PastiiJay/klbf-lab/commit/74315e765a6a7b24a926e55f9b2a192d6b8ec05a), PastiiJay / KLBF Lab |
+| **Hilos de pipelines** | `VICTORY_PIPELINE_WORKERS=<n>` y `VICTORY_PIPELINE_NORMAL=1` fijan cuántos hilos crean pipelines y con qué prioridad. Apagados por defecto. | [#955](https://github.com/fxceless/victory-fork/pull/955), LukaManstein |
+| **Watchdog del título** | `VICTORY_NO_WATCHDOG=1` salta el watchdog de cuelgues del propio título en una versión conocida, comprobando antes la versión y los bytes que sustituye. Apagado por defecto y sin usar en la medida de abajo. | [#959](https://github.com/fxceless/victory-fork/pull/959), ruvenesh |
+| **Pruebas estables** | Tres fallos intermitentes de tests eliminados: los de vigilancia de memoria, el de ficheros y el de esperas de frame. | [#963](https://github.com/fxceless/victory-fork/pull/963) y [#952](https://github.com/fxceless/victory-fork/pull/952), MamaLeVrai; [#978](https://github.com/fxceless/victory-fork/pull/978), avt0m4t48 |
 
 Son correcciones de comportamiento con pruebas de regresión. No equivalen a una mejora de FPS demostrada ni a una solución completa del renderizado.
 
