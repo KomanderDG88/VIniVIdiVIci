@@ -5,7 +5,9 @@
 //! or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
 //!
 //! A press is held until the title has read the input with the key down
-//! [`Script::need`] times, and at least [`MIN_HOLD`]: at one to three frames a
+//! [`Script::need`] times (`VICTORY_KEYS_READS`, 1 by default: while loading
+//! the title reads its input seldom, and one read with the key down was
+//! enough in the first unattended run), and at least [`MIN_HOLD`]: at one to three frames a
 //! second a fixed 0.2 s fell between two of the title's reads and was never
 //! seen. A press nobody reads is let go after [`GIVE_UP`], and said so. The
 //! next press of the same key waits until the title has read it up once
