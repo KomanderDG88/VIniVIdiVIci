@@ -1248,7 +1248,7 @@ mod host {
                     at = at.as_secs_f64(),
                     reads,
                     held_ms = held.as_millis() as u64,
-                    "scripted key let go UNREAD: the title did not read it enough times"
+                    "scripted key let go after the longest hold: the title read it fewer times than asked (reads of need; 0 = never seen)"
                 ),
             }
         }
@@ -1270,7 +1270,7 @@ mod host {
             let need = std::env::var("VICTORY_KEYS_READS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(2u32)
+                .unwrap_or(1u32)
                 .clamp(1, 16);
             tracing::info!(
                 presses = presses.len(),
