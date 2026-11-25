@@ -2293,7 +2293,20 @@ impl State {
             once!("no stand-in for indirect light: the resolve's tables are not as expected");
             return false;
         }
-        crate::ambient::replace(list, light as This)
+        // The scene's depth, for the shade in creases and under objects
+        // (`VICTORY_AMBIENT_SHADE`), if the resolve reads it where expected.
+        let (slot, offset) = crate::ambient::DEPTH;
+        let named = stage.translated().used.iter().any(|u| {
+            u.kind == ResourceType::Srv && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        });
+        let depth = match self.roots_ref(true).get(usize::from(slot)) {
+            Some(Root::Table(table)) if named => match crate::descriptor::view(table + u64::from(offset) * 4) {
+                Some(View::Shader(r, _)) => Some(r as This),
+                _ => None,
+            },
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
