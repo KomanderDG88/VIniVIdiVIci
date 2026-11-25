@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">VIniVIdiVIci VI monogram</title>
+  <defs><linearGradient id="metal" x2="1" y2="1"><stop stop-color="#fff0c6"/><stop offset=".5" stop-color="#e9bc79"/><stop offset="1" stop-color="#ff795f"/></linearGradient></defs>
+  <rect x="1" y="1" width="254" height="254" rx="58" fill="#101827" stroke="#e9bc79" stroke-opacity=".45"/>
+  <path d="M42 54h46l38 109 39-109h35l-62 157h-30Z" fill="url(#metal)"/>
+  <path d="M185 101h27v110h-27Z" fill="#f5eddb"/>
+  <path d="M48 229h39m21 0h39m21 0h39" stroke="#e9bc79" stroke-width="4" stroke-linecap="round" opacity=".6"/>
+</svg>

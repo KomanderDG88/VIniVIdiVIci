@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="380" viewBox="0 0 1200 380" role="img" aria-labelledby="title desc">
+  <title id="title">VIniVIdiVIci</title>
+  <desc id="desc">A gold VI monogram and cream wordmark on ink blue with coral orbital lines. An experimental Windows compatibility project focused on NVIDIA.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#101827"/><stop offset="1" stop-color="#090d16"/></linearGradient>
+    <linearGradient id="metal" x2="1" y2="1"><stop stop-color="#fff0c6"/><stop offset=".5" stop-color="#e9bc79"/><stop offset="1" stop-color="#ff795f"/></linearGradient>
+    <radialGradient id="glow"><stop stop-color="#e6564c" stop-opacity=".22"/><stop offset="1" stop-color="#e6564c" stop-opacity="0"/></radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#8da0bd" stroke-opacity=".055"/></pattern>
+    <clipPath id="clip"><rect width="1200" height="380" rx="24"/></clipPath>
+  </defs>
+  <g clip-path="url(#clip)">
+    <path fill="url(#bg)" d="M0 0h1200v380H0z"/>
+    <path fill="url(#grid)" d="M0 0h1200v380H0z"/>
+    <ellipse cx="1050" cy="180" rx="430" ry="370" fill="url(#glow)"/>
+    <g fill="none" stroke="#ed907a" stroke-opacity=".16">
+      <circle cx="1170" cy="-45" r="270"/><circle cx="1170" cy="-45" r="310"/><circle cx="1170" cy="-45" r="350"/>
+      <path d="M895 380 1200 75M975 380l225-225"/>
+    </g>
+    <path d="M0 0h1200" stroke="url(#metal)" stroke-width="5"/>
+    <g transform="translate(52 88)">
+      <rect width="182" height="182" rx="42" fill="#131e2d" stroke="#e9bc79" stroke-opacity=".35"/>
+      <path d="M30 38h33l27 78 28-78h25L99 150H77Z" fill="url(#metal)"/>
+      <path d="M132 72h19v78h-19Z" fill="#f5eddb"/>
+      <path d="M34 164h28m15 0h28m15 0h28" stroke="#e9bc79" stroke-width="3" stroke-linecap="round" opacity=".6"/>
+    </g>
+    <g font-family="Segoe UI, Arial, sans-serif">
+      <text x="280" y="119" fill="#e9bc79" font-size="13" font-weight="600" letter-spacing="4">INDEPENDENT COMPATIBILITY PROJECT</text>
+      <text x="274" y="199" fill="#f7f0e2" font-size="76" font-weight="700" letter-spacing="-3">VIniVIdiVIci</text>
+      <text x="280" y="244" fill="#aab7c9" font-size="23">Console code. PC execution.</text>
+      <path d="M280 280h770" stroke="#b3bfd2" stroke-opacity=".15"/>
+      <text x="280" y="314" fill="#d0d8e5" font-size="12" font-weight="600" letter-spacing="2">WINDOWS / D3D12</text>
+      <circle cx="470" cy="310" r="2" fill="#e9bc79"/>
+      <text x="492" y="314" fill="#d0d8e5" font-size="12" font-weight="600" letter-spacing="2">NVIDIA FOCUS</text>
+      <circle cx="666" cy="310" r="2" fill="#e9bc79"/>
+      <text x="688" y="314" fill="#d0d8e5" font-size="12" font-weight="600" letter-spacing="2">OPEN SOURCE</text>
+      <rect x="993" y="34" width="170" height="29" rx="14" fill="#e9bc79" fill-opacity=".08" stroke="#e9bc79" stroke-opacity=".25"/>
+      <circle cx="1010" cy="48.5" r="3" fill="#e9bc79"/>
+      <text x="1022" y="53" fill="#e9bc79" font-size="10" font-weight="600" letter-spacing="1.7">EXPERIMENTAL</text>
+    </g>
+  </g>
+  <rect x=".5" y=".5" width="1199" height="379" rx="24" fill="none" stroke="#a8b8d0" stroke-opacity=".15"/>
+</svg>
