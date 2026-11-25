@@ -133,11 +133,26 @@ Recorded on 25 November 2026 at commit `abf1575`, on **Windows 11 / RTX 4060 Ti 
 - **Where a usual frame of about 200 ms went:** the rendering thread spent about 190 ms inside submit calls, some 90 to 100 ms preparing and 60 to 100 ms waiting for the card. Copying back what shaders wrote took 86 to 141 ms for 15 to 32 MB on its own thread. The card stood idle for 93 to 134 ms of the frame, and its own work was 73 to 99 ms. On this machine the processor-side work in series bounds the frame, not the card.
 - **Limits:** diagnostics counters and occasional screenshots were on, and they cost frame time. Typically 80 to 130 draws a frame were dropped with no pipeline pending, at times more. Shadows were black in the views checked. No input was tested. Both runs were stopped by the test harness's own memory guard (under 2 GiB of physical memory free), not by a crash, after about 7 and 3 minutes in the world.
 
+### The same evening, from an SSD
+
+The title's files were copied to an NVMe SSD on the same machine. These runs used a test build, `abf1575` plus fxceless/victory-fork#258, which is not in `main` yet. Diagnostics build, `VICTORY_HEAP_SYNC_TABLES=1`.
+
+| Profile | How it went | Memory |
+| :--- | :--- | :--- |
+| Series X | First 3D scene of the introduction after about 4.5 minutes. Stopped at 295 s by the harness's memory guard, not by a crash. | 20.1 GiB private in the process; 201 MB of physical memory available; 43.8 GiB of commit still free |
+| Series S | 800 s without a crash, closed on request. The introduction's scenes advanced. | 16.7 GiB private at most; 516 MB of physical memory available at the lowest |
+
+- **Physical memory is the limit on this 32 GB machine**, with other programs open. The page file does not help: commit was never short.
+- **Picture, Series S with #258:** dark, with incomplete geometry and faces and strong temporal artifacts. There is no matching shot without #258 to compare with, so nothing is concluded about #258 here.
+- **No frame rate is reported for these runs.** An unrelated job was using about ten of the machine's twelve threads at the time, the pipeline cache was cold (about 418 ms of a 580 ms frame spent waiting for pipelines) and texture refreshes waited 89 to 342 ms a frame for the lock that mapping changes take. The log's 1.4 frames a second for the last minute measures those, not the layer.
+- **Player control is still not confirmed.**
+
 ## What's next
 
-- Repeat the baseline with the title's files on an SSD, so that disk reads stop bounding the load and the streaming.
-- Measure the pending synchronisation and copy-back changes against that baseline, one change at a time, at comparable draw counts: fxceless/victory-fork#665, #467, #812, #916, #857 and #853.
-- Compare image correctness and stability before drawing conclusions about performance.
+- Repeat the Series S run with nothing else using the processor and with warm caches, then with `VICTORY_TEXTURE_NO_WAIT=1` as the only change.
+- Read the new counters of console-only processor instructions on this Intel machine (`monitorx`, `mwaitx`, `clzero` and others are emulated by exception here).
+- Test player control once the world is reached, and record the longest session.
+- Measure the pending synchronisation and copy-back changes one at a time, at comparable draw counts: fxceless/victory-fork#665, #467, #812, #916, #857 and #853.
 
 ## Contribute
 

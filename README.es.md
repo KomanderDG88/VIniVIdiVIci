@@ -82,11 +82,26 @@ Registrada el 25 de noviembre de 2026 en el commit `abf1575`, con **Windows 11, 
 - **En qué se va un frame habitual de unos 200 ms:** el hilo de render pasa unos 190 ms dentro de las llamadas de envío, entre 90 y 100 ms preparando y entre 60 y 100 ms esperando a la tarjeta. Copiar de vuelta lo que escriben los shaders lleva de 86 a 141 ms para 15-32 MB, en su propio hilo. La tarjeta está parada de 93 a 134 ms del frame y su trabajo propio es de 73 a 99 ms. En este equipo el frame lo limita el trabajo en serie del procesador, no la tarjeta.
 - **Límites:** los contadores de diagnóstico y las capturas ocasionales estaban activos y cuestan tiempo de frame. Se descartaban normalmente entre 80 y 130 draws por frame sin ningún pipeline pendiente, a veces más. Las sombras salían negras en las vistas revisadas. No se probó el control. Las dos ejecuciones las paró la guarda de memoria del propio banco de pruebas (menos de 2 GiB de memoria física libre), no una caída, tras unos 7 y 3 minutos en el mundo.
 
+### Esa misma tarde, desde un SSD
+
+Copiamos los archivos del título a un SSD NVMe del mismo equipo. Estas ejecuciones usaron una compilación de prueba, `abf1575` más fxceless/victory-fork#258, que todavía no está en `main`. Compilación de diagnóstico, `VICTORY_HEAP_SYNC_TABLES=1`.
+
+| Perfil | Cómo fue | Memoria |
+| :--- | :--- | :--- |
+| Series X | Primera escena 3D de la introducción a los 4,5 minutos aproximadamente. La paró a los 295 s la guarda de memoria del banco de pruebas, no una caída. | 20,1 GiB privados en el proceso; 201 MB de memoria física disponible; 43,8 GiB de memoria comprometible aún libres |
+| Series S | 800 s sin caídas, cerrada a propósito. Las escenas de la introducción avanzaron. | 16,7 GiB privados como máximo; 516 MB de memoria física disponible en el peor momento |
+
+- **El límite en este equipo de 32 GB es la memoria física**, con otros programas abiertos. El archivo de paginación no ayuda: nunca faltó memoria comprometible.
+- **Imagen, Series S con el #258:** oscura, con geometría y caras incompletas y artefactos temporales fuertes. No hay un plano equivalente sin el #258 con el que comparar, así que de aquí no se concluye nada sobre el #258.
+- **No damos FPS de estas ejecuciones.** Un trabajo ajeno ocupaba unos diez de los doce hilos del equipo, la caché de pipelines estaba fría (unos 418 ms de un frame de 580 ms esperando pipelines) y los refrescos de texturas esperaban de 89 a 342 ms por frame el candado que toman los cambios de mapeo. Los 1,4 fotogramas por segundo que marca el registro en el último minuto miden eso, no la capa.
+- **El control del jugador sigue sin confirmar.**
+
 ## Próximos pasos
 
-- Repetir la línea base con los archivos del título en un SSD, para que las lecturas de disco dejen de limitar la carga y el streaming.
-- Medir contra esa base los cambios pendientes de sincronización y copia de vuelta, de uno en uno y con un número de draws comparable: fxceless/victory-fork#665, #467, #812, #916, #857 y #853.
-- Comparar imagen y estabilidad antes de sacar conclusiones de rendimiento.
+- Repetir la ejecución en Series S sin nada más usando el procesador y con las cachés calientes, y después con `VICTORY_TEXTURE_NO_WAIT=1` como único cambio.
+- Leer los contadores nuevos de instrucciones de procesador exclusivas de la consola en este equipo Intel (`monitorx`, `mwaitx`, `clzero` y otras se emulan aquí por excepción).
+- Probar el control del jugador cuando se llegue al mundo y registrar la sesión más larga.
+- Medir los cambios pendientes de sincronización y copia de vuelta de uno en uno y con un número de draws comparable: fxceless/victory-fork#665, #467, #812, #916, #857 y #853.
 
 ## Colaborar y dar crédito
 
