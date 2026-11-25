@@ -24,7 +24,7 @@
 
 Built on [victory-fork](https://github.com/fxceless/victory-fork) and [VIctory](https://github.com/Marvisak/VIctory), it runs a title's x86-64 code natively on the CPU and translates console GPU programs for Direct3D 12. The current work focuses on wave64 compute, memory correctness and texture updates.
 
-> **Current status: experimental. It reaches the game world and the player controls the character, at about 2 to 5 frames a second on our machine.** See [Status](#status) for what is measured and what is only reported. It is not playable, and no frame-rate gain is claimed for any change in this fork. Results reported by upstream projects belong to their builds and machines.
+> **Current status: experimental. It reaches the game world and the player controls the character, at about 3 to 5 frames a second on our machine.** See [Status](#status) for what is measured and what is only reported. It is not playable, and no frame-rate gain is claimed for any change in this fork. Results reported by upstream projects belong to their builds and machines.
 
 No game files, assets or console SDK material are included. Supply your own files outside the repository. This is an independent community project, unaffiliated with console or game publishers and hardware vendors.
 
@@ -39,6 +39,7 @@ The fork follows victory-fork and is merged up to its `3973179` (25 November 202
 | **Pixel helper lanes** | A helper lane reads its own value in `v_readfirstlane`, allowing the tested waterfall loop to serve it on the first pass. | [0601955](https://github.com/Marvisak/VIctory/commit/0601955361c77fd8e306631784ed084a31e5ad8f) · Vax |
 | **Texture refresh** | Remap-notification overflow triggers one full revisit of placed textures. The port retains the existing memory bound and protects the batch and marker with the same lock. | [74315e7](https://github.com/PastiiJay/klbf-lab/commit/74315e765a6a7b24a926e55f9b2a192d6b8ec05a) · PastiiJay / KLBF Lab |
 | **Upscaler programs and more instructions** | The FidelityFX upscaler's FSPX images are read as native programs, and several instructions and descriptor forms the translator refused are now translated. Carried onto the paired form, with a test of our own for the reads that follow a whole-wave section. Of the title's 29 upscaler programs, 28 translate, validate and create pipelines on the RTX 4060 Ti; none did before. The picture with it has not been compared with the picture without it. The Series S profile needs it to draw. | [#258](https://github.com/fxceless/victory-fork/pull/258) · Ortomanic |
+| **Licence** | The emulation of the console's AMD-only processor instructions that victory-fork had ported from XCL, which is GPL-2.0-only, is removed: this program is GPL-3.0-or-later and cannot carry it. VIctory's own handler does that job. Checked on an Intel processor, where the title depends on it to start. | [#1057](https://github.com/fxceless/victory-fork/pull/1057) · nullexxx |
 | **Pipeline workers** | `VICTORY_PIPELINE_WORKERS=<n>` and `VICTORY_PIPELINE_NORMAL=1` set the number and the priority of the threads that make host pipelines. Off by default. | [#955](https://github.com/fxceless/victory-fork/pull/955) · LukaManstein |
 | **Title watchdog** | `VICTORY_NO_WATCHDOG=1` steps over the title's own hang watchdog on one known build, checking the build and the bytes it replaces first. Off by default, and not used in the measurement below. | [#959](https://github.com/fxceless/victory-fork/pull/959) · ruvenesh |
 | **Test stability** | Three intermittent test failures removed: watch tests, the files test and the frame-wait test. | [#963](https://github.com/fxceless/victory-fork/pull/963), [#952](https://github.com/fxceless/victory-fork/pull/952) · MamaLeVrai; [#978](https://github.com/fxceless/victory-fork/pull/978) · avt0m4t48 |
@@ -128,8 +129,8 @@ As of 25 November 2026, on **Windows 11 / RTX 4060 Ti / driver 617.42 / Core i7-
 | | Status | Notes |
 | :--- | :--- | :--- |
 | In game | Player in control | Reported by the person running it, at 18:36 in a Series S session of build `6dc5f86` (the code of `main`): the character responds to input. Not instrumented. |
-| Frame rate in the world | About 2 to 5 fps by scene | Series X, yard, about 800 draws a frame: 5.0 fps measured, earlier the same day and from the hard disk. Series S, opening cinematic, about 3,000 draws: 2.9 to 3.6 fps measured (usual frames of 279 to 343 ms). Under player control: about 2 fps by eye, with an unrelated job using the processor at the time; not a measurement. RTX 4060 Ti. |
-| Stability | 13 minutes in one session without a crash | Series S, 800 s, closed on request. Series X stops earlier on this machine: physical memory runs out. |
+| Frame rate in the world | About 3 to 5 fps by scene | Series X, yard, about 800 draws a frame: 5.0 fps measured, earlier the same day and from the hard disk. Series S, opening cinematic, about 3,000 draws: 2.9 to 3.6 fps measured (usual frames of 279 to 343 ms). Under player control: 3.2 fps measured in the minute after the report (median frame 313 ms), with an unrelated job using the processor at the time. RTX 4060 Ti. |
+| Stability | 15 minutes in one session without a crash | Series S, 924 s to the session's time limit, with `VICTORY_TEXTURE_ROOM_PERCENT=95`. A 30-minute session also reached its limit, but its shutdown was not recorded cleanly and is not counted. Series X stops earlier on this machine: physical memory runs out. |
 | Rendering | Dark, with wrong textures | Series S: textures look wrong, geometry and faces incomplete in places. Series X: shadows black. The opening video is black in the latest build and was visible before; the cause is not established. |
 
 How we measure: the frame times the layer logs about every five seconds, in the world only, given by scene. Figures come from diagnostics builds, which cost frame time. One machine, a handful of sessions.
@@ -165,11 +166,11 @@ The title's files were copied to an NVMe SSD on the same machine. These runs use
 
 ## What's next
 
-- Repeat the Series S run with nothing else using the processor and with warm caches, then with `VICTORY_TEXTURE_NO_WAIT=1` as the only change.
-- Read the new counters of console-only processor instructions on this Intel machine (`monitorx`, `mwaitx`, `clzero` and others are emulated by exception here).
-- Find why the opening video is black in the latest build and why textures look wrong on Series S.
+- On Series S the profile selector, the loading picture and the opening video are black while the 3D world is drawn; on Series X they show. A present shows only the first of the planes the title names: whether Series S puts its interface in a second plane is being checked.
+- An 8 GB card has almost no room left for the title's textures with the default reserves on Series S. Measure a smaller reserve for render targets, one setting at a time.
+- The largest part of a frame is the copying of title memory through the kernel, 81 to 118 ms of about 300. Measure the copy in place and the pending synchronisation and copy-back changes one at a time, at comparable draw counts: fxceless/victory-fork#665, #467, #812, #916, #857 and #853.
+- On this Intel machine the console-only instructions cost 8,000 to 12,000 exceptions a second in the opening cinematic. That does not bound the frame, so no work is planned there.
 - Record a longer session under player control, with frame rates by scene.
-- Measure the pending synchronisation and copy-back changes one at a time, at comparable draw counts: fxceless/victory-fork#665, #467, #812, #916, #857 and #853.
 
 ## Contribute
 
