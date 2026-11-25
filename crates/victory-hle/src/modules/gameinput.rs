@@ -618,6 +618,11 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
+    // A read of the title's: the scripted keys count it (`host::scripted`).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(r) = found {
+        host::title_read(r.timestamp);
+    }
     hand(out, found)
 }
 
@@ -699,7 +704,12 @@ extern "system" fn temporal_reading(
     };
     let state = hub.state();
     let history = &state.slots[index].history;
-    hand(out, history.iter().rev().find(|r| r.timestamp <= time))
+    let found = history.iter().rev().find(|r| r.timestamp <= time);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(r) = found {
+        host::title_read(r.timestamp);
+    }
+    hand(out, found)
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -1067,6 +1077,9 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+mod script;
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1198,43 +1211,85 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// Debugging aid: `VICTORY_KEYS`, keys pressed on a script (see
+    /// `super::script`), with or without focus; the stand-in pad's table maps
+    /// them to buttons too.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+        let mut script = super::lock(&SCRIPT);
+        let Some((start, script)) = script.as_mut() else {
+            return Vec::new();
+        };
+        let (down, notes) = script.down(start.elapsed(), super::now());
+        for note in notes {
+            match note {
+                super::script::Note::Down { vk, at } => {
+                    tracing::info!(key = vk, at = at.as_secs_f64(), "scripted key down")
+                }
+                super::script::Note::Seen {
                     vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+                    at,
+                    reads,
+                    held,
+                } => tracing::info!(
+                    key = vk,
+                    at = at.as_secs_f64(),
+                    reads,
+                    held_ms = held.as_millis() as u64,
+                    "scripted key let go: the title read it"
+                ),
+                super::script::Note::Unread {
+                    vk,
+                    at,
+                    reads,
+                    held,
+                } => tracing::warn!(
+                    key = vk,
+                    at = at.as_secs_f64(),
+                    reads,
+                    held_ms = held.as_millis() as u64,
+                    "scripted key let go UNREAD: the title did not read it enough times"
+                ),
+            }
+        }
+        down
+    }
+
+    /// The script of `VICTORY_KEYS`, from when input starts.
+    #[cfg(feature = "diagnostics")]
+    static SCRIPT: LazyLock<Mutex<Option<(Instant, super::script::Script)>>> =
+        LazyLock::new(|| {
+            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+            let (presses, bad) = super::script::parse(&list);
+            if !bad.is_empty() {
+                tracing::warn!(?bad, "VICTORY_KEYS entries not understood, left out");
+            }
+            if presses.is_empty() {
+                return Mutex::new(None);
+            }
+            let need = std::env::var("VICTORY_KEYS_READS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(2u32)
+                .clamp(1, 16);
+            tracing::info!(
+                presses = presses.len(),
+                need,
+                "scripted keys (VICTORY_KEYS)"
+            );
+            Mutex::new(Some((
+                Instant::now(),
+                super::script::Script::new(presses, need),
+            )))
         });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+
+    /// The title read a reading taken at `timestamp` (microseconds, our
+    /// clock): it counts for the scripted keys down then.
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn title_read(timestamp: u64) {
+        if let Some((_, script)) = super::lock(&SCRIPT).as_mut() {
+            script.read(timestamp);
+        }
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
