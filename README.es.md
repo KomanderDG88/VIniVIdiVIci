@@ -16,7 +16,7 @@ El repositorio no incluye archivos del juego, sus recursos ni material del SDK d
 
 ## Qué aporta
 
-El fork sigue a victory-fork y está fusionado hasta su `3973179` (25 de noviembre de 2026). Lo de abajo es lo que añadimos encima.
+El fork sigue a victory-fork y está fusionado hasta su `79cfdd9` (25 de noviembre de 2026). Esa fusión trae, encendidos por defecto, un contador de fps dibujado en la esquina de la imagen (`VICTORY_FPS_COUNTER=0` lo quita; en el perfil Series S queda debajo del plano de la interfaz donde este es opaco) y lecturas de DirectStorage a páginas físicas que esperan al Submit del título; y, apagados por defecto, `VICTORY_INDIRECT_GATHER=1`, `VICTORY_SHOT`, `VICTORY_COPY_CHANGED=1` y `VICTORY_WINDOW_UPLOAD=1`. Nada de esto está medido todavía en este equipo. Lo de abajo es lo que añadimos encima.
 
 | Área | Corrección | Procedencia |
 | :--- | :--- | :--- |
@@ -68,7 +68,7 @@ En Windows, con RTX 4060 Ti y controlador 617.42:
 
 Algunas rutas de prueba se omiten si falta compilador o dispositivo: el contador de pruebas superadas no garantiza que se hayan ejecutado todas las rutas de hardware. WARP no cubre aquí la ruta por parejas con `WaveSize(32)`.
 
-**Batería de GPU, estabilizada:** los fallos intermitentes de la batería completa de GPU (la liberación de memoria del test de buffers in-place de WARP, una violación de acceso de WARP con tests simultáneos y el orden de grupos del test de presupuesto indirecto) quedan corregidos con fxceless/victory-fork#878 (MamaLeVrai), #875 (eazyves) y un recorte que lanza un grupo por cada 64 registros, a partir del #864 (xiaotu030202). Treinta ejecuciones del binario completo de tests de `victory-gpu` en una RTX 4060 Ti: 30 de 30 limpias (171 superadas, 5 ignoradas), frente a 25 de 30 antes. El cambio del recorte cuesta unos 1,4 µs por cada 64 registros y no es una mejora de fps.
+**Batería de GPU, estabilizada:** los fallos intermitentes de la batería completa de GPU (la liberación de memoria del test de buffers in-place de WARP, una violación de acceso de WARP con tests simultáneos y el orden de grupos del test de presupuesto indirecto) quedan corregidos con fxceless/victory-fork#878 (MamaLeVrai), #875 (eazyves) y un recorte que lanza un grupo por cada 64 registros, a partir del #864 (xiaotu030202). Treinta ejecuciones del binario completo de tests de `victory-gpu` en una RTX 4060 Ti: 30 de 30 limpias (171 superadas, 5 ignoradas), frente a 25 de 30 antes. El cambio del recorte cuesta unos 1,4 µs por cada 64 registros y no es una mejora de fps. La pasada posterior de victory-fork que recorta de una vez los registros dispersos de cada lista (`VICTORY_INDIRECT_GATHER=1`) lanzaba todos sus grupos a la vez y contaba con el índice antiguo del shader; aquí lanza un grupo por cada 64 registros como las demás pasadas, con un test de 130 registros dispersos que falla si se repone el lanzamiento único. Diez ejecuciones del binario con ello: 10 de 10 limpias (196 superadas, 5 ignoradas).
 
 Los comandos de verificación y sus requisitos están en [Validation](README.md#validation). Estas cifras describen pruebas sintéticas, **no rendimiento del juego**.
 

@@ -30,7 +30,7 @@ No game files, assets or console SDK material are included. Supply your own file
 
 ## What this fork adds
 
-The fork follows victory-fork and is merged up to its `3973179` (25 November 2026). The changes below are what this fork adds on top. Original authors retain their credit and history.
+The fork follows victory-fork and is merged up to its `79cfdd9` (25 November 2026). That merge brings, on by default, a frame-rate counter drawn in the corner of the picture (`VICTORY_FPS_COUNTER=0` removes it; on the Series S profile it lies under the interface plane where that is opaque) and DirectStorage reads into physical pages that wait for the title's Submit; and, off by default, `VICTORY_INDIRECT_GATHER=1`, `VICTORY_SHOT`, `VICTORY_COPY_CHANGED=1` and `VICTORY_WINDOW_UPLOAD=1`. None of these has been measured on this machine yet. The changes below are what this fork adds on top. Original authors retain their credit and history.
 
 | Area | Change | Source |
 | :--- | :--- | :--- |
@@ -98,7 +98,7 @@ Recorded on **Windows / RTX 4060 Ti / driver 617.42**. These are synthetic check
 
 Some device/compiler-dependent test paths can return early when prerequisites are unavailable. A suite's “passed” count alone does not certify execution of every hardware path. WARP does not cover the paired `WaveSize(32)` path here.
 
-**GPU test suite, stabilised:** the intermittent failures of the full GPU suite (the WARP in-place-buffer test's decommit, a WARP access violation with tests running at once, and the indirect budget test's group order) are fixed by fxceless/victory-fork#878 (MamaLeVrai), #875 (eazyves) and a clamp that dispatches one group per 64 records, after #864 (xiaotu030202). Thirty runs of the whole `victory-gpu` test binary on an RTX 4060 Ti: 30 of 30 clean (171 passed, 5 ignored), against 25 of 30 before. The clamp change costs about 1.4 µs per 64 records and is not a frame-rate improvement.
+**GPU test suite, stabilised:** the intermittent failures of the full GPU suite (the WARP in-place-buffer test's decommit, a WARP access violation with tests running at once, and the indirect budget test's group order) are fixed by fxceless/victory-fork#878 (MamaLeVrai), #875 (eazyves) and a clamp that dispatches one group per 64 records, after #864 (xiaotu030202). Thirty runs of the whole `victory-gpu` test binary on an RTX 4060 Ti: 30 of 30 clean (171 passed, 5 ignored), against 25 of 30 before. The clamp change costs about 1.4 µs per 64 records and is not a frame-rate improvement. victory-fork's later pass that clamps scattered records once per list (`VICTORY_INDIRECT_GATHER=1`) dispatched all its groups at once and counted on the shader's old indexing; here it dispatches one group per 64 records like the other passes, with a test of 130 scattered records that fails when the single dispatch is put back. Ten runs of the binary with it: 10 of 10 clean (196 passed, 5 ignored).
 
 The page-boundary and texture-overflow regressions were also checked by removing their respective fixes: the tests detect the resulting wrong behavior.
 
