@@ -5,15 +5,18 @@
 //! (`CS_ScreenProbes_TemporalResolve_*`) then leaves next to nothing, and
 //! whatever the sun does not reach directly is black. With
 //! `VICTORY_AMBIENT=<level>` the image that program wrote is replaced, right
-//! after it, by one constant (0.6 looked balanced in the first rooms). The
-//! title's own lighting then applies it with the surfaces' colors.
-//! Replaced, not raised: without rays the resolve's inputs are never
-//! written, and what it leaves is whatever their memory held.
+//! after it, by a constant (it used to be a floor under what the program
+//! wrote, but that is garbage: see the shader). The constant is the same
+//! everywhere: the light in these images does not go with the title's
+//! exposure (well-lit surfaces hold about the same in a shot at -5.5 EV and
+//! in one at -9.75). The title's own lighting then applies it with the
+//! surfaces' colors. Raised, not added: the result is the next frame's
+//! history.
 //!
-//! Off by default (and with `VICTORY_AMBIENT=off` or `0`): the title's own
-//! output stays.
-//! shortcut: the same light everywhere, from everywhere, whatever the
-//! title's exposure; of no use once rays run.
+//! Off by default here (and with `VICTORY_AMBIENT=off` or `0`): the title's
+//! own output stays. Belobug's fork has it on at 0.6, which looked balanced
+//! in the first rooms.
+//! shortcut: the same light everywhere, from everywhere; gone once rays run.
 //!
 //! From Belobug's VIctory-Belobug-AMD (`crates/victory-gpu/src/ambient.rs`
 //! there, where it is on by default), fitted to this tree.
@@ -72,7 +75,7 @@ void main(uint3 at : SV_DispatchThreadID) {
     if (at.x >= w || at.y >= h) return;
     // What the resolve left is not kept: without rays its inputs are never
     // written and it holds whatever their memory did (bright magenta on
-    // translucent surfaces, blocks of colours indoors).
+    // translucent surfaces, blocks of colours indoors: run v6, 2026-11-25).
     light[at.xy] = pack(tint * level);
 }
 "#;
