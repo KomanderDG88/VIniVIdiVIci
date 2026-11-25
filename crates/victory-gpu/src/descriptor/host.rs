@@ -4695,7 +4695,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
             Some((None, None))
         }
         View::ConsoleSampler(words) => {
-            let desc = crate::sampler::console(words);
+            let desc = crate::sampler::console(words, crate::sampler::heap_aniso_point_mip(device));
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some((None, None))
