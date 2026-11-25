@@ -54,21 +54,49 @@ unsafe extern "C" {
     static victory_copy_guarded_fault: u8;
 }
 
-/// Whether copies of title memory into host memory are made in place
-/// (`VICTORY_COPY_PLAIN=1`).
-pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
-        if on {
+/// How `VICTORY_COPY_PLAIN` asks for copies in place: 0 off, 1 on, 2 in
+/// turn (`alt`: 20 s each way, each change said in the log, for measuring
+/// it in one scene). Safe to turn in a running game: a copy in place and
+/// one through the kernel give the same bytes.
+fn mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let asked = match std::env::var("VICTORY_COPY_PLAIN").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        let mode = if cfg!(target_arch = "x86_64") { asked } else { 0 };
+        if mode != 0 {
             install();
             tracing::info!(
                 "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
-                 page that is not there (VICTORY_COPY_PLAIN=1)"
+                 page that is not there (VICTORY_COPY_PLAIN=1; alt: in turn)"
             );
         }
-        on
+        mode
     })
+}
+
+/// Whether copies of title memory into host memory are made in place now
+/// (`VICTORY_COPY_PLAIN=1`, or its turn with `alt`).
+pub(crate) fn on() -> bool {
+    match mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "copies of title memory in place from now (VICTORY_COPY_PLAIN=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// Copies made in place, their bytes, the copies that met a page that was
@@ -209,7 +237,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
 
 /// With the frame line: what [`copy`] did per frame over `frames`.
 pub(crate) fn line(frames: f64) {
-    if !on() {
+    if mode() == 0 {
         return;
     }
     let [copies, bytes, gone, lately, small] = [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
