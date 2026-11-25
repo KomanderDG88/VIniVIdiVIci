@@ -38,6 +38,7 @@ The fork follows victory-fork and is merged up to its `3973179` (25 November 202
 | **Memory boundaries** | Wide shader loads and stores crossing a 64 KiB page use the mapping of each page. | [#846](https://github.com/fxceless/victory-fork/pull/846) · gomeaw |
 | **Pixel helper lanes** | A helper lane reads its own value in `v_readfirstlane`, allowing the tested waterfall loop to serve it on the first pass. | [0601955](https://github.com/Marvisak/VIctory/commit/0601955361c77fd8e306631784ed084a31e5ad8f) · Vax |
 | **Texture refresh** | Remap-notification overflow triggers one full revisit of placed textures. The port retains the existing memory bound and protects the batch and marker with the same lock. | [74315e7](https://github.com/PastiiJay/klbf-lab/commit/74315e765a6a7b24a926e55f9b2a192d6b8ec05a) · PastiiJay / KLBF Lab |
+| **Upscaler programs and more instructions** | The FidelityFX upscaler's FSPX images are read as native programs, and several instructions and descriptor forms the translator refused are now translated. Carried onto the paired form, with a test of our own for the reads that follow a whole-wave section. Of the title's 29 upscaler programs, 28 translate, validate and create pipelines on the RTX 4060 Ti; none did before. The picture with it has not been compared with the picture without it. The Series S profile needs it to draw. | [#258](https://github.com/fxceless/victory-fork/pull/258) · Ortomanic |
 | **Pipeline workers** | `VICTORY_PIPELINE_WORKERS=<n>` and `VICTORY_PIPELINE_NORMAL=1` set the number and the priority of the threads that make host pipelines. Off by default. | [#955](https://github.com/fxceless/victory-fork/pull/955) · LukaManstein |
 | **Title watchdog** | `VICTORY_NO_WATCHDOG=1` steps over the title's own hang watchdog on one known build, checking the build and the bytes it replaces first. Off by default, and not used in the measurement below. | [#959](https://github.com/fxceless/victory-fork/pull/959) · ruvenesh |
 | **Test stability** | Three intermittent test failures removed: watch tests, the files test and the frame-wait test. | [#963](https://github.com/fxceless/victory-fork/pull/963), [#952](https://github.com/fxceless/victory-fork/pull/952) · MamaLeVrai; [#978](https://github.com/fxceless/victory-fork/pull/978) · avt0m4t48 |
@@ -89,6 +90,8 @@ Recorded on **Windows / RTX 4060 Ti / driver 617.42**. These are synthetic check
 | Remap port, `158676e` | **19 passed** | Descriptor/host tests after the texture fix |
 | Pixel helper test | **18 / 18** | Helper neighbours served on hardware and WARP |
 | Paired LDS tests | **30 / 30 each** | Two synthetic cases, including a 128-thread group |
+| Folded lane read, with #258 | **10 / 10**, 24 of 24 paired dispatches each | A wave OR read after the section's restore, lanes 0 and 63; three mutations make it fail |
+| With #258 merged | **252 passed**, 2 ignored | `victory-shader` library suite |
 
 Some device/compiler-dependent test paths can return early when prerequisites are unavailable. A suite's “passed” count alone does not certify execution of every hardware path. WARP does not cover the paired `WaveSize(32)` path here.
 
@@ -135,7 +138,7 @@ Recorded on 25 November 2026 at commit `abf1575`, on **Windows 11 / RTX 4060 Ti 
 
 ### The same evening, from an SSD
 
-The title's files were copied to an NVMe SSD on the same machine. These runs used a test build, `abf1575` plus fxceless/victory-fork#258, which is not in `main` yet. Diagnostics build, `VICTORY_HEAP_SYNC_TABLES=1`.
+The title's files were copied to an NVMe SSD on the same machine. These runs used a test build, `abf1575` plus fxceless/victory-fork#258; #258 was merged into `main` afterwards. Diagnostics build, `VICTORY_HEAP_SYNC_TABLES=1`.
 
 | Profile | How it went | Memory |
 | :--- | :--- | :--- |

@@ -24,6 +24,7 @@ El fork sigue a victory-fork y está fusionado hasta su `3973179` (25 de noviemb
 | **Límites de memoria** | Las lecturas y escrituras anchas que cruzan una página de 64 KiB usan el mapeo de cada página. | [#846](https://github.com/fxceless/victory-fork/pull/846), gomeaw |
 | **Píxeles auxiliares** | Corrige `v_readfirstlane` para que las helper lanes completen el bucle probado en la primera pasada. | [0601955](https://github.com/Marvisak/VIctory/commit/0601955361c77fd8e306631784ed084a31e5ad8f), Vax |
 | **Actualización de texturas** | Si se desborda la lista de avisos de remapeo, se revisan las texturas colocadas. Conservamos el límite de memoria y sincronizamos la marca de desbordamiento con la lista. | [74315e7](https://github.com/PastiiJay/klbf-lab/commit/74315e765a6a7b24a926e55f9b2a192d6b8ec05a), PastiiJay / KLBF Lab |
+| **Programas del reescalador y más instrucciones** | Las imágenes FSPX del reescalador FidelityFX se leen como programas nativos, y se traducen varias instrucciones y formas de descriptor que antes se rechazaban. Adaptado a la ejecución por parejas, con una prueba nuestra para las lecturas que siguen a una sección de ola completa. De los 29 programas del reescalador del título, 28 se traducen, validan y crean pipeline en la RTX 4060 Ti; antes, ninguno. No hemos comparado la imagen con y sin este cambio. El perfil Series S lo necesita para dibujar. | [#258](https://github.com/fxceless/victory-fork/pull/258), Ortomanic |
 | **Hilos de pipelines** | `VICTORY_PIPELINE_WORKERS=<n>` y `VICTORY_PIPELINE_NORMAL=1` fijan cuántos hilos crean pipelines y con qué prioridad. Apagados por defecto. | [#955](https://github.com/fxceless/victory-fork/pull/955), LukaManstein |
 | **Watchdog del título** | `VICTORY_NO_WATCHDOG=1` salta el watchdog de cuelgues del propio título en una versión conocida, comprobando antes la versión y los bytes que sustituye. Apagado por defecto y sin usar en la medida de abajo. | [#959](https://github.com/fxceless/victory-fork/pull/959), ruvenesh |
 | **Pruebas estables** | Tres fallos intermitentes de tests eliminados: los de vigilancia de memoria, el de ficheros y el de esperas de frame. | [#963](https://github.com/fxceless/victory-fork/pull/963) y [#952](https://github.com/fxceless/victory-fork/pull/952), MamaLeVrai; [#978](https://github.com/fxceless/victory-fork/pull/978), avt0m4t48 |
@@ -60,6 +61,7 @@ En Windows, con RTX 4060 Ti y controlador 617.42:
 - **Arreglo de texturas `158676e`:** las 19 pruebas de descriptores superadas. Al desactivar la corrección, la nueva prueba detecta el fallo.
 - **Píxeles auxiliares:** 18 de 18 vecinos atendidos tanto en hardware como en WARP.
 - **LDS con ejecución por parejas:** dos casos sintéticos repetidos 30 veces, incluido un grupo de 128 hilos.
+- **Con el #258 fusionado:** 252 pruebas de shaders superadas y 2 ignoradas; la prueba nueva de lectura de lane tras la sección, 10 de 10 con 24 de 24 envíos por parejas en cada pasada, y tres mutaciones que la hacen fallar.
 
 Algunas rutas de prueba se omiten si falta compilador o dispositivo: el contador de pruebas superadas no garantiza que se hayan ejecutado todas las rutas de hardware. WARP no cubre aquí la ruta por parejas con `WaveSize(32)`.
 
@@ -84,7 +86,7 @@ Registrada el 25 de noviembre de 2026 en el commit `abf1575`, con **Windows 11, 
 
 ### Esa misma tarde, desde un SSD
 
-Copiamos los archivos del título a un SSD NVMe del mismo equipo. Estas ejecuciones usaron una compilación de prueba, `abf1575` más fxceless/victory-fork#258, que todavía no está en `main`. Compilación de diagnóstico, `VICTORY_HEAP_SYNC_TABLES=1`.
+Copiamos los archivos del título a un SSD NVMe del mismo equipo. Estas ejecuciones usaron una compilación de prueba, `abf1575` más fxceless/victory-fork#258; el #258 se fusionó en `main` después. Compilación de diagnóstico, `VICTORY_HEAP_SYNC_TABLES=1`.
 
 | Perfil | Cómo fue | Memoria |
 | :--- | :--- | :--- |
