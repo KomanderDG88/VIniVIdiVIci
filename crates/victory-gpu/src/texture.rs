@@ -427,9 +427,12 @@ fn no_wait() -> bool {
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
-/// through the kernel because title memory was being remapped, and those
-/// left for the next refresh because a page was not there.
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// through the kernel because title memory was being remapped, those left
+/// for a later refresh because a page was not there (or the texture was
+/// found partly mapped less than 30 frames before), and those whose read was
+/// not taken because a mapping under it changed while it read
+/// (`crate::watch::read_unlocked`).
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -1163,30 +1166,55 @@ impl Staging {
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
     /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
-    /// is looked at again at its next refresh (what was learnt about writes
-    /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
+    /// is not there at this moment, and the read is taken only if no
+    /// mapping under it changed while it read (`crate::watch::read_unlocked`:
+    /// else it could be part what was shown before and part what is shown
+    /// after). When it is not taken nothing is, and the texture is looked
+    /// at again at a later refresh (what was learnt about writes to it is
+    /// forgotten, so that it is not passed over as unwritten). A texture
+    /// found partly mapped, the usual state while it streams in, is read
+    /// again at most every 30 frames, as in the path that waits: each try
+    /// is a read of the whole texture that cannot succeed until its pages
+    /// arrive. Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+        use crate::watch::Unlocked;
         use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
-            }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
-            }
-            true
-        });
-        if read {
-            UNLOCKED[0].fetch_add(1, Relaxed);
-            size
-        } else {
+        let frame = crate::frame::current();
+        if last.partial.is_some_and(|at| frame < at + 30) && !committed(self.memory, size) {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
-            0
+            return 0;
+        }
+        let found = with_read(size, |read| {
+            let found = crate::watch::read_unlocked(self.memory, read);
+            if found == Unlocked::Read {
+                let hash = blake3::hash(read);
+                if last.hash != Some(hash) {
+                    last.hash = Some(hash);
+                    self.detile(read);
+                }
+            }
+            found
+        });
+        match found {
+            Unlocked::Read => {
+                UNLOCKED[0].fetch_add(1, Relaxed);
+                last.partial = None;
+                size
+            }
+            Unlocked::Missing => {
+                UNLOCKED[1].fetch_add(1, Relaxed);
+                last.asked = 0;
+                if !committed(self.memory, size) {
+                    last.partial = Some(frame);
+                }
+                0
+            }
+            Unlocked::Moved => {
+                UNLOCKED[2].fetch_add(1, Relaxed);
+                last.asked = 0;
+                0
+            }
         }
     }
 

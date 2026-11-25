@@ -1062,10 +1062,17 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
+pub struct Remapping(
+    #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
+    std::time::Instant,
+    std::ops::Range<usize>,
+);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        // The change is done: the zones' epochs are even again, before the
+        // lock is let go (the fields are dropped after this).
+        bump(self.2.clone());
         // From asking for the lock until it is let go (the frame log).
         crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
     }
@@ -1075,12 +1082,75 @@ impl Drop for Remapping {
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
-pub fn title_memory_remapping() -> Remapping {
+/// `[at, at + len)` is the title memory whose mapping changes: its zones'
+/// epochs are odd until the change is done ([`read_unlocked`]).
+pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     let asked = std::time::Instant::now();
     let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     crate::framelog::add(crate::framelog::T::Remaps, 1);
     crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
-    Remapping(held, asked)
+    let zones = zones(at, len);
+    bump(zones.clone());
+    Remapping(held, asked, zones)
+}
+
+/// Title memory in zones of 64 MiB, by address modulo [`ZONES`], each with
+/// an epoch: odd while the runtime changes a mapping in it, one more when
+/// it is done. A read that does not hold [`title_memory_reading`] knows by
+/// them whether a mapping under it changed while it read.
+const ZONE_SHIFT: u32 = 26;
+const ZONES: usize = 256;
+static EPOCH: [std::sync::atomic::AtomicU64; ZONES] = [const { std::sync::atomic::AtomicU64::new(0) }; ZONES];
+
+/// The zones `[at, at + len)` lies in: all of them if it spans as many.
+fn zones(at: usize, len: usize) -> std::ops::Range<usize> {
+    let first = at >> ZONE_SHIFT;
+    let last = at.saturating_add(len.max(1) - 1) >> ZONE_SHIFT;
+    if last - first + 1 >= ZONES { 0..ZONES } else { first..last + 1 }
+}
+
+/// Adds one to the epochs of `zones` (indices before the modulo).
+fn bump(zones: std::ops::Range<usize>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    for z in zones {
+        EPOCH[z % ZONES].fetch_add(1, SeqCst);
+    }
+}
+
+/// What [`read_unlocked`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unlocked {
+    /// Read whole, and no mapping under it changed while it read.
+    Read,
+    /// A page was not there.
+    Missing,
+    /// The runtime was changing a mapping under it, or changed one while it
+    /// read: what was read may be part before and part after. Not taken.
+    Moved,
+}
+
+/// Reads title memory at `src` into `dst` without [`title_memory_reading`]
+/// (through the kernel, which fails rather than faults on a page that is
+/// not there). Taken only if no change of mapping in its zones was under
+/// way when it began, and none began or ended before it was done: the
+/// epochs are the same, and even, before and after.
+pub(crate) fn read_unlocked(src: *const u8, dst: &mut [u8]) -> Unlocked {
+    use std::sync::atomic::Ordering::SeqCst;
+    let zones = zones(src as usize, dst.len());
+    // A texture lies in one zone or two: the allocation is that of a
+    // handful of words, against a read of the whole texture.
+    let seen: Vec<u64> = zones.clone().map(|z| EPOCH[z % ZONES].load(SeqCst)).collect();
+    if seen.iter().any(|e| e & 1 == 1) {
+        return Unlocked::Moved;
+    }
+    if !crate::host::read_into(src, dst) {
+        return Unlocked::Missing;
+    }
+    std::sync::atomic::fence(SeqCst);
+    if zones.zip(&seen).any(|(z, &e)| EPOCH[z % ZONES].load(SeqCst) != e) {
+        return Unlocked::Moved;
+    }
+    Unlocked::Read
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -1723,7 +1793,7 @@ mod mapping_tests {
             let changed = changed.clone();
             std::thread::spawn(move || {
                 began.send(()).unwrap();
-                let _changing = title_memory_remapping();
+                let _changing = title_memory_remapping(0, usize::MAX);
                 changed.store(true, Ordering::SeqCst);
             })
         };
@@ -1735,7 +1805,7 @@ mod mapping_tests {
         assert!(changed.load(Ordering::SeqCst));
         // A change holds; the read does not begin until it is done.
         let read = Arc::new(AtomicBool::new(false));
-        let changing = title_memory_remapping();
+        let changing = title_memory_remapping(0, usize::MAX);
         let (began, wait) = mpsc::channel();
         let reader = {
             let read = read.clone();
@@ -1751,5 +1821,65 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// A read without the lock is taken only if no mapping under it changed
+    /// while it read. A thread changes what a range shows from one content
+    /// to another, page by page and announced as the runtime announces a
+    /// change of mapping, and rests between changes; another reads the
+    /// range in a loop. Every read taken holds one content whole, and some
+    /// are taken, some not.
+    #[test]
+    fn reads_without_the_lock_never_take_two_mappings() {
+        use super::{Unlocked, read_unlocked};
+        use std::time::Instant;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const PAGE: usize = 4096;
+        const PAGES: usize = 16;
+        // SAFETY: a fresh allocation of ours.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let changer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut fill = 1u8;
+                while !stop.load(Ordering::SeqCst) {
+                    {
+                        let _changing = title_memory_remapping(at, PAGES * PAGE);
+                        fill = 3 - fill;
+                        for page in 0..PAGES {
+                            // SAFETY: committed memory of ours.
+                            unsafe { std::ptr::write_bytes((at + page * PAGE) as *mut u8, fill, PAGE) };
+                            std::thread::yield_now();
+                        }
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
+                }
+            })
+        };
+        let mut read = vec![0u8; PAGES * PAGE];
+        let (mut taken, mut moved) = (0u64, 0u64);
+        let end = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < end {
+            match read_unlocked(at as *const u8, &mut read) {
+                Unlocked::Read => {
+                    taken += 1;
+                    assert!(read.iter().all(|&b| b == read[0]), "a read taken holds two contents");
+                }
+                Unlocked::Moved => moved += 1,
+                Unlocked::Missing => panic!("committed memory read as not there"),
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        changer.join().unwrap();
+        // SAFETY: the allocation above, no longer used.
+        unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
+        assert!(taken > 0, "no read was taken");
+        assert!(moved > 0, "no read met a change");
     }
 }
