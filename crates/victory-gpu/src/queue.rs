@@ -157,6 +157,13 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let Some(texture) = crate::resource::host_resource(resource) else {
         return false;
     };
+    // A second plane (the interface, in the title's Series S mode) is drawn
+    // over the first by the present made at once (`crate::over`); a present
+    // held behind the line carries one texture, so it would lose it.
+    // SAFETY: the title passes `planes` plane descriptions.
+    if unsafe { second_plane(planes, plane_parameters, resource) }.is_some() {
+        return false;
+    }
     // The state the lists recorded so far leave the texture in: what our
     // copy finds it in when it runs behind them (looked at, not changed).
     const COPY_SOURCE: u32 = 0x800;
