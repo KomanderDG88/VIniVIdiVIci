@@ -1027,6 +1027,11 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -2272,21 +2277,36 @@ impl State {
     /// ([`crate::ambient`]), if `p` is the program that resolves it and
     /// the stand-in is on. Whether anything was recorded.
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+        else {
             return false;
         };
         if crate::ambient::level().is_none() {
             return false;
         }
-        let (slot, offset) = crate::ambient::LIGHT;
-        let named = stage.translated().used.iter().any(|u| {
-            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
-        });
-        let light = match self.roots_ref(true).get(usize::from(slot)) {
-            Some(Root::Table(table)) if named => match crate::descriptor::view(table + u64::from(offset) * 4) {
-                Some(View::Unordered(r, ..)) => r,
-                _ => 0,
-            },
+        // The view a table of the program names at (slot, offset), if the
+        // program uses one there.
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let named = stage.translated().used.iter().any(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            });
+            match self.roots_ref(true).get(usize::from(slot)) {
+                Some(Root::Table(table)) if named => crate::descriptor::view(table + u64::from(offset) * 4),
+                _ => None,
+            }
+        };
+        if !stage.shader.resolves_light {
+            // The reflections, held to the light around.
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => false,
+            };
+        }
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
             _ => 0,
         };
         if light == 0 {
@@ -2295,15 +2315,8 @@ impl State {
         }
         // The scene's depth, for the shade in creases and under objects
         // (`VICTORY_AMBIENT_SHADE`), if the resolve reads it where expected.
-        let (slot, offset) = crate::ambient::DEPTH;
-        let named = stage.translated().used.iter().any(|u| {
-            u.kind == ResourceType::Srv && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
-        });
-        let depth = match self.roots_ref(true).get(usize::from(slot)) {
-            Some(Root::Table(table)) if named => match crate::descriptor::view(table + u64::from(offset) * 4) {
-                Some(View::Shader(r, _)) => Some(r as This),
-                _ => None,
-            },
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
             _ => None,
         };
         crate::ambient::raise(list, light as This, depth)

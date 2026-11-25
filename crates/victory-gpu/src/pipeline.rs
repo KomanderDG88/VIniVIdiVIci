@@ -65,6 +65,13 @@ pub(crate) struct Shader {
     /// ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
+    /// It writes the title's reflections for the last time in a frame
+    /// ([`crate::ambient::REFLECTED`]).
+    #[cfg(windows)]
+    pub(crate) ends_reflections: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -121,6 +128,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 resolves_light: crate::ambient::resolves(bytes),
+                #[cfg(windows)]
+                draws_sky: bytes
+                    .windows(crate::ambient::SKY.len())
+                    .any(|w| w == crate::ambient::SKY),
+                #[cfg(windows)]
+                ends_reflections: bytes
+                    .windows(crate::ambient::REFLECTED.len())
+                    .any(|w| w == crate::ambient::REFLECTED),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
