@@ -977,6 +977,45 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    /// Which stores give title-memory copies as written: a vector store
+    /// through a buffer descriptor does not; flat, global and scalar-memory
+    /// stores do, the scalar buffer forms too (kept conservative: their
+    /// descriptor may alias title memory). Each case starts with an
+    /// `s_load_dword` by address, which stores nothing.
+    #[cfg(windows)]
+    #[test]
+    fn only_stores_that_can_take_an_address_count_as_address_stores() {
+        use victory_shader::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+        let program = |store: [u32; 2]| {
+            let words = [0xF400_0202, 0xFA00_0000, store[0], store[1], 0xBF81_0000];
+            NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            }
+        };
+        for (store, name, by_address) in [
+            ([0xE070_1000, 0x8001_0100], "buffer_store_dword", false),
+            ([0xF440_0202, 0xFA00_0000], "s_store_dword", true),
+            ([0xF460_0202, 0xFA00_0000], "s_buffer_store_dword", true),
+            ([0xDC70_8000, 0x007D_0200], "global_store_dword", true),
+            ([0xF400_0202, 0xFA00_0000], "s_load_dword", false),
+        ] {
+            let p = program(store);
+            let code = victory_shader::gfx10::decode(&p.code).unwrap();
+            assert_eq!(code[1].name(), Some(name));
+            assert!(stores(&p) || !by_address, "{name}");
+            assert_eq!(stores_by_address(&p), by_address, "{name}");
+        }
+    }
+
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
             .shaders
