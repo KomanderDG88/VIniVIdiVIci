@@ -708,9 +708,11 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
-/// [`keeps`]). `crate::host::relay` says what it does; here it changes
-/// what a copy keeps:
+/// (on by default: `VICTORY_RELAY` unset, `1` or `2`, any other value turns
+/// it off; not with kept snapshots, [`keeps`]; `crate::host::relay` needs
+/// late waits too, and its second stage, `crate::host::relay_exact`, is the
+/// default unless `VICTORY_RELAY=1`). `crate::host::relay` says what it
+/// does; here it changes what a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
 ///   ([`Flights`]): a range two flights declared stays closed to refreshes
@@ -1361,7 +1363,9 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
+/// across ranges (on by default since c96b4f2b, "about 230 ms a frame
+/// where it was about 400"; `VICTORY_WIDE_BACK=0` keeps them on the
+/// submitting thread).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
