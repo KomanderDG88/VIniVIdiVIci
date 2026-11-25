@@ -10,7 +10,7 @@
 
 Partimos de [victory-fork](https://github.com/fxceless/victory-fork) y [VIctory](https://github.com/Marvisak/VIctory). El código x86-64 del título se ejecuta de forma nativa en la CPU; los programas de la GPU de consola se traducen para Direct3D 12.
 
-> **Estado: experimental. Llega al mundo del juego a unos 3-5 fotogramas por segundo en nuestro equipo.** La [primera medida dentro del juego](#primera-medida-dentro-del-juego) está más abajo, con sus límites. No es jugable y no atribuimos ninguna mejora de FPS a los cambios de este fork. Los resultados de otros proyectos corresponden a sus versiones y equipos.
+> **Estado: experimental. Llega al mundo del juego y el jugador controla al personaje, a unos 2-5 fotogramas por segundo en nuestro equipo.** En [Estado](#estado) está lo que hemos medido y lo que solo está observado. No es jugable y no atribuimos ninguna mejora de FPS a los cambios de este fork. Los resultados de otros proyectos corresponden a sus versiones y equipos.
 
 El repositorio no incluye archivos del juego, sus recursos ni material del SDK de consola. Debes aportar tus propios archivos y guardarlos fuera del repositorio. Es un proyecto comunitario independiente, sin afiliación con fabricantes o editoras.
 
@@ -69,6 +69,19 @@ Algunas rutas de prueba se omiten si falta compilador o dispositivo: el contador
 
 Los comandos de verificación y sus requisitos están en [Validation](README.md#validation). Estas cifras describen pruebas sintéticas, **no rendimiento del juego**.
 
+## Estado
+
+A 25 de noviembre de 2026, con **Windows 11, RTX 4060 Ti, controlador 617.42, Core i7-8700K y 32 GB de RAM**, y los archivos del título en un SSD NVMe.
+
+| | Estado | Notas |
+| :--- | :--- | :--- |
+| En el juego | El jugador controla al personaje | Lo comunica quien lo ejecuta, a las 18:36, en una sesión en Series S con la compilación `6dc5f86` (el código de `main`): el personaje responde a la entrada. Sin instrumentar. |
+| FPS en el mundo | De unos 2 a 5 fps según la escena | Series X, patio, unos 800 draws por frame: 5,0 fps medidos, ese mismo día por la mañana y desde el disco duro. Series S, cinemática inicial, unos 3000 draws: de 2,9 a 3,6 fps medidos (frames habituales de 279 a 343 ms). Con control del jugador: unos 2 fps a ojo, con un trabajo ajeno ocupando el procesador en ese momento; no es una medida. RTX 4060 Ti. |
+| Estabilidad | 13 minutos en una sesión sin caídas | Series S, 800 s, cerrada a propósito. En Series X dura menos en este equipo: se queda sin memoria física. |
+| Imagen | Oscura y con texturas mal | Series S: las texturas se ven mal, y la geometría y las caras están incompletas en algunos planos. Series X: sombras negras. El vídeo inicial sale negro en la última compilación y antes se veía; la causa no está establecida. |
+
+Cómo medimos: los tiempos de frame que la capa anota cada unos cinco segundos, solo en el mundo y por escena. Las cifras salen de compilaciones de diagnóstico, que cuestan tiempo de frame. Un equipo y unas pocas sesiones.
+
 ## Primera medida dentro del juego
 
 Registrada el 25 de noviembre de 2026 en el commit `abf1575`, con **Windows 11, RTX 4060 Ti, controlador 617.42, Core i7-8700K (6 núcleos, 12 hilos) y 32 GB de RAM**, y los archivos del título en un disco duro de 5400 rpm. Compilación de diagnóstico, perfil Series X, `VICTORY_HEAP_SYNC_TABLES=1`, registro de frames y medidor de la tarjeta activados.
@@ -102,7 +115,8 @@ Copiamos los archivos del título a un SSD NVMe del mismo equipo. Estas ejecucio
 
 - Repetir la ejecución en Series S sin nada más usando el procesador y con las cachés calientes, y después con `VICTORY_TEXTURE_NO_WAIT=1` como único cambio.
 - Leer los contadores nuevos de instrucciones de procesador exclusivas de la consola en este equipo Intel (`monitorx`, `mwaitx`, `clzero` y otras se emulan aquí por excepción).
-- Probar el control del jugador cuando se llegue al mundo y registrar la sesión más larga.
+- Averiguar por qué el vídeo inicial sale negro en la última compilación y por qué las texturas se ven mal en Series S.
+- Registrar una sesión más larga con control del jugador, con los FPS por escena.
 - Medir los cambios pendientes de sincronización y copia de vuelta de uno en uno y con un número de draws comparable: fxceless/victory-fork#665, #467, #812, #916, #857 y #853.
 
 ## Colaborar y dar crédito

@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="#what-this-fork-adds">The changes</a> · <a href="#build-and-run">Build &amp; run</a> · <a href="#validation">Validation</a> · <a href="#first-in-game-measurement">In-game measurement</a> · <a href="https://github.com/KomanderDG88/VIniVIdiVIci/issues">Report an issue</a>
+  <a href="#what-this-fork-adds">The changes</a> · <a href="#build-and-run">Build &amp; run</a> · <a href="#status">Status</a> · <a href="#validation">Validation</a> · <a href="#first-in-game-measurement">In-game measurement</a> · <a href="https://github.com/KomanderDG88/VIniVIdiVIci/issues">Report an issue</a>
   <br /><strong>English</strong> · <a href="README.es.md">Español</a>
 </p>
 
@@ -24,7 +24,7 @@
 
 Built on [victory-fork](https://github.com/fxceless/victory-fork) and [VIctory](https://github.com/Marvisak/VIctory), it runs a title's x86-64 code natively on the CPU and translates console GPU programs for Direct3D 12. The current work focuses on wave64 compute, memory correctness and texture updates.
 
-> **Current status: experimental. It reaches the game world at about 3 to 5 frames a second on our machine.** The [first in-game measurement](#first-in-game-measurement) is recorded below with its limits. It is not playable, and no frame-rate gain is claimed for any change in this fork. Results reported by upstream projects belong to their builds and machines.
+> **Current status: experimental. It reaches the game world and the player controls the character, at about 2 to 5 frames a second on our machine.** See [Status](#status) for what is measured and what is only reported. It is not playable, and no frame-rate gain is claimed for any change in this fork. Results reported by upstream projects belong to their builds and machines.
 
 No game files, assets or console SDK material are included. Supply your own files outside the repository. This is an independent community project, unaffiliated with console or game publishers and hardware vendors.
 
@@ -121,6 +121,19 @@ The executable is then `target\diag\victory.exe`. See the [diagnostics reference
 
 </details>
 
+## Status
+
+As of 25 November 2026, on **Windows 11 / RTX 4060 Ti / driver 617.42 / Core i7-8700K / 32 GB of RAM**, with the title's files on an NVMe SSD.
+
+| | Status | Notes |
+| :--- | :--- | :--- |
+| In game | Player in control | Reported by the person running it, at 18:36 in a Series S session of build `6dc5f86` (the code of `main`): the character responds to input. Not instrumented. |
+| Frame rate in the world | About 2 to 5 fps by scene | Series X, yard, about 800 draws a frame: 5.0 fps measured, earlier the same day and from the hard disk. Series S, opening cinematic, about 3,000 draws: 2.9 to 3.6 fps measured (usual frames of 279 to 343 ms). Under player control: about 2 fps by eye, with an unrelated job using the processor at the time; not a measurement. RTX 4060 Ti. |
+| Stability | 13 minutes in one session without a crash | Series S, 800 s, closed on request. Series X stops earlier on this machine: physical memory runs out. |
+| Rendering | Dark, with wrong textures | Series S: textures look wrong, geometry and faces incomplete in places. Series X: shadows black. The opening video is black in the latest build and was visible before; the cause is not established. |
+
+How we measure: the frame times the layer logs about every five seconds, in the world only, given by scene. Figures come from diagnostics builds, which cost frame time. One machine, a handful of sessions.
+
 ## First in-game measurement
 
 Recorded on 25 November 2026 at commit `abf1575`, on **Windows 11 / RTX 4060 Ti / driver 617.42 / Core i7-8700K (6 cores, 12 threads) / 32 GB of RAM**, with the title's files on a 5,400 rpm hard disk. Diagnostics build, Series X profile, `VICTORY_HEAP_SYNC_TABLES=1`, frame log and card meter on.
@@ -154,7 +167,8 @@ The title's files were copied to an NVMe SSD on the same machine. These runs use
 
 - Repeat the Series S run with nothing else using the processor and with warm caches, then with `VICTORY_TEXTURE_NO_WAIT=1` as the only change.
 - Read the new counters of console-only processor instructions on this Intel machine (`monitorx`, `mwaitx`, `clzero` and others are emulated by exception here).
-- Test player control once the world is reached, and record the longest session.
+- Find why the opening video is black in the latest build and why textures look wrong on Series S.
+- Record a longer session under player control, with frame rates by scene.
 - Measure the pending synchronisation and copy-back changes one at a time, at comparable draw counts: fxceless/victory-fork#665, #467, #812, #916, #857 and #853.
 
 ## Contribute
