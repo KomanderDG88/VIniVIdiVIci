@@ -192,6 +192,26 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(rows[0]['requested_settings'], {})
         self.assertEqual(rows[0]['status'], 'inconclusive')
 
+    def test_repeated_case_names_are_refused_before_any_launch(self):
+        binary = self.root / 'victory.exe'
+        binary.write_bytes(b'synthetic')
+        case = {'name': 'same', 'binary': str(binary), 'commit': 'synthetic',
+                'sha256': hashlib.sha256(b'synthetic').hexdigest()}
+        manifest = self.root / 'manifest.json'
+        lab.write_json(manifest, {'runner': str(binary), 'lease_script': 'unused',
+                                  'cases': [dict(case, settings={'VICTORY_A': '1'}), dict(case, settings={'VICTORY_A': '2'})]})
+        launched = []
+        saved = lab.run_command
+        lab.run_command = lambda *a, **k: launched.append(a) or {'status': 'passed'}
+        try:
+            for selected in (None, 'same'):
+                with self.assertRaisesRegex(ValueError, 'same'):
+                    lab.runtime_checks(argparse.Namespace(manifest=str(manifest), case=selected, repo=self.root),
+                                       self.root / 'out', 'synthetic-owner')
+        finally:
+            lab.run_command = saved
+        self.assertEqual(launched, [])
+
     def test_invalid_settings_stop_before_any_launch(self):
         with self.assertRaisesRegex(ValueError, 'VICTORY_STACKS'):
             self.runtime_case({'VICTORY_STACKS': '1'}, {})

@@ -250,6 +250,12 @@ def runtime_checks(args, directory, owner):
     runner = Path(manifest['runner']).resolve()
     results = []
     cases = manifest['cases']
+    # A name is how --case selects and how settings are kept: a repeated one
+    # would let one case run with another's settings unseen.
+    names = [case['name'] for case in cases]
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise ValueError('Repeated runtime case names: ' + ', '.join(repeated))
     if args.case:
         cases = [case for case in cases if case['name'] == args.case]
     if not cases:
