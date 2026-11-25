@@ -752,10 +752,13 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// Last, so it is let go after the device.
+        _one: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let _one = crate::inplace::tests::one_warp_at_a_time();
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -794,6 +797,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _one,
                 })
             }
         }
