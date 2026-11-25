@@ -222,7 +222,7 @@ def case_settings(case):
     for name, value in settings.items():
         if not isinstance(name, str) or not re.fullmatch(r'VICTORY_[A-Z0-9_]+', name):
             raise ValueError(f'Invalid setting name {name!r} in case {case["name"]}')
-        if name in RESERVED_SETTINGS or name.startswith('VICTORY_PROFILE_'):
+        if name in RESERVED_SETTINGS or name.startswith('VICTORY_PROFILE'):
             raise ValueError(f'Setting {name} is governed by another case key or the runner: {case["name"]}')
         if isinstance(value, bool) or not isinstance(value, (str, int)):
             raise ValueError(f'Setting {name} must be a string or an integer: {case["name"]}')

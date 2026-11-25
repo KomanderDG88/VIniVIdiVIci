@@ -45,8 +45,8 @@ when testing a single setting; declare cold caches and competing applications.
 `{"VICTORY_TEXTURE_NO_WAIT": "1"}`. Names match `^VICTORY_[A-Z0-9_]+$`; values
 are strings or integers whose text matches `^[A-Za-z0-9_.,:-]{0,64}$` (no spaces,
 quotes or semicolons). Switches another key or the adapter already governs are
-refused: `VICTORY_HEAP_SYNC_TABLES`, `VICTORY_INDIRECT_WINDOW`, `VICTORY_PROFILE`
-and any `VICTORY_PROFILE_*`, `VICTORY_FRAME_LOG`, `VICTORY_CAPTURE`,
+refused: any name that begins with `VICTORY_PROFILE`, and
+`VICTORY_HEAP_SYNC_TABLES`, `VICTORY_INDIRECT_WINDOW`, `VICTORY_FRAME_LOG`, `VICTORY_CAPTURE`,
 `VICTORY_KEYS`, `VICTORY_CARD_METER`, `VICTORY_STACKS`, `VICTORY_CONFIG` and
 `VICTORY_LOG`. Every selected case's
 settings are checked before any GPU reservation or launch. They reach the

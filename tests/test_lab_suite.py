@@ -122,7 +122,7 @@ class SuiteTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'VICTORY_X'):
                 lab.case_settings({'name': 'c', 'settings': {'VICTORY_X': value}})
         for name in ('VICTORY_HEAP_SYNC_TABLES', 'VICTORY_INDIRECT_WINDOW', 'VICTORY_PROFILE',
-                     'VICTORY_PROFILE_OUT', 'VICTORY_FRAME_LOG', 'VICTORY_CAPTURE', 'VICTORY_KEYS',
+                     'VICTORY_PROFILE_OUT', 'VICTORY_PROFILEX', 'VICTORY_FRAME_LOG', 'VICTORY_CAPTURE', 'VICTORY_KEYS',
                      'VICTORY_CARD_METER', 'VICTORY_STACKS', 'VICTORY_CONFIG', 'VICTORY_LOG'):
             with self.assertRaisesRegex(ValueError, name):
                 lab.case_settings({'name': 'c', 'settings': {name: '1'}})
