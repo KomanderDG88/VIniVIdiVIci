@@ -4,7 +4,9 @@ import contextlib
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -152,7 +154,7 @@ class SuiteTests(unittest.TestCase):
         lab.write_json(manifest, {'runner': str(runner), 'lease_script': 'unused', 'cases': [case]})
         commands = []
 
-        def fake_run(command, cwd, output, timeout):
+        def fake_run(command, cwd, output, timeout, grace=180):
             commands.append(command)
             label = command[command.index('-Label') + 1]
             run = Path(command[command.index('-RunRoot') + 1]) / (label + '-1')
@@ -211,6 +213,89 @@ class SuiteTests(unittest.TestCase):
         finally:
             lab.run_command = saved
         self.assertEqual(launched, [])
+
+    def lease_helper(self):
+        """A claim/release helper that records the last action asked of it."""
+        helper = self.root / 'lease.py'
+        helper.write_text('import sys\nfrom pathlib import Path\n'
+                          'Path(__file__).with_suffix(".state").write_text(sys.argv[1])\n')
+        return helper
+
+    def test_a_timeout_ends_the_whole_tree_and_the_lease_is_released(self):
+        marker = self.root / 'grandchild-wrote.txt'
+        grandchild = 'import time; from pathlib import Path; time.sleep(2); Path(' + repr(str(marker)) + ').write_text("late")'
+        parent = 'import subprocess,sys,time; subprocess.Popen([sys.executable,"-c",' + repr(grandchild) + ']); time.sleep(30)'
+        helper = self.lease_helper()
+        with lab.gpu_lease(helper, 'synthetic-owner') as lease:
+            row = lab.run_command([sys.executable, '-c', parent], self.root, self.root / 'tree', .8, grace=10)
+            self.assertFalse(lab.left_running(row, lease))
+        self.assertEqual(row['status'], 'timeout')
+        self.assertTrue(row['tree_gone'])
+        self.assertEqual(row['tree']['still_present'], [])
+        if os.name == 'nt':
+            self.assertTrue(row['tree']['job'])
+            self.assertGreaterEqual(len(row['tree']['pids_seen']), 2, 'the grandchild was not seen in the job')
+        self.assertEqual(helper.with_suffix('.state').read_text(), 'release')
+        time.sleep(2.2)
+        self.assertFalse(marker.exists(), 'the grandchild outlived the timeout')
+
+    def test_processes_left_running_keep_the_lease_taken(self):
+        helper = self.lease_helper()
+        saved = lab.ProcessTree.present
+        lab.ProcessTree.present = lambda tree: [424242]  # as if a process of the tree would not go
+        try:
+            with self.assertRaises(lab.LeaseHeld) as held:
+                with lab.gpu_lease(helper, 'synthetic-owner') as lease:
+                    row = lab.run_command([sys.executable, '-c', 'pass'], self.root, self.root / 'stuck', 5, grace=.3)
+                    self.assertFalse(row['tree_gone'])
+                    self.assertGreaterEqual(row['tree']['waited_seconds'], .3)
+                    self.assertTrue(lab.left_running(row, lease))
+        finally:
+            lab.ProcessTree.present = saved
+        self.assertEqual(row['status'], 'error')
+        self.assertEqual(helper.with_suffix('.state').read_text(), 'claim', 'the lease was released')
+        message = str(held.exception)
+        for part in ('synthetic-owner', '424242', 'release --owner synthetic-owner'):
+            self.assertIn(part, message)
+
+    @unittest.skipUnless(os.name == 'nt', 'creation times identify processes on Windows')
+    def test_a_reused_pid_is_not_one_of_ours(self):
+        me = os.getpid()
+        created = lab.process_created(me)
+        self.assertIsNotNone(created)
+        tree = lab.ProcessTree()
+        tree.seen = {me: created + 1}  # the same PID, another process
+        self.assertEqual(tree.present(), [])
+        tree.seen = {me: created}
+        self.assertEqual(tree.present(), [me])
+        ended = subprocess.Popen([sys.executable, '-c', 'pass'])
+        ended.wait()  # ended, while Popen still holds it open: not running
+        self.assertIsNone(lab.process_created(ended.pid))
+
+    def test_a_normal_command_does_not_wait_for_nothing(self):
+        row = lab.run_command([sys.executable, '-c', 'pass'], self.root, self.root / 'quick', 5, grace=60)
+        self.assertEqual(row['status'], 'passed')
+        self.assertTrue(row['tree_gone'])
+        self.assertLess(row['tree']['waited_seconds'], 1)
+
+    def test_a_runtime_timeout_is_never_passed_nor_inconclusive(self):
+        binary = self.root / 'victory.exe'
+        binary.write_bytes(b'synthetic')
+        case = {'name': 'slow', 'binary': str(binary), 'commit': 'synthetic',
+                'sha256': hashlib.sha256(b'synthetic').hexdigest(), 'max_seconds': 120}
+        manifest = self.root / 'manifest.json'
+        lab.write_json(manifest, {'runner': str(binary), 'lease_script': 'unused', 'cases': [case, dict(case, name='next')]})
+        ran = []
+        saved = lab.run_command, lab.gpu_lease
+        lab.run_command = lambda command, *a, **k: ran.append(command) or {'status': 'timeout', 'exit_code': 1, 'tree_gone': True}
+        lab.gpu_lease = lambda script, owner: contextlib.nullcontext()
+        try:
+            rows = lab.runtime_checks(argparse.Namespace(manifest=str(manifest), case=None, repo=self.root),
+                                      self.root / 'out', 'synthetic-owner')
+        finally:
+            lab.run_command, lab.gpu_lease = saved
+        self.assertEqual([row['status'] for row in rows], ['timeout'])
+        self.assertEqual(len(ran), 1, 'a case ran after a timeout')
 
     def test_invalid_settings_stop_before_any_launch(self):
         with self.assertRaisesRegex(ValueError, 'VICTORY_STACKS'):

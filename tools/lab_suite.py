@@ -49,35 +49,198 @@ def log_lines(path):
         yield from stream
 
 
-def run_command(command, cwd, output, timeout):
-    """No shell expansion; timeout stops only this command's process tree."""
+# A command's processes are followed as a tree: on Windows a Job Object the
+# child is put in before it runs (it is created suspended, so no descendant
+# can start outside it; descendants inherit the job), elsewhere the child's
+# own process group. Every process seen in the tree is remembered with its
+# creation time, so that a reused PID is never taken for one of ours.
+if os.name == 'nt':
+    import ctypes
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    _ntdll = ctypes.WinDLL('ntdll')
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    _kernel32.TerminateJobObject.restype = wintypes.BOOL
+    _kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    _kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    _kernel32.QueryInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                    wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _kernel32.GetProcessTimes.restype = wintypes.BOOL
+    _kernel32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    _kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    _kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    _ntdll.NtResumeProcess.restype = ctypes.c_long
+    _ntdll.NtResumeProcess.argtypes = (wintypes.HANDLE,)
+    CREATE_SUSPENDED = 0x4
+    JOB_PROCESS_ID_LIST = 3  # JobObjectBasicProcessIdList
+
+    class _ProcessIds(ctypes.Structure):
+        _fields_ = [('assigned', wintypes.DWORD), ('listed', wintypes.DWORD), ('ids', ctypes.c_size_t * 4096)]
+
+
+def process_created(pid):
+    """Process `pid`'s creation time while it runs; None once it has ended (or never was).
+
+    A process that has ended but is still held open by someone counts as ended:
+    its object is signaled. Elsewhere than on Windows: True while it exists."""
+    if os.name != 'nt':
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            pass
+        return True
+    handle = _kernel32.OpenProcess(0x1000 | 0x00100000, False, pid)  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+    if not handle:
+        return None
+    try:
+        if _kernel32.WaitForSingleObject(handle, 0) == 0:  # signaled: it has ended
+            return None
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not _kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return None
+        return times[0].dwHighDateTime << 32 | times[0].dwLowDateTime
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+class ProcessTree:
+    """The processes of one command (see above)."""
+
+    def __init__(self):
+        self.job = None
+        self.root = None
+        self.seen = {}  # pid -> creation time
+
+    def start(self, child):
+        """With `child` just created (suspended, on Windows): puts it in a job, then lets it run."""
+        self.root = child.pid
+        if os.name != 'nt':
+            self.seen[child.pid] = process_created(child.pid)
+            return
+        handle = int(child._handle)  # the process handle Popen holds
+        job = _kernel32.CreateJobObjectW(None, None)
+        if job and _kernel32.AssignProcessToJobObject(job, handle):
+            self.job = job
+        elif job:
+            _kernel32.CloseHandle(job)
+        self.collect()
+        if _ntdll.NtResumeProcess(handle) != 0:
+            child.kill()
+            raise OSError('The command could not be resumed after being put in its job')
+
+    def pids(self):
+        if self.job is None:
+            return [self.root] if self.root is not None else []
+        ids = _ProcessIds()
+        if not _kernel32.QueryInformationJobObject(self.job, JOB_PROCESS_ID_LIST, ctypes.byref(ids),
+                                                   ctypes.sizeof(ids), None):
+            return []
+        return list(ids.ids[:ids.listed])
+
+    def collect(self):
+        """Remembers the processes in the tree now."""
+        for pid in self.pids():
+            if pid not in self.seen:
+                created = process_created(pid)
+                if created is not None:
+                    self.seen[pid] = created
+
+    def stop(self):
+        """Ends every process of the tree (on a timeout or an interruption)."""
+        self.collect()
+        if os.name != 'nt':
+            import signal
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.root, signal.SIGKILL)
+        elif self.job is not None:
+            _kernel32.TerminateJobObject(self.job, 1)
+        elif self.root is not None:
+            subprocess.run(['taskkill', '/PID', str(self.root), '/T', '/F'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+
+    def present(self):
+        """The processes seen that still run as themselves (the same creation time)."""
+        if os.name != 'nt':
+            if self.root is None:
+                return []
+            try:
+                os.killpg(self.root, 0)
+            except ProcessLookupError:
+                return []
+            except PermissionError:
+                pass
+            return [self.root]
+        return sorted(pid for pid, created in self.seen.items() if process_created(pid) == created)
+
+    def close(self):
+        if self.job is not None:
+            _kernel32.CloseHandle(self.job)  # no kill-on-close: closing ends nothing
+            self.job = None
+
+
+def wait_collecting(child, tree, timeout):
+    """`child.wait(timeout)`, remembering the tree's processes while it runs."""
+    deadline = time.monotonic() + timeout
+    while True:
+        tree.collect()
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(child.args, timeout)
+        try:
+            return child.wait(timeout=min(0.25, left))
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def run_command(command, cwd, output, timeout, grace=180):
+    """No shell expansion. The command runs as a process tree of its own; a
+    timeout or an interruption ends that whole tree. Then every process seen in
+    it must be gone, waiting up to `grace` seconds (a process of many GB takes
+    a while to leave): `tree_gone` says whether they are."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     result = {'command': command, 'cwd': str(cwd), 'timeout_seconds': timeout,
               'started': dt.datetime.now(dt.timezone.utc).isoformat()}
     start = time.monotonic()
-    options = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
+    tree = ProcessTree()
+    options = ({'creationflags': subprocess.CREATE_NO_WINDOW | CREATE_SUSPENDED} if os.name == 'nt'
+               else {'start_new_session': True})
     with (output / 'stdout.log').open('wb') as stdout, (output / 'stderr.log').open('wb') as stderr:
         try:
             child = subprocess.Popen(command, cwd=cwd, env=clean_environment(),
                                      stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, **options)
             result['pid'] = child.pid
             try:
-                result['exit_code'] = child.wait(timeout=timeout)
+                tree.start(child)
+                result['exit_code'] = wait_collecting(child, tree, timeout)
                 result['status'] = 'passed' if child.returncode == 0 else 'failed'
             except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
                 result['status'] = 'timeout' if isinstance(error, subprocess.TimeoutExpired) else 'interrupted'
-                if child.poll() is None:
-                    if os.name == 'nt':
-                        subprocess.run(['taskkill', '/PID', str(child.pid), '/T', '/F'],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-                    else:
-                        import signal
-                        os.killpg(child.pid, signal.SIGKILL)
+                tree.stop()
                 child.wait(timeout=20)
                 result['exit_code'] = child.returncode
         except OSError as error:
             result.update(status='error', error=str(error), exit_code=None)
+    tree.collect()
+    waiting = time.monotonic()
+    still = tree.present()
+    while still and time.monotonic() - waiting < grace:
+        time.sleep(0.5)
+        still = tree.present()
+    result['tree'] = {'pids_seen': sorted(tree.seen), 'still_present': still,
+                      'waited_seconds': round(time.monotonic() - waiting, 3), 'job': tree.job is not None}
+    result['tree_gone'] = not still
+    tree.close()
     result['seconds'] = round(time.monotonic() - start, 3)
     write_json(output / 'result.json', result)
     return result
@@ -96,8 +259,33 @@ def rust_results(paths):
             'ignored': sum(row['ignored'] for row in summaries), 'summaries': len(summaries)}
 
 
+class LeaseHeld(RuntimeError):
+    """The GPU reservation was left taken: a command's processes did not go.
+    `results` carries the rows run so far into the report."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.results = []
+
+
+class Lease:
+    """The suite's GPU reservation while it is held; `keep` leaves it taken on the way out."""
+
+    def __init__(self, command, owner):
+        self.command, self.owner, self.kept = command, owner, None
+
+    def keep(self, row):
+        self.kept = row
+
+    def release_by_hand(self):
+        return subprocess.list2cmdline(self.command + ['release', '--owner', self.owner])
+
+
 @contextlib.contextmanager
 def gpu_lease(script, owner):
+    """Claims the GPU and yields a `Lease`. On the way out it is released, unless a
+    command's processes were still present (`Lease.keep`): then it stays taken, and
+    `LeaseHeld` names the owner, the processes and how to release it by hand."""
     if not script or not Path(script).is_file():
         raise ValueError('GPU checks require --lease-script (the shared claim/release helper)')
     command = [sys.executable, str(Path(script).resolve())]
@@ -105,13 +293,32 @@ def gpu_lease(script, owner):
                              capture_output=True, text=True, timeout=20)
     if claimed.returncode:
         raise RuntimeError('GPU reservation refused: ' + claimed.stderr.strip())
+    lease = Lease(command, owner)
     try:
-        yield
+        yield lease
     finally:
+        if lease.kept is not None:
+            tree = lease.kept.get('tree', {})
+            raise LeaseHeld(f'GPU reservation LEFT TAKEN by {owner}: processes of '
+                            f'{lease.kept.get("name") or lease.kept.get("command")} were still present after '
+                            f'{tree.get("waited_seconds")} s (PIDs {tree.get("still_present")}). Make sure they are '
+                            f'gone, then release it by hand: {lease.release_by_hand()}')
         released = subprocess.run(command + ['release', '--owner', owner],
                                   capture_output=True, text=True, timeout=20)
         if released.returncode:
             raise RuntimeError('GPU release failed: ' + released.stderr.strip())
+
+
+def left_running(row, lease):
+    """A command whose processes did not all go: an error, nothing more runs, and
+    the GPU reservation (if any) is kept."""
+    if row.get('tree_gone', True):
+        return False
+    still = row.get('tree', {}).get('still_present')
+    row.update(status='error', reason=f'Processes of the command still present after the exit grace: PIDs {still}')
+    if lease is not None:
+        lease.keep(row)
+    return True
 
 
 def runtime_summary(run):
@@ -183,22 +390,27 @@ def code_checks(args, directory, owner):
         for crate in ('victory-gpu', 'victory-shader', 'victory-hle'):
             cases.append((crate, ['cargo', 'test', '--locked', '-p', crate, '--lib', '--', '--test-threads=1'], True))
     results = []
-    lease = gpu_lease(args.lease_script, owner) if args.gpu else contextlib.nullcontext()
-    with lease:
-        for repetition in range(args.repeat):
-            for name, command, rust in cases:
-                folder = directory / f'{repetition + 1:02d}-{name}'
-                row = run_command(command, args.repo, folder, args.timeout)
-                row.update(name=name, repetition=repetition + 1)
-                if rust:
-                    row['tests'] = rust_results([folder / 'stdout.log', folder / 'stderr.log'])
-                    if row['status'] == 'passed' and (row['tests']['passed'] == 0 or row['tests']['failed']):
-                        row['status'] = 'failed'
-                        row['reason'] = 'No passing Rust tests, or a failing test summary'
-                results.append(row)
-                write_json(directory / 'progress.json', results)
-                if row['status'] != 'passed':
-                    return results
+    grace = getattr(args, 'exit_grace', 180)
+    try:
+        with (gpu_lease(args.lease_script, owner) if args.gpu else contextlib.nullcontext()) as lease:
+            for repetition in range(args.repeat):
+                for name, command, rust in cases:
+                    folder = directory / f'{repetition + 1:02d}-{name}'
+                    row = run_command(command, args.repo, folder, args.timeout, grace)
+                    row.update(name=name, repetition=repetition + 1)
+                    if rust:
+                        row['tests'] = rust_results([folder / 'stdout.log', folder / 'stderr.log'])
+                        if row['status'] == 'passed' and (row['tests']['passed'] == 0 or row['tests']['failed']):
+                            row['status'] = 'failed'
+                            row['reason'] = 'No passing Rust tests, or a failing test summary'
+                    gone = not left_running(row, lease)
+                    results.append(row)
+                    write_json(directory / 'progress.json', results)
+                    if row['status'] != 'passed' or not gone:
+                        return results
+    except LeaseHeld as held:
+        held.results = results
+        raise
     return results
 
 
@@ -287,9 +499,17 @@ def runtime_checks(args, directory, owner):
         settings = requested[case['name']]
         if settings:
             command.extend(['-Settings', settings_argument(settings)])
-        with gpu_lease(manifest['lease_script'], owner):
-            row = run_command(command, args.repo, folder, duration + 120)
-        row.update(name=case['name'], runner_sha256=sha256(runner), requested_settings=settings)
+        try:
+            with gpu_lease(manifest['lease_script'], owner) as lease:
+                row = run_command(command, args.repo, folder, duration + 120, getattr(args, 'exit_grace', 180))
+                row.update(name=case['name'], runner_sha256=sha256(runner), requested_settings=settings)
+                left_running(row, lease)
+        except LeaseHeld as held:
+            # The game's processes did not all go: nothing more runs, and the reservation stays taken.
+            results.append(row)
+            write_json(directory / 'progress.json', results)
+            held.results = results
+            raise
         runs = list(run_root.glob(label + '-*')) if run_root.exists() else []
         if row['status'] == 'passed' and len(runs) == 1:
             try:
@@ -323,10 +543,12 @@ def main():
     parser.add_argument('--timeout', type=int, default=900)
     parser.add_argument('--manifest', type=Path)
     parser.add_argument('--case')
+    parser.add_argument('--exit-grace', type=int, default=180,
+                        help='Seconds to wait, after a command ends, for every process it started to be gone')
     args = parser.parse_args()
     args.repo = args.repo.resolve()
-    if args.repeat < 1 or args.timeout < 1:
-        parser.error('repeat and timeout must be positive')
+    if args.repeat < 1 or args.timeout < 1 or args.exit_grace < 0:
+        parser.error('repeat and timeout must be positive, and exit grace not negative')
     if args.mode == 'runtime' and not args.manifest:
         parser.error('runtime requires a private --manifest')
     root = outside_repository(args.out, args.repo)
@@ -343,6 +565,9 @@ def main():
         report['results'] = (code_checks if args.mode == 'code' else runtime_checks)(args, directory, owner)
         statuses = {row['status'] for row in report['results']}
         report['status'] = 'failed' if statuses - {'passed', 'inconclusive'} else ('inconclusive' if 'inconclusive' in statuses else 'passed')
+    except LeaseHeld as error:
+        # The GPU reservation is still taken on purpose; the message says how to release it.
+        report.update(status='error', error=str(error), results=error.results, lease_left_taken=True)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
         report.update(status='error', error=str(error))
     except KeyboardInterrupt:
