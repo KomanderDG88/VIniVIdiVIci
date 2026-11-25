@@ -110,6 +110,10 @@ impl Pending {
         }
     }
 
+    pub(super) fn key(&self) -> &str {
+        &self.key
+    }
+
     fn make(&self) {
         if self.screen {
             let _ = self.begun.set(Instant::now());

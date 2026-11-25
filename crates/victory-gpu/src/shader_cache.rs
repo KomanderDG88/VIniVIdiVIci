@@ -88,6 +88,11 @@ fn translate_counted(container: &[u8]) -> Result<HostShader, String> {
 /// build used to translate the title's thousands of shaders again, which kept
 /// the first minutes of every test run short of pipelines).
 /// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
+/// What tells one set of translations from another ([`build`]).
+pub(crate) fn translation() -> [u8; 32] {
+    build()
+}
+
 /// Worked out per lookup, so a translation made before the device said its
 /// wave size is never filed under the later key.
 fn build() -> [u8; 32] {
