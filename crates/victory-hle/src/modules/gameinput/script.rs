@@ -1,8 +1,12 @@
 //! `VICTORY_KEYS`: keys pressed on a script, for runs nobody plays by hand
 //! (diagnostics builds). `<seconds>:<key>` presses a key that long after
 //! input starts; `<seconds>:<key>*<n>/<gap>` presses it `n` times, `gap`
-//! seconds apart (10 when only `*<n>` is given). A key is a letter, a digit,
-//! or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
+//! seconds apart (10 when only `*<n>` is given). `<key>~<hold>` holds the key
+//! down exactly `hold` seconds (0.2 to 60), whatever the title reads, to walk
+//! or turn: `300:W~3` holds W for three seconds at 300 s, `300:W~3*4/10` does
+//! so four times; its line in the log says how many reads saw it down (0: the
+//! title did not read its input then). A key is a letter, a digit, or `Enter`,
+//! `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
 //!
 //! A press is held until the title has read the input with the key down
 //! [`Script::need`] times (`VICTORY_KEYS_READS`, 1 by default: while loading
@@ -32,6 +36,9 @@ pub(super) struct Press {
     pub at: Duration,
     /// The virtual key.
     pub vk: u8,
+    /// `~<hold>`: held down exactly this long, whatever the reads; `None`:
+    /// until read (see the module).
+    pub hold: Option<Duration>,
 }
 
 /// What happened to a press, for the log.
@@ -41,6 +48,13 @@ pub(super) enum Note {
     Down { vk: u8, at: Duration },
     /// Let go after `reads` reads saw it down, held `held`.
     Seen {
+        vk: u8,
+        at: Duration,
+        reads: u32,
+        held: Duration,
+    },
+    /// A key with `~<hold>` let go after its hold; `reads` saw it down.
+    Held {
         vk: u8,
         at: Duration,
         reads: u32,
@@ -78,6 +92,14 @@ fn entry_presses(entry: &str) -> Option<Vec<Press>> {
         Some((key, repeat)) => (key, Some(repeat)),
         None => (rest, None),
     };
+    let (key, hold) = match key.split_once('~') {
+        Some((key, hold)) => (key, Some(seconds(hold)?)),
+        None => (key, None),
+    };
+    // Held at least the shortest hold, at most a minute.
+    if hold.is_some_and(|h| h < MIN_HOLD || h > Duration::from_secs(60)) {
+        return None;
+    }
     let vk = key_code(key.trim())?;
     let (times, gap) = match repeat {
         None => (1, Duration::ZERO),
@@ -88,7 +110,7 @@ fn entry_presses(entry: &str) -> Option<Vec<Press>> {
             };
             let times: u32 = times.trim().parse().ok()?;
             // A gap shorter than a held press would run presses together.
-            if !(1..=100).contains(&times) || (times > 1 && gap < MIN_HOLD * 2) {
+            if !(1..=100).contains(&times) || (times > 1 && gap < hold.unwrap_or(MIN_HOLD) + MIN_HOLD) {
                 return None;
             }
             (times, gap)
@@ -99,6 +121,7 @@ fn entry_presses(entry: &str) -> Option<Vec<Press>> {
             .map(|i| Press {
                 at: at + gap * i,
                 vk,
+                hold,
             })
             .collect(),
     )
@@ -174,7 +197,17 @@ impl Script {
                 continue;
             };
             let held = now.saturating_sub(since);
-            if *reads >= self.need && held >= MIN_HOLD {
+            if let Some(hold) = press.hold {
+                if held < hold {
+                    continue;
+                }
+                notes.push(Note::Held {
+                    vk: press.vk,
+                    at: since,
+                    reads: *reads,
+                    held,
+                });
+            } else if *reads >= self.need && held >= MIN_HOLD {
                 notes.push(Note::Seen {
                     vk: press.vk,
                     at: since,
@@ -205,10 +238,13 @@ impl Script {
                 .presses
                 .iter()
                 .any(|(p, s, _)| p.vk == press.vk && matches!(s, State::Down { .. }));
-            let unseen = self
-                .released
-                .iter()
-                .any(|&(vk, at, _)| vk == press.vk && now.saturating_sub(at) < GIVE_UP);
+            // A press with a hold of its own (`~<hold>`) has its gap set by
+            // the script: it does not wait for a read to see the key up.
+            let unseen = press.hold.is_none()
+                && self
+                    .released
+                    .iter()
+                    .any(|&(vk, at, _)| vk == press.vk && now.saturating_sub(at) < GIVE_UP);
             if busy || unseen {
                 continue;
             }
@@ -384,6 +420,47 @@ mod tests {
         assert!(down.is_empty());
     }
 
+    /// `~<hold>`: a key held for a walk is held exactly that long, read
+    /// often or not at all; repeats leave room for the hold; bad holds are
+    /// named.
+    #[test]
+    fn a_held_key_stays_down_exactly_its_hold() {
+        let (presses, bad) = parse("1:W~3, 10:D~2*2/5, 20:W~0.1, 20:W~61, 30:W~3*2/3");
+        assert_eq!(bad, ["20:W~0.1", "20:W~61", "30:W~3*2/3"]);
+        assert_eq!(presses.len(), 3);
+        // Read often (every 0.1 s): not let go before its hold.
+        let mut script = Script::new(presses.clone(), 1);
+        let reads: Vec<f64> = (0..300).map(|i| f64::from(i) * 0.1).collect();
+        let (_, notes) = run(&mut script, 0.0, 25.0, &reads);
+        let helds: Vec<(u8, u32, Duration)> = notes
+            .iter()
+            .filter_map(|n| match n {
+                Note::Held { vk, reads, held, .. } => Some((*vk, *reads, *held)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(helds.len(), 3, "{notes:?}");
+        assert_eq!(helds[0].0, b'W');
+        assert!(helds[0].1 >= 25, "read about 30 times: {helds:?}");
+        assert!(helds[0].2 >= secs(3.0) && helds[0].2 < secs(3.05), "{helds:?}");
+        for &(vk, _, held) in &helds[1..] {
+            assert_eq!(vk, b'D');
+            assert!(held >= secs(2.0) && held < secs(2.05), "{helds:?}");
+        }
+        // Never read: let go at its hold all the same, with 0 reads.
+        let mut script = Script::new(presses, 1);
+        let (_, notes) = run(&mut script, 0.0, 25.0, &[]);
+        let unread: Vec<(u32, Duration)> = notes
+            .iter()
+            .filter_map(|n| match n {
+                Note::Held { reads, held, .. } => Some((*reads, *held)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unread.len(), 3, "{notes:?}");
+        assert!(unread.iter().all(|&(r, h)| r == 0 && h < secs(3.05)), "{unread:?}");
+    }
+
     #[test]
     fn the_old_form_still_presses_once() {
         let (presses, bad) = parse("150:Enter, 151.5:a");
@@ -393,11 +470,13 @@ mod tests {
             [
                 Press {
                     at: secs(150.0),
-                    vk: ENTER
+                    vk: ENTER,
+                    hold: None
                 },
                 Press {
                     at: secs(151.5),
-                    vk: b'A'
+                    vk: b'A',
+                    hold: None
                 }
             ]
         );
@@ -410,7 +489,8 @@ mod tests {
             presses,
             [Press {
                 at: secs(7.0),
-                vk: 0x1B
+                vk: 0x1B,
+                hold: None
             }]
         );
         assert_eq!(

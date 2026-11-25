@@ -1163,12 +1163,32 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
+            // Sticks and triggers too, by the same table as the stand-in's
+            // (W A S D, I J K L, Z, C): a scripted walk moves the character
+            // with a real pad connected as well.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
+                let keys: Vec<KeyState> = scripted()
+                    .into_iter()
+                    .map(|vk| KeyState {
+                        virtual_key: vk,
+                        ..Default::default()
+                    })
+                    .collect();
+                if !keys.is_empty() {
+                    let s = super::fallback(&keys);
+                    pad.buttons |= s.buttons;
+                    let set = |v: &mut f32, scripted: f32| {
+                        if scripted != 0.0 {
+                            *v = scripted;
+                        }
+                    };
+                    set(&mut pad.left_trigger, s.left_trigger);
+                    set(&mut pad.right_trigger, s.right_trigger);
+                    set(&mut pad.left_x, s.left_x);
+                    set(&mut pad.left_y, s.left_y);
+                    set(&mut pad.right_x, s.right_x);
+                    set(&mut pad.right_y, s.right_y);
                 }
             }
             Some(pad)
@@ -1237,6 +1257,18 @@ mod host {
                     reads,
                     held_ms = held.as_millis() as u64,
                     "scripted key let go: the title read it"
+                ),
+                super::script::Note::Held {
+                    vk,
+                    at,
+                    reads,
+                    held,
+                } => tracing::info!(
+                    key = vk,
+                    at = at.as_secs_f64(),
+                    reads,
+                    held_ms = held.as_millis() as u64,
+                    "scripted key let go after its hold (reads: how many of the title's reads saw it down; 0 = none)"
                 ),
                 super::script::Note::Unread {
                     vk,
