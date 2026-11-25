@@ -207,6 +207,9 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
+    // Null views put off while submissions were in flight
+    // (`VICTORY_UNMAKE_QUIET=1`), now that none may be.
+    crate::descriptor::flush_idle_heaps();
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;

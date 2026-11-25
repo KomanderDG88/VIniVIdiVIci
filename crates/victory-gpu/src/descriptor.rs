@@ -170,6 +170,24 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Writes the null views put off while submissions were in flight
+/// (`VICTORY_UNMAKE_QUIET=1`) on every live shader-visible view heap, once
+/// none is; nothing to do otherwise. From victory-unified 768735ad.
+#[cfg(windows)]
+pub(crate) fn flush_idle_heaps() {
+    if !host::unmake_quiet() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            host.flush_unmake();
+        }
+    }
+}
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.

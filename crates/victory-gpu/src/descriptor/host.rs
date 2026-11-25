@@ -155,6 +155,10 @@ pub(crate) struct HostHeap {
     /// the lock wherever `made` is, to 0 before a slot is made again and
     /// to its record only once the slot is made and kept.
     made_now: Vec<std::sync::atomic::AtomicU64>,
+    /// Slots made null while submissions were in flight, whose null
+    /// descriptor and letting go wait until none is (`(index, key)`;
+    /// [`unmake_quiet`], [`HostHeap::flush_unmake`]).
+    pending_unmake: Mutex<Vec<(u32, u64)>>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -399,6 +403,19 @@ pub(crate) fn views_remade() -> [u64; 2] {
 fn views_remade_quiet() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEWS_REMADE_QUIET").is_some_and(|v| v == "1"))
+}
+
+/// Whether a view slot made null again while a submission is in flight
+/// keeps its descriptor (and the resource it holds) until none is
+/// (`VICTORY_UNMAKE_QUIET=1`; off by default: written at once, as before).
+/// Direct3D 12 asks that a descriptor a submitted list reads is left alone
+/// until the list has run. From victory-unified 768735ad, whose author saw
+/// MMU faults of the NVIDIA driver after some 50 minutes on an 8 GB card;
+/// here the old resource already goes through `crate::host::retire`, so
+/// what is left is the null write itself.
+pub(crate) fn unmake_quiet() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNMAKE_QUIET").is_some_and(|v| v == "1"))
 }
 
 /// The first level with memory of the placed texture at `start` changed:
@@ -1497,6 +1514,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             made_now: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            pending_unmake: Mutex::new(Vec::new()),
             copied: Mutex::new(Vec::new()),
             kept: (0..KEPT_PIECES)
                 .map(|_| Mutex::new(vec![None; (count + extra).div_ceil(KEPT_PIECES) as usize]))
@@ -2172,7 +2190,8 @@ impl HostHeap {
     }
 
     /// Makes host slot `index` null again, as it is before its view is
-    /// made: a null view of the kind it held.
+    /// made: a null view of the kind it held. With [`unmake_quiet`] and a
+    /// submission in flight, the write waits ([`HostHeap::flush_unmake`]).
     fn unmake(&self, made: &mut [u64], index: u32) {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
@@ -2183,11 +2202,42 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        if unmake_quiet() && crate::host::submissions_in_flight() > 0 {
+            self.pending_unmake
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((index, key));
+            return;
+        }
+        self.unmake_key(index, key);
+    }
+
+    /// Writes the null view for slot `index`, made from record `key`, and
+    /// lets go of what it held. No submission may be reading the slot.
+    fn unmake_key(&self, index: u32, key: u64) {
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
         }
         self.keep(index, None);
+    }
+
+    /// Writes the null views [`HostHeap::unmake`] put off, once no
+    /// submission is in flight; a slot made again since is left as it is.
+    pub(crate) fn flush_unmake(&self) -> usize {
+        if crate::host::submissions_in_flight() > 0 {
+            return 0;
+        }
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = std::mem::take(&mut *self.pending_unmake.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut flushed = 0;
+        for (index, key) in pending {
+            if made.get(index as usize).is_some_and(|&now| now == 0) {
+                self.unmake_key(index, key);
+                flushed += 1;
+            }
+        }
+        flushed
     }
 
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
@@ -2965,9 +3015,13 @@ impl HostHeap {
             if made[index as usize] != 0 {
                 #[cfg(feature = "diagnostics")]
                 held.slot_changed();
-                made[index as usize] = 0;
-                self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
-                self.make_null(index);
+                if !self.sampler && unmake_quiet() {
+                    self.unmake(made, index);
+                } else {
+                    made[index as usize] = 0;
+                    self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
+                    self.make_null(index);
+                }
                 let _ = self.note_buffer_into(index, None, false, record_change, batch);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
@@ -5737,6 +5791,27 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// Null views put off while submissions were in flight are written
+    /// only for slots still null; one made again since is left alone.
+    #[test]
+    fn deferred_unmake_flushes_only_still_cleared_slots() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        {
+            let mut made = heap.made.lock().unwrap_or_else(|e| e.into_inner());
+            made[1] = 0;
+            made[2] = 42;
+        }
+        heap.pending_unmake
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend([(1, 100), (2, 200)]);
+        assert_eq!(heap.flush_unmake(), 1);
+        assert_eq!(heap.flush_unmake(), 0);
+        assert_eq!(heap.made.lock().unwrap_or_else(|e| e.into_inner())[2], 42);
     }
 
     /// The title's view heap in the retail game.
