@@ -22,6 +22,28 @@ suite uses a unique owner, releases in a finally block, and never steals a lease
 Use the same helper as other agents on the machine. `--repeat 3` repeats the
 checks; `--timeout 900` sets a per-command limit. A failure stops the sequence.
 
+### Process trees and the exit grace
+
+Every command runs as a tree of its own. On Windows it is created suspended,
+put in a Job Object (its descendants inherit the job) and then resumed, so no
+descendant starts outside it; elsewhere it has its own process group. Every
+process seen in the tree is remembered with its creation time, so a reused PID
+is never taken for one of ours. A timeout or an interruption ends the whole job.
+
+When a command has ended, every process seen in it must be gone before anything
+else happens, waiting up to `--exit-grace` seconds (180 by default: a process
+of many GB takes a while to leave). Each command's `result.json` records
+`tree` (`pids_seen`, `still_present`, `waited_seconds`, `job`) and `tree_gone`.
+
+If processes are still present after the grace, that command is an `error`,
+nothing more runs, and the **GPU reservation is left taken on purpose**: another
+agent must not get the card and the memory while they are still in use. The
+report is `error` with `lease_left_taken: true`, and its message names the
+owner, the PIDs still present and the exact command that releases it. To
+recover by hand: check that those PIDs are gone (Task Manager, or
+`tasklist /FI "PID eq <pid>"`), then run that command, which is
+`python <lease-script> release --owner <owner>`.
+
 The runner has its own synthetic tests:
 
 ```powershell
