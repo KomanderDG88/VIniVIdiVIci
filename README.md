@@ -7,12 +7,14 @@ A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (its
 - **Wave64 compute programs in a paired form on 32-lane GPUs** — fxceless/victory-fork#854 by PiloteCode, merged as is. A console wave of 64 lanes runs as one host wave of 32 threads, two lanes a thread, instead of asking for `WaveSize(64)` (which NVIDIA refuses) or taking an approximate per-half form. Also: mesh programs over 32 KiB linked with their pixel program, and the rest of that pull request.
 - **Wide title-memory accesses across a 64 KiB page** — fxceless/victory-fork#846 by gomeaw, with the author's test fixture. `global_load/store_dwordxN` and `s_load_dwordxN` that straddle a page now use each page's own mapping.
 - **Helper lanes in waterfall loops** — a port of VIctory upstream `0601955` by Vax: in a pixel shader, `v_readfirstlane_b32` in a helper lane reads the lane's own value, so a waterfall loop serves helper lanes in its first pass instead of running to the loop limit.
-- **Tests:** `a_waterfall_loop_serves_helper_lanes_in_its_first_pass` and `paired_lanes_split_a_wide_title_memory_load_at_the_page_boundary`, next to the pull requests' own tests.
+- **Remapped texture notifications:** adapted from [klbf-lab `74315e7`](https://github.com/PastiiJay/klbf-lab/commit/74315e765a6a7b24a926e55f9b2a192d6b8ec05a) by PastiiJay. If the notification list overflows, revisit placed textures once instead of losing their updates. This port keeps the existing memory bound and takes the overflow marker and ranges under one lock.
+- **Tests:** `a_waterfall_loop_serves_helper_lanes_in_its_first_pass`, `paired_lanes_split_a_wide_title_memory_load_at_the_page_boundary` and `remapped_overflow_revisits_lost_ranges_once`, next to the pull requests' own tests.
 
 ## Checked (RTX 4060 Ti, driver 617.42; no game)
 
 - `cargo test -p victory-shader --lib`: 247 passed, 0 failed, 2 ignored. `cargo test -p victory-gpu --lib`: 170 passed, 0 failed, 5 ignored. (`VICTORY_PC_DXC` set to a PC `dxc.exe`.)
 - Helper lanes: 18 of 18 helper neighbours served on the card and on WARP (none without the fix).
+- After the remap fix: all 19 `descriptor::host::tests` pass. Its regression forces a real overflow, checks the lost texture is revisited once, and excludes recently tabled slots. A mutation disabling overflow recovery fails the regression. Game rendering and frame-rate effects of this fix have not been measured.
 - Paired form: its tests run on the card, including two console waves in a group of 128 with a barrier (30 of 30 repeats); the page-boundary test passes on all 64 lanes of both halves and fails without #846.
 
 ## In the game
