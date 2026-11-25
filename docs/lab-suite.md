@@ -66,7 +66,7 @@ The manifest is a local file, not an artifact to publish. Its top-level keys are
 `runner` (a trusted PowerShell runtime runner), `lease_script` and `cases`.
 Each case contains `name`, `binary`, `commit`, `sha256`, and optionally `console`
 (`series-x` or `series-s`), `heap_sync_tables`, `max_seconds`, `profile`,
-`indirect_window`, `settings` and `keys`. `--case NAME` selects one case. Use the same build and scene
+`indirect_window`, `settings`, `keys` and `run_folders`. `--case NAME` selects one case. Use the same build and scene
 when testing a single setting; declare cold caches and competing applications.
 
 `settings` is an object of further switches, one measurement per manifest line:
@@ -99,11 +99,24 @@ fails the case. `VICTORY_KEYS` itself stays refused under `settings`;
 `VICTORY_KEYS_READS` goes there. That the title read a key is in the layer's
 log; that anything moved on screen is not: control stays unverified until seen.
 
+`run_folders` is for switches that take a folder by its full path, which cannot
+travel under `settings`: `{"VICTORY_SHOT": "shot"}`. The value is a plain name
+(lowercase letters, digits and hyphens, at most 32), never a path. It reaches the
+adapter as `-RunFolders "NAME1=folder1;NAME2=folder2"`; the adapter makes each
+folder inside the run's own fresh directory and sets the switch to its full
+path, and declares them in launch.json under `run_folders` (switch to full
+path). A folder the adapter does not declare there, or declares anywhere but
+directly inside the run's directory, fails the case. A switch cannot be both a
+setting and a run folder. What the layer writes there (a frame shot's lines and
+pictures) is derived from the title: it stays with the run's private evidence
+and is never published.
+
 The runtime adapter accepts `-Binary`, `-Commit`, `-ExpectedSha256`, `-Label`,
 `-HeapSyncTables`, `-ConsoleMode`, `-MaxSeconds`, `-RunRoot`, `-LeaseOwner` and
 `-LeaseManagedExternally`, plus optional `-Profile`, `-IndirectWindow`,
-`-Settings` (applied as environment variables and declared in launch.json) and
-`-Keys` (set as `VICTORY_KEYS` and declared in launch.json as `keys`).
+`-Settings` (applied as environment variables and declared in launch.json) `-Keys` (set as `VICTORY_KEYS` and declared in launch.json as `keys`) and
+`-RunFolders` (folders made inside the run, declared in launch.json as
+`run_folders`).
 It must verify the externally held lease without releasing it, retain its
 memory guards, stop its own child, and create exactly one fresh directory
 under RunRoot with launch.json, result.json, stderr.log and memory.jsonl.

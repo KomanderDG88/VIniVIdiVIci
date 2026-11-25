@@ -416,6 +416,7 @@ def runtime_summary(run):
         return round(ordered[lo] + (ordered[hi] - ordered[lo]) * (position - lo), 3)
     return {'run_dir': str(run), 'commit': launch['commit'], 'binary_sha256': launch['sha256'],
             'console': launch.get('console'), 'settings': launch.get('settings'), 'keys': launch.get('keys'),
+            'run_folders': launch.get('run_folders'),
             'profile': launch.get('profile', False), 'end': end,
             'high_draw_scene_candidate': first_scene.isoformat() if first_scene else None,
             'visual_quality': 'unverified', 'player_control': 'unverified',
@@ -508,6 +509,45 @@ def settings_mismatch(requested, launched):
             for name, value in requested.items() if str(launched.get(name)) != value]
 
 
+def case_run_folders(case, settings):
+    """A case's optional `run_folders` ({"VICTORY_X": "name"}), validated, as name -> folder name.
+
+    Some switches take a folder by its full path (`VICTORY_SHOT`), and a path
+    cannot travel under `settings`. A run folder is named here, without any
+    path: the runner makes it inside the run's own fresh directory and hands
+    the switch its full path, so what the layer writes there stays with the
+    run's private evidence.
+    """
+    folders = case.get('run_folders', {})
+    if not isinstance(folders, dict):
+        raise ValueError('run_folders must be an object of VICTORY_ switches: ' + case['name'])
+    checked = {}
+    for name, folder in folders.items():
+        if not isinstance(name, str) or not re.fullmatch(r'VICTORY_[A-Z0-9_]+', name):
+            raise ValueError(f'Invalid run folder switch {name!r} in case {case["name"]}')
+        if name in RESERVED_SETTINGS or name.startswith('VICTORY_PROFILE') or name in settings:
+            raise ValueError(f'Run folder switch {name} is governed elsewhere (settings, another case key or the runner): {case["name"]}')
+        if not isinstance(folder, str) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,31}', folder):
+            raise ValueError(f'A run folder is a plain name of lowercase letters, digits and hyphens, not a path: '
+                             f'{folder!r} for {name} in case {case["name"]}')
+        checked[name] = folder
+    if len(set(checked.values())) != len(checked):
+        raise ValueError('Two switches of a case cannot share a run folder: ' + case['name'])
+    return dict(sorted(checked.items()))
+
+
+def run_folders_mismatch(requested, launched, run):
+    """Requested run folders the runner did not declare as a folder of that name inside the run."""
+    launched = launched if isinstance(launched, dict) else {}
+    wrong = []
+    for name, folder in requested.items():
+        declared = launched.get(name)
+        inside = isinstance(declared, str) and Path(declared).name == folder and Path(declared).parent == Path(run)
+        if not inside:
+            wrong.append(f'{name} (asked {folder!r} inside the run, launch.json {declared!r})')
+    return wrong
+
+
 # The keys a scripted press may name, and its limits, as the layer reads
 # VICTORY_KEYS (crates/victory-hle/src/modules/gameinput/script.rs).
 KEY_NAMES = {'Enter', 'Esc', 'Tab', 'Back', 'Up', 'Down', 'Left', 'Right'}
@@ -573,6 +613,8 @@ def runtime_checks(args, directory, owner):
     requested = {case['name']: case_settings(case) for case in cases}
     # And its scripted keys, against the time the case runs.
     scripted = {case['name']: case_keys(case, int(case.get('max_seconds', 600))) for case in cases}
+    # And the folders it asks for inside its run.
+    foldered = {case['name']: case_run_folders(case, requested[case['name']]) for case in cases}
     for index, case in enumerate(cases):
         if not re.fullmatch(r'[a-z0-9-]+', case['name']):
             raise ValueError('Case names use lowercase letters, digits and hyphens')
@@ -601,11 +643,14 @@ def runtime_checks(args, directory, owner):
         keys = scripted[case['name']]
         if keys:
             command.extend(['-Keys', keys])
+        folders = foldered[case['name']]
+        if folders:
+            command.extend(['-RunFolders', settings_argument(folders)])
         try:
             with gpu_lease(manifest['lease_script'], owner) as lease:
                 row = run_command(command, args.repo, folder, duration + 120, getattr(args, 'exit_grace', 180))
                 row.update(name=case['name'], runner_sha256=sha256(runner), requested_settings=settings,
-                           requested_keys=keys)
+                           requested_keys=keys, requested_run_folders=folders)
                 left_running(row, lease)
         except LeaseHeld as held:
             # The game's processes did not all go: nothing more runs, and the reservation stays taken.
@@ -628,6 +673,10 @@ def runtime_checks(args, directory, owner):
                 elif keys and row['runtime'].get('keys') != keys:
                     row.update(status='failed', reason='Requested keys not applied by the runner: asked '
                                f'{keys!r}, launch.json {row["runtime"].get("keys")!r}')
+                else:
+                    outside = run_folders_mismatch(folders, row['runtime'].get('run_folders'), runs[0])
+                    if outside:
+                        row.update(status='failed', reason='Requested run folders not made by the runner: ' + ', '.join(outside))
             except (OSError, ValueError, KeyError) as error:
                 row.update(status='failed', error='Missing or invalid runtime evidence: ' + str(error))
         elif row['status'] == 'passed':

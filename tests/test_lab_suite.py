@@ -139,7 +139,7 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(lab.case_settings({'name': 'c'}), {})
         self.assertIsNone(lab.settings_argument({}))
 
-    def runtime_case(self, settings, launched, keys=None, launched_keys=None):
+    def runtime_case(self, settings, launched, keys=None, launched_keys=None, folders=None, launched_folders=None):
         """runtime_checks over a fake runner: returns (commands run, result rows)."""
         root = Path(tempfile.mkdtemp(dir=self.root))  # one per call: a test may run several cases
         binary = root / 'victory.exe'
@@ -152,6 +152,8 @@ class SuiteTests(unittest.TestCase):
             case['settings'] = settings
         if keys is not None:
             case['keys'] = keys
+        if folders is not None:
+            case['run_folders'] = folders
         manifest = root / 'manifest.json'
         lab.write_json(manifest, {'runner': str(runner), 'lease_script': 'unused', 'cases': [case]})
         commands = []
@@ -164,6 +166,9 @@ class SuiteTests(unittest.TestCase):
             launch = {'commit': 'synthetic', 'sha256': 'synthetic', 'settings': launched}
             if launched_keys is not None:
                 launch['keys'] = launched_keys
+            if launched_folders is not None:
+                # '{run}' stands for the run's own directory, as a runner would declare it.
+                launch['run_folders'] = {name: path.replace('{run}', str(run)) for name, path in launched_folders.items()}
             lab.write_json(run / 'launch.json', launch)
             lab.write_json(run / 'result.json', {'reason': 'time_limit', 'exit_code': -1})
             (run / 'stderr.log').write_text('')
@@ -380,6 +385,46 @@ class SuiteTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unknown key'):
             self.runtime_case(None, {}, keys='30:Space')
         self.assertFalse(list(self.root.glob('*/out')), 'a case ran before its keys were checked')
+
+    def test_run_folders_are_plain_names_for_switches_nothing_else_governs(self):
+        self.assertEqual(lab.case_run_folders({'name': 'c', 'run_folders': {'VICTORY_SHOT': 'shot', 'VICTORY_A': 'a-1'}}, {}),
+                         {'VICTORY_A': 'a-1', 'VICTORY_SHOT': 'shot'})
+        self.assertEqual(lab.case_run_folders({'name': 'c'}, {}), {})
+        for folder in ('', 'Shot', 'a/b', 'a\\b', '..', '.', 'C:shot', 'a b', '-a', 'x' * 33, 1, None):
+            with self.assertRaisesRegex(ValueError, 'not a path', msg=repr(folder)):
+                lab.case_run_folders({'name': 'c', 'run_folders': {'VICTORY_SHOT': folder}}, {})
+        for name in ('victory_shot', 'OTHER', 'VICTORY_KEYS', 'VICTORY_PROFILE_OUT', 'VICTORY_LOG'):
+            with self.assertRaises(ValueError, msg=name):
+                lab.case_run_folders({'name': 'c', 'run_folders': {name: 'shot'}}, {})
+        # Not both a setting and a run folder, and not one folder for two switches.
+        with self.assertRaisesRegex(ValueError, 'governed elsewhere'):
+            lab.case_run_folders({'name': 'c', 'run_folders': {'VICTORY_SHOT': 'shot'}}, {'VICTORY_SHOT': 'x'})
+        with self.assertRaisesRegex(ValueError, 'share'):
+            lab.case_run_folders({'name': 'c', 'run_folders': {'VICTORY_A': 'same', 'VICTORY_B': 'same'}}, {})
+        with self.assertRaises(ValueError):
+            lab.case_run_folders({'name': 'c', 'run_folders': ['VICTORY_SHOT=shot']}, {})
+
+    def test_run_folders_reach_the_runner_and_must_be_inside_the_run(self):
+        asked = {'VICTORY_SHOT': 'shot'}
+        commands, rows = self.runtime_case(None, {}, folders=asked, launched_folders={'VICTORY_SHOT': '{run}/shot'})
+        command = commands[0]
+        self.assertEqual(command[command.index('-RunFolders') + 1], 'VICTORY_SHOT=shot')
+        self.assertEqual(rows[0]['requested_run_folders'], asked)
+        self.assertEqual(rows[0]['status'], 'inconclusive')
+        # Not declared, another name, or a folder that is not the run's own: failed.
+        for launched in (None, {}, {'VICTORY_SHOT': '{run}/other'}, {'VICTORY_SHOT': '{run}/deeper/shot'},
+                         {'VICTORY_SHOT': str(self.root / 'shot')}, {'VICTORY_SHOT': 'shot'}):
+            _, rows = self.runtime_case(None, {}, folders=asked, launched_folders=launched)
+            self.assertEqual(rows[0]['status'], 'failed', msg=repr(launched))
+            self.assertIn('VICTORY_SHOT', rows[0]['reason'])
+        commands, rows = self.runtime_case(None, {})
+        self.assertNotIn('-RunFolders', commands[0])
+        self.assertEqual(rows[0]['requested_run_folders'], {})
+
+    def test_invalid_run_folders_stop_before_any_launch(self):
+        with self.assertRaisesRegex(ValueError, 'not a path'):
+            self.runtime_case(None, {}, folders={'VICTORY_SHOT': 'C:/shots'})
+        self.assertFalse(list(self.root.glob('*/out')), 'a case ran before its run folders were checked')
 
 
 if __name__ == '__main__':
