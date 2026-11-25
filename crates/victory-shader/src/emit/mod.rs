@@ -215,6 +215,15 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether buffer atomics of the ray-tracing structure builder stand between
+/// two fences (`VICTORY_BVH_FENCES=1`; off by default here). Part of the
+/// translation: the shader cache keys on it (`translation_fingerprint` takes
+/// in every `VICTORY_*` switch this crate names).
+pub fn builder_fences() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_some_and(|v| v == "1"))
+}
+
 /// Whether the ray-tracing structure builder's reads through its root views
 /// stay near them, and a size in a structure's header that cannot be one
 /// counts as none (`VICTORY_BVH_BOUNDS=1`; off by default here). Part of

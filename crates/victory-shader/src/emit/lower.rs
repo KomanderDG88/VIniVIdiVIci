@@ -5449,6 +5449,17 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
+        // `VICTORY_BVH_FENCES=1`: the structure builder's threads take turns
+        // through atomics (a tree built from its leaves up): what one wrote
+        // before its atomic is seen by the thread that comes after it. The
+        // console's program waits for its writes there, and those waits are
+        // not in the code here (after beloooo's 72e748ea, VIctory-Belobug-AMD).
+        let ordered = (name.starts_with("buffer_atomic") || name.starts_with("global_atomic"))
+            && crate::spill::is_spilled(self.x.native)
+            && super::builder_fences();
+        if ordered {
+            self.memory_fence();
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -5494,6 +5505,9 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        if ordered && r.is_ok() {
+            self.memory_fence();
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -5648,6 +5662,13 @@ impl<'a> Lower<'a> {
         }
         self.mirror(inst);
         Ok(())
+    }
+
+    /// Writes to buffers made before are seen, by every group, before those made after
+    /// (a UAV fence, no wait for the group).
+    fn memory_fence(&mut self) {
+        let (mode, void) = (self.s.m.i32(2), self.s.t.void);
+        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
