@@ -268,14 +268,17 @@ impl Script {
     }
 
     /// The title read a reading taken at `timestamp_us` (the hub's clock).
-    pub(super) fn read(&mut self, timestamp_us: u64) {
+    /// `timestamp_us` is the reading's own time (a key held down is one
+    /// reading the title gets again and again); `now_us`, when the title
+    /// read it: reads are counted by the latter.
+    pub(super) fn read(&mut self, timestamp_us: u64, now_us: u64) {
         if self
             .last_read_us
-            .is_some_and(|last| timestamp_us < last + SAME_READ_US)
+            .is_some_and(|last| now_us < last + SAME_READ_US)
         {
             return;
         }
-        self.last_read_us = Some(timestamp_us);
+        self.last_read_us = Some(now_us);
         for (_, state, reads) in &mut self.presses {
             if let State::Down { since_us, .. } = *state
                 && timestamp_us >= since_us
@@ -324,7 +327,7 @@ mod tests {
             while next_read.peek().is_some_and(|&r| r <= t) {
                 let r = next_read.next().unwrap();
                 // The title gets the newest reading: this poll's.
-                script.read((t * 1e6) as u64);
+                script.read((t * 1e6) as u64, (r * 1e6) as u64);
                 seen.push((r, down.clone()));
             }
             t += 0.008;
@@ -406,16 +409,32 @@ mod tests {
         assert!(script.finished());
     }
 
+    /// A key held down is one reading (the hub makes one per change), which
+    /// the title reads again and again: each read counts.
+    #[test]
+    fn a_held_key_counts_every_read_of_its_one_reading() {
+        let mut script = Script::new(parse("0:W~2").0, 1);
+        script.down(Duration::ZERO, 0);
+        for i in 1..=10u64 {
+            script.read(8_000, i * 100_000);
+        }
+        let (_, notes) = script.down(secs(2.0), 2_000_000);
+        let Some(Note::Held { reads, .. }) = notes.iter().find(|n| matches!(n, Note::Held { .. })) else {
+            panic!("{notes:?}")
+        };
+        assert_eq!(*reads, 10);
+    }
+
     #[test]
     fn reads_in_the_same_frame_count_once() {
         let mut script = Script::new(parse("0:Enter").0, 2);
         script.down(Duration::ZERO, 0);
         for us in [10_000, 11_000, 12_000] {
-            script.read(us);
+            script.read(us, us);
         }
         let (down, notes) = script.down(secs(0.5), 500_000);
         assert_eq!(down, [ENTER], "one frame's reads are one read: {notes:?}");
-        script.read(400_000);
+        script.read(400_000, 400_000);
         let (down, _) = script.down(secs(0.6), 600_000);
         assert!(down.is_empty());
     }

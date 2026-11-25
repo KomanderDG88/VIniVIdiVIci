@@ -1320,7 +1320,7 @@ mod host {
     #[cfg(feature = "diagnostics")]
     pub(super) fn title_read(timestamp: u64) {
         if let Some((_, script)) = super::lock(&SCRIPT).as_mut() {
-            script.read(timestamp);
+            script.read(timestamp, super::now());
         }
     }
 
