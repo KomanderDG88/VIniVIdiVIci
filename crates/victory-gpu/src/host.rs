@@ -2396,10 +2396,9 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory; if a
-    /// descriptor slot shows that memory and nothing else does (a constant
-    /// buffer of a table made for the draw), the title heap and the slot.
-    Fill(usize, usize, usize, Option<(usize, u32)>),
+    /// A copy of title memory into the list's own upload memory, and how
+    /// the card could bring the bytes instead.
+    Fill(usize, usize, usize, Option<card_steps::FillTo>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -3701,7 +3700,7 @@ fn given_to_shaders<'a>(
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -3762,13 +3761,32 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // (`VICTORY_MERGE_RUNS`: the cap. Run 218 had 500 to 5,400 changed
         // runs a frame of a few bytes each, and the cap of 512 settled the
         // flights twice a frame, 50 ms of the submitting thread.)
+        // With [`card_steps`] the pages of the title's ring of constants
+        // come here too, which were waited for before: hundreds of short
+        // runs each, at about 1.5 us a run (upstream); its default cap is
+        // 4096.
         static RUNS: OnceLock<usize> = OnceLock::new();
         let mut runs_left = *RUNS.get_or_init(|| {
-            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
+            let cap = if card_steps::stage() > 0 { 4096 } else { 512 };
+            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(cap, |n| n.clamp(1, 1 << 16))
         });
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        if card_steps::stage() == 0 {
+            // As before: the first span that is stale settles, the ones
+            // after it are not merged.
+            return spans
+                .into_iter()
+                .find(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left))
+                .into_iter()
+                .collect();
+        }
+        spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        return spans;
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    if card_steps::stage() == 0 {
+        return spans.into_iter().find(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from)).into_iter().collect();
+    }
+    spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
+    spans
 }
 
 /// Whether the list that brings copies in the card's memory up to date
@@ -6273,6 +6291,36 @@ impl Host {
         working(was_working);
     }
 
+    /// For a submission of `runs` that refreshes the ranges `stale` of host
+    /// copies, which flights may be writing and the title wrote too
+    /// ([`stale_under_flights`]): the flights land first. `ranges` are
+    /// those of the submission's one asking, which is made again.
+    ///
+    /// With [`card_steps`] only the flights that declared them: a range of
+    /// a copy nobody declared any more is refreshed like any other. What
+    /// they landed is title memory written, so everything is asked and
+    /// looked at again; what is left after three times waits as before.
+    fn settle_stale(
+        &self,
+        submitted: &mut u64,
+        runs: &[&HostList],
+        mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        ranges: &[(usize, usize)],
+    ) {
+        if relay_exact() && card_steps::stage() > 0 {
+            for _ in 0..3 {
+                relay_wait(WHY_STALE, |_| stale.iter().all(|(shadow, from, to)| !shadow.writes_pending_in(*from, *to)));
+                crate::watch::ask_once(ranges);
+                stale = stale_under_flights(runs);
+                if stale.is_empty() {
+                    return;
+                }
+            }
+        }
+        self.settle(submitted, WHY_STALE);
+        crate::watch::ask_once(ranges);
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -6388,13 +6436,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            if !stale.is_empty() {
                 let settling = std::time::Instant::now();
-                self.settle(&mut submitted, WHY_STALE);
+                self.settle_stale(&mut submitted, runs, stale, &ranges);
                 settled += settling.elapsed();
-                crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && !stale_under_flights(runs).is_empty() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -7803,7 +7851,14 @@ impl HostList {
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, Some(slot)));
+            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+    }
+
+    /// As [`HostList::defer_fill`], for the beginning of a buffer
+    /// [`HostList::upload`] made.
+    pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
+        let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
+        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7865,7 +7920,8 @@ impl HostList {
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
+        // With [`card_steps`] the card may be the one that fills it.
+        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name_frame(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))

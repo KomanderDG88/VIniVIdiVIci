@@ -3453,6 +3453,12 @@ impl Shadow {
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// Whether one of those submissions may be writing in title memory
+    /// `[from, to)`.
+    pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
     /// title bytes behind: a range shaders may be writing holds a page the
     /// title wrote since the copy last took it. The answer comes from the
