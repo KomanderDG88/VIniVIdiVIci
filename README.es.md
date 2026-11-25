@@ -10,7 +10,7 @@
 
 Partimos de [victory-fork](https://github.com/fxceless/victory-fork) y [VIctory](https://github.com/Marvisak/VIctory). El código x86-64 del título se ejecuta de forma nativa en la CPU; los programas de la GPU de consola se traducen para Direct3D 12.
 
-> **Estado: experimental.** Hemos comprobado pruebas sintéticas en nuestro hardware. Este fork **todavía no publica mediciones propias de FPS, calidad de imagen o estabilidad dentro del juego**. Los resultados de otros proyectos corresponden a sus versiones y equipos.
+> **Estado: experimental. Llega al mundo del juego a unos 3-5 fotogramas por segundo en nuestro equipo.** La [primera medida dentro del juego](#primera-medida-dentro-del-juego) está más abajo, con sus límites. No es jugable y no atribuimos ninguna mejora de FPS a los cambios de este fork. Los resultados de otros proyectos corresponden a sus versiones y equipos.
 
 El repositorio no incluye archivos del juego, sus recursos ni material del SDK de consola. Debes aportar tus propios archivos y guardarlos fuera del repositorio. Es un proyecto comunitario independiente, sin afiliación con fabricantes o editoras.
 
@@ -62,9 +62,26 @@ Algunas rutas de prueba se omiten si falta compilador o dispositivo: el contador
 
 Los comandos de verificación y sus requisitos están en [Validation](README.md#validation). Estas cifras describen pruebas sintéticas, **no rendimiento del juego**.
 
+## Primera medida dentro del juego
+
+Registrada el 25 de noviembre de 2026 en el commit `abf1575`, con **Windows 11, RTX 4060 Ti, controlador 617.42, Core i7-8700K (6 núcleos, 12 hilos) y 32 GB de RAM**, y los archivos del título en un disco duro de 5400 rpm. Compilación de diagnóstico, perfil Series X, `VICTORY_HEAP_SYNC_TABLES=1`, registro de frames y medidor de la tarjeta activados.
+
+| Ejecución | Ventana de 60 s | Frames | Media | Tiempo de frame p5 / p50 / p95 |
+| :--- | :--- | ---: | ---: | :--- |
+| A | Primera ventana en el mundo | 222 | 3,6 fps | 161 / 262 / 429 ms |
+| A | Unos tres minutos después | 188 | 3,0 fps | 115 / 303 / 672 ms |
+| B, añadiendo `VICTORY_INDIRECT_WINDOW=1` | Último minuto | 306 | 5,0 fps | 161 / 195 / 242 ms |
+
+- **Llegar al mundo:** el primer frame con 500 draws o más llegó unos 10 minutos después de arrancar. El disco duro limitó la carga: unas 100 lecturas por segundo a 2-4 MB/s en las muestras tomadas, sin descanso.
+- **No es una comparación controlada:** la cámara no estaba fija. Las vistas de la ejecución A fueron de unos 530 a 2650 draws por frame y la B se quedó cerca de 800. Con unos 800 draws, un frame habitual tardó 194 ms en A y 201 ms en B: **no atribuimos ninguna mejora a `VICTORY_INDIRECT_WINDOW`**.
+- **En qué se va un frame habitual de unos 200 ms:** el hilo de render pasa unos 190 ms dentro de las llamadas de envío, entre 90 y 100 ms preparando y entre 60 y 100 ms esperando a la tarjeta. Copiar de vuelta lo que escriben los shaders lleva de 86 a 141 ms para 15-32 MB, en su propio hilo. La tarjeta está parada de 93 a 134 ms del frame y su trabajo propio es de 73 a 99 ms. En este equipo el frame lo limita el trabajo en serie del procesador, no la tarjeta.
+- **Límites:** los contadores de diagnóstico y las capturas ocasionales estaban activos y cuestan tiempo de frame. Se descartaban normalmente entre 80 y 130 draws por frame sin ningún pipeline pendiente, a veces más. Las sombras salían negras en las vistas revisadas. No se probó el control. Las dos ejecuciones las paró la guarda de memoria del propio banco de pruebas (menos de 2 GiB de memoria física libre), no una caída, tras unos 7 y 3 minutos en el mundo.
+
 ## Próximos pasos
 
-Medir una escena reproducible de este fork, registrar versión, controlador, ajustes y estado de la caché, y comparar imagen y estabilidad. Las nuevas correcciones de lectura de texturas y avisos de memoria se revisarán por separado antes de integrarse.
+- Repetir la línea base con los archivos del título en un SSD, para que las lecturas de disco dejen de limitar la carga y el streaming.
+- Medir contra esa base los cambios pendientes de sincronización y copia de vuelta, de uno en uno y con un número de draws comparable: fxceless/victory-fork#665, #467, #812, #916, #857 y #853.
+- Comparar imagen y estabilidad antes de sacar conclusiones de rendimiento.
 
 ## Colaborar y dar crédito
 

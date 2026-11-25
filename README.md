@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="#what-this-fork-adds">The changes</a> · <a href="#build-and-run">Build &amp; run</a> · <a href="#validation">Validation</a> · <a href="https://github.com/KomanderDG88/VIniVIdiVIci/issues">Report an issue</a>
+  <a href="#what-this-fork-adds">The changes</a> · <a href="#build-and-run">Build &amp; run</a> · <a href="#validation">Validation</a> · <a href="#first-in-game-measurement">In-game measurement</a> · <a href="https://github.com/KomanderDG88/VIniVIdiVIci/issues">Report an issue</a>
   <br /><strong>English</strong> · <a href="README.es.md">Español</a>
 </p>
 
@@ -24,7 +24,7 @@
 
 Built on [victory-fork](https://github.com/fxceless/victory-fork) and [VIctory](https://github.com/Marvisak/VIctory), it runs a title's x86-64 code natively on the CPU and translates console GPU programs for Direct3D 12. The current work focuses on wave64 compute, memory correctness and texture updates.
 
-> **Current status: experimental.** Synthetic tests have been checked on our hardware. This fork does **not yet publish its own gameplay frame-rate, visual-quality or session-stability results**. Results reported by upstream projects belong to their builds and machines.
+> **Current status: experimental. It reaches the game world at about 3 to 5 frames a second on our machine.** The [first in-game measurement](#first-in-game-measurement) is recorded below with its limits. It is not playable, and no frame-rate gain is claimed for any change in this fork. Results reported by upstream projects belong to their builds and machines.
 
 No game files, assets or console SDK material are included. Supply your own files outside the repository. This is an independent community project, unaffiliated with console or game publishers and hardware vendors.
 
@@ -115,11 +115,26 @@ The executable is then `target\diag\victory.exe`. See the [diagnostics reference
 
 </details>
 
+## First in-game measurement
+
+Recorded on 25 November 2026 at commit `abf1575`, on **Windows 11 / RTX 4060 Ti / driver 617.42 / Core i7-8700K (6 cores, 12 threads) / 32 GB of RAM**, with the title's files on a 5,400 rpm hard disk. Diagnostics build, Series X profile, `VICTORY_HEAP_SYNC_TABLES=1`, frame log and card meter on.
+
+| Run | 60-second window | Frames | Mean rate | Frame time p5 / p50 / p95 |
+| :--- | :--- | ---: | ---: | :--- |
+| A | First window in the world | 222 | 3.6 fps | 161 / 262 / 429 ms |
+| A | About three minutes later | 188 | 3.0 fps | 115 / 303 / 672 ms |
+| B, with `VICTORY_INDIRECT_WINDOW=1` added | Last minute of the run | 306 | 5.0 fps | 161 / 195 / 242 ms |
+
+- **Reaching the world:** the first frame with 500 draws or more came about 10 minutes after the process started. The hard disk bounded the load: about 100 reads a second at 2 to 4 MB/s in the samples taken, never idle.
+- **Not a controlled comparison:** the camera was not fixed. Run A's views ranged from about 530 to 2,650 draws a frame; run B stayed near 800. At about 800 draws a usual frame took 194 ms in A and 201 ms in B, so **no gain is attributed to `VICTORY_INDIRECT_WINDOW`**.
+- **Where a usual frame of about 200 ms went:** the rendering thread spent about 190 ms inside submit calls, some 90 to 100 ms preparing and 60 to 100 ms waiting for the card. Copying back what shaders wrote took 86 to 141 ms for 15 to 32 MB on its own thread. The card stood idle for 93 to 134 ms of the frame, and its own work was 73 to 99 ms. On this machine the processor-side work in series bounds the frame, not the card.
+- **Limits:** diagnostics counters and occasional screenshots were on, and they cost frame time. Typically 80 to 130 draws a frame were dropped with no pipeline pending, at times more. Shadows were black in the views checked. No input was tested. Both runs were stopped by the test harness's own memory guard (under 2 GiB of physical memory free), not by a crash, after about 7 and 3 minutes in the world.
+
 ## What's next
 
-- Measure this fork in a repeatable gameplay scene, with the exact commit, driver, settings and cache state recorded.
+- Repeat the baseline with the title's files on an SSD, so that disk reads stop bounding the load and the streaming.
+- Measure the pending synchronisation and copy-back changes against that baseline, one change at a time, at comparable draw counts: fxceless/victory-fork#665, #467, #812, #916, #857 and #853.
 - Compare image correctness and stability before drawing conclusions about performance.
-- Review further texture readback and memory-notification fixes independently, with tests for their interactions.
 
 ## Contribute
 
