@@ -31,6 +31,10 @@ const ALLOWED_NAMES: &[&str] = &[
 // binary format-table exception below, these still pass every content check.
 const AUTHORED_SVG: &[&str] = &["docs/brand/banner.svg", "docs/brand/mark.svg"];
 
+// Our original test orchestration and its synthetic tests. Only these Python
+// paths are accepted; size, text, magic and encoded-data checks still apply.
+const AUTHORED_TEST_TOOLS: &[&str] = &["tools/lab_suite.py", "tests/test_lab_suite.py"];
+
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(
     "crates/victory-formats/src/bcpack-tables.bin",
@@ -153,6 +157,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     let allowed = ALLOWED_NAMES.contains(&name)
         || AUTHORED_SVG.contains(&path)
+        || AUTHORED_TEST_TOOLS.contains(&path)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
@@ -201,6 +206,17 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+    }
+
+    #[test]
+    fn authored_test_tools_keep_content_checks() {
+        for path in super::AUTHORED_TEST_TOOLS {
+            assert!(check(path, b"print('synthetic test')\n").is_empty());
+            assert!(!check(path, b"MZ\0binary").is_empty());
+            assert!(!check(path, &vec![b'a'; 600 * 1024]).is_empty());
+            assert!(!check(path, format!("blob = '{}'", "AB".repeat(600)).as_bytes()).is_empty());
+        }
+        assert!(!check("tools/unreviewed.py", b"print('other')\n").is_empty());
     }
 
     #[test]
