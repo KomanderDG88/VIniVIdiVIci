@@ -1,3 +1,32 @@
+# VIniVIdiVIci
+
+A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (itself a fork of [VIctory](https://github.com/Marvisak/VIctory)) aimed at **NVIDIA cards** (32-lane waves), checked on an RTX 4060 Ti. It contains no game files, assets or data, and no console SDK material. GPL-3.0, like the projects it builds on.
+
+## What it adds to victory-fork `main` (`0b0074e`)
+
+- **Wave64 compute programs in a paired form on 32-lane GPUs** — fxceless/victory-fork#854 by PiloteCode, merged as is. A console wave of 64 lanes runs as one host wave of 32 threads, two lanes a thread, instead of asking for `WaveSize(64)` (which NVIDIA refuses) or taking an approximate per-half form. Also: mesh programs over 32 KiB linked with their pixel program, and the rest of that pull request.
+- **Wide title-memory accesses across a 64 KiB page** — fxceless/victory-fork#846 by gomeaw, with the author's test fixture. `global_load/store_dwordxN` and `s_load_dwordxN` that straddle a page now use each page's own mapping.
+- **Helper lanes in waterfall loops** — a port of VIctory upstream `0601955` by Vax: in a pixel shader, `v_readfirstlane_b32` in a helper lane reads the lane's own value, so a waterfall loop serves helper lanes in its first pass instead of running to the loop limit.
+- **Tests:** `a_waterfall_loop_serves_helper_lanes_in_its_first_pass` and `paired_lanes_split_a_wide_title_memory_load_at_the_page_boundary`, next to the pull requests' own tests.
+
+## Checked (RTX 4060 Ti, driver 617.42; no game)
+
+- `cargo test -p victory-shader --lib`: 247 passed, 0 failed, 2 ignored. `cargo test -p victory-gpu --lib`: 170 passed, 0 failed, 5 ignored. (`VICTORY_PC_DXC` set to a PC `dxc.exe`.)
+- Helper lanes: 18 of 18 helper neighbours served on the card and on WARP (none without the fix).
+- Paired form: its tests run on the card, including two console waves in a group of 128 with a barrier (30 of 30 repeats); the page-boundary test passes on all 64 lanes of both halves and fails without #846.
+
+## In the game
+
+Not measured here yet: no frame rate, picture or stability figures are claimed.
+
+## Credits
+
+VIctory by Marvisak and contributors; victory-fork by fxceless and contributors; PiloteCode (#854); gomeaw (#846 and its fixture); Vax (VIctory `0601955`). Each commit keeps its author.
+
+---
+
+*The rest of this file is victory-fork's README.*
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
