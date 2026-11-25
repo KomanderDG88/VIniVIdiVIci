@@ -3855,7 +3855,7 @@ mod tests {
             let mut desc = [0u32; 16];
             (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
             let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
-            assert!(heap.note_buffer(slot, Some(&view), false).is_empty());
+            assert!(heap.note_buffer(slot, Some(&view), false, true).is_empty());
         }
         for (slot, write) in heap.texture_slots_due(u64::MAX, 8).0 {
             heap.texture_slot_done(slot, write, None);
