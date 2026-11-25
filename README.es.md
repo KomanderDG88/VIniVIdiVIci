@@ -25,6 +25,7 @@ El fork sigue a victory-fork y está fusionado hasta su `3973179` (25 de noviemb
 | **Píxeles auxiliares** | Corrige `v_readfirstlane` para que las helper lanes completen el bucle probado en la primera pasada. | [0601955](https://github.com/Marvisak/VIctory/commit/0601955361c77fd8e306631784ed084a31e5ad8f), Vax |
 | **Actualización de texturas** | Si se desborda la lista de avisos de remapeo, se revisan las texturas colocadas. Conservamos el límite de memoria y sincronizamos la marca de desbordamiento con la lista. | [74315e7](https://github.com/PastiiJay/klbf-lab/commit/74315e765a6a7b24a926e55f9b2a192d6b8ec05a), PastiiJay / KLBF Lab |
 | **Programas del reescalador y más instrucciones** | Las imágenes FSPX del reescalador FidelityFX se leen como programas nativos, y se traducen varias instrucciones y formas de descriptor que antes se rechazaban. Adaptado a la ejecución por parejas, con una prueba nuestra para las lecturas que siguen a una sección de ola completa. De los 29 programas del reescalador del título, 28 se traducen, validan y crean pipeline en la RTX 4060 Ti; antes, ninguno. No hemos comparado la imagen con y sin este cambio. El perfil Series S lo necesita para dibujar. | [#258](https://github.com/fxceless/victory-fork/pull/258), Ortomanic |
+| **Series S: el segundo plano** | En el perfil Series S el título presenta dos planos, su imagen y su interfaz, y solo se mostraba el primero: el selector de perfil, las imágenes de carga y el vídeo inicial salían negros. Ahora el segundo plano se dibuja sobre el primero, y el escalado que pide el título pasa a ser un estirado simple. El tamaño de la descripción de un plano no sale de la documentación de Microsoft; varias personas confirman que funciona con el mismo título. | [#188](https://github.com/fxceless/victory-fork/pull/188), sagouindupm y Filip722 |
 | **Licencia** | Quitamos la emulación de las instrucciones de procesador exclusivas de AMD que victory-fork había portado de XCL, que es GPL-2.0-only: este programa es GPL-3.0-or-later y no puede llevarla. Ese trabajo lo hace ahora el manejador propio de VIctory. Comprobado en un procesador Intel, donde el título depende de ello para arrancar. | [#1057](https://github.com/fxceless/victory-fork/pull/1057), nullexxx |
 | **Hilos de pipelines** | `VICTORY_PIPELINE_WORKERS=<n>` y `VICTORY_PIPELINE_NORMAL=1` fijan cuántos hilos crean pipelines y con qué prioridad. Apagados por defecto. | [#955](https://github.com/fxceless/victory-fork/pull/955), LukaManstein |
 | **Watchdog del título** | `VICTORY_NO_WATCHDOG=1` salta el watchdog de cuelgues del propio título en una versión conocida, comprobando antes la versión y los bytes que sustituye. Apagado por defecto y sin usar en la medida de abajo. | [#959](https://github.com/fxceless/victory-fork/pull/959), ruvenesh |
@@ -79,7 +80,7 @@ A 25 de noviembre de 2026, con **Windows 11, RTX 4060 Ti, controlador 617.42, Co
 | En el juego | El jugador controla al personaje | Lo comunica quien lo ejecuta, a las 18:36, en una sesión en Series S con la compilación `6dc5f86` (el código de `main`): el personaje responde a la entrada. Sin instrumentar. |
 | FPS en el mundo | De unos 3 a 5 fps según la escena | Series X, patio, unos 800 draws por frame: 5,0 fps medidos, ese mismo día por la mañana y desde el disco duro. Series S, cinemática inicial, unos 3000 draws: de 2,9 a 3,6 fps medidos (frames habituales de 279 a 343 ms). Con control del jugador: 3,2 fps medidos en el minuto siguiente al aviso (frame mediano de 313 ms), con un trabajo ajeno ocupando el procesador en ese momento. RTX 4060 Ti. |
 | Estabilidad | 15 minutos en una sesión sin caídas | Series S, 924 s hasta el límite de la sesión, con `VICTORY_TEXTURE_ROOM_PERCENT=95`. Otra sesión de 30 minutos también llegó a su límite, pero su cierre no quedó registrado limpiamente y no la contamos. En Series X dura menos en este equipo: se queda sin memoria física. |
-| Imagen | Oscura y con texturas mal | Series S: las texturas se ven mal, y la geometría y las caras están incompletas en algunos planos. Series X: sombras negras. El vídeo inicial sale negro en la última compilación y antes se veía; la causa no está establecida. |
+| Imagen | Las imágenes de carga se ven; el mundo 3D sale muy oscuro y con texturas mal | Series S: el selector y las imágenes de carga se ven desde el #188 (medido aquí: dos planos en Series S, uno en Series X) y la sesión sigue hasta el juego. La imagen 3D sale casi negra y sin detalle, y las texturas se ven mal. Series X: sombras negras. |
 
 Cómo medimos: los tiempos de frame que la capa anota cada unos cinco segundos, solo en el mundo y por escena. Las cifras salen de compilaciones de diagnóstico, que cuestan tiempo de frame. Un equipo y unas pocas sesiones.
 
@@ -114,11 +115,13 @@ Copiamos los archivos del título a un SSD NVMe del mismo equipo. Estas ejecucio
 
 ## Próximos pasos
 
-- En Series S el selector de perfil, la imagen de carga y el vídeo inicial salen negros mientras el mundo 3D sí se dibuja; en Series X se ven. Al presentar solo se muestra el primero de los planos que nombra el título: estamos comprobando si Series S pone su interfaz en un segundo plano.
-- Una tarjeta de 8 GB casi no tiene sitio para las texturas del título con las reservas por defecto en Series S. Medir una reserva menor para las superficies de dibujo, un ajuste cada vez.
-- La mayor parte de un frame es copiar memoria del título a través del núcleo, de 81 a 118 ms de unos 300. Medir la copia en sitio y los cambios pendientes de sincronización y copia de vuelta de uno en uno y con un número de draws comparable: fxceless/victory-fork#665, #467, #812, #916, #857 y #853.
-- En este equipo Intel las instrucciones exclusivas de la consola cuestan de 8000 a 12 000 excepciones por segundo en la cinemática inicial. Eso no limita el frame, así que no hay trabajo previsto ahí.
-- Registrar una sesión más larga con control del jugador, con los FPS por escena.
+La imagen 3D en Series S es mala por lo que parecen tres motivos distintos, que hay que separar con un ajuste cada vez sobre la misma compilación:
+
+- **Oscura:** el constructor de estructuras de trazado de rayos va apagado por defecto (`VICTORY_BVH_BUILDER=1` lo enciende) y la luz indirecta del título sale de los rayos: lo que no ilumina el sol queda negro.
+- **Texturas:** una tarjeta de 8 GB casi no tiene sitio para las texturas del título con las reservas por defecto. Estamos midiendo una reserva menor para las superficies de dibujo.
+- **Bordes y temblor:** el estirado simple no acumula ni afila. fxceless/victory-fork#798 hace que el título use su propio reescalador.
+
+Después, los FPS. La mayor parte de un frame es copiar memoria del título a través del núcleo, de 81 a 118 ms de unos 300: la copia en sitio y los cambios pendientes de sincronización y copia de vuelta (fxceless/victory-fork#665, #467, #812, #916, #857 y #853) se miden de uno en uno y con un número de draws comparable. En este equipo Intel las instrucciones exclusivas de la consola cuestan de 8000 a 12 000 excepciones por segundo en la cinemática inicial, y eso no limita el frame.
 
 ## Colaborar y dar crédito
 
