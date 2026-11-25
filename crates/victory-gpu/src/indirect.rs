@@ -37,7 +37,7 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -48,6 +48,8 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing.
     uint has_count;
     uint count_offset;
+    // The chunk of 64 records this dispatch clamps (one group per dispatch).
+    uint base;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -81,9 +83,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     // Threads past the records take part in the group's charge (cost 0)
     // and store nothing.
-    bool active = id.x < eff_count;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint index = base + gi;
+    bool active = index < eff_count;
+    uint src_at = args_offset + index * stride;
+    uint dst_at = index * stride;
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -152,7 +155,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // The group's own records: none for a group past a count buffer's
     // count (an execution may ask for thousands and count a few), which
     // touches the budget not at all, as its threads did not before.
-    uint first = id.x - gi;
+    uint first = base;
     uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
     if (gi == 0 && n > 0) {
         // What the records charge, from `before` on, in lane order: a
@@ -447,7 +450,7 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset, 0];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -481,12 +484,23 @@ fn record_clamp_as(
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            // One group per 64 records, in order, with a UAV barrier between:
+            // the chunks charge the budget in record order (Claude's variant of #864).
+            let mut offset: u32 = 0;
+            while offset < records {
+                let mut chunk = constants;
+                chunk[6] = offset;
+                l.SetComputeRoot32BitConstants(0, 7, chunk.as_ptr().cast(), 0);
+                l.Dispatch(1, 1, 1);
+                offset += 64;
+                if offset < records {
+                    l.ResourceBarrier(&[uav_barrier()]);
+                }
+            }
         }
         l.ResourceBarrier(&second[skip..]);
     }
