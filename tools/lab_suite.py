@@ -77,6 +77,8 @@ if os.name == 'nt':
     _kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
     _kernel32.CloseHandle.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    _kernel32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+    _kernel32.K32GetProcessMemoryInfo.argtypes = (wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD)
     _ntdll.NtResumeProcess.restype = ctypes.c_long
     _ntdll.NtResumeProcess.argtypes = (wintypes.HANDLE,)
     CREATE_SUSPENDED = 0x4
@@ -85,12 +87,24 @@ if os.name == 'nt':
     class _ProcessIds(ctypes.Structure):
         _fields_ = [('assigned', wintypes.DWORD), ('listed', wintypes.DWORD), ('ids', ctypes.c_size_t * 4096)]
 
+    class _MemoryCounters(ctypes.Structure):  # PROCESS_MEMORY_COUNTERS
+        _fields_ = [('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                'PeakWorkingSetSize', 'WorkingSetSize', 'QuotaPeakPagedPoolUsage', 'QuotaPagedPoolUsage',
+                'QuotaPeakNonPagedPoolUsage', 'QuotaNonPagedPoolUsage', 'PagefileUsage', 'PeakPagefileUsage')]
 
-def process_created(pid):
-    """Process `pid`'s creation time while it runs; None once it has ended (or never was).
+# A process that has ended is gone once the memory it still holds is below this:
+# the game's process keeps GB for a while after it has ended.
+EXITED_MEMORY_LIMIT = 64 << 20
 
-    A process that has ended but is still held open by someone counts as ended:
-    its object is signaled. Elsewhere than on Windows: True while it exists."""
+
+def process_state(pid):
+    """(creation time, ended, memory held in bytes or None) of process `pid`;
+    None if it cannot be opened (it is gone, or never was).
+
+    A process that has ended can still be listed, held open by someone, while
+    the system takes its memory back: see `still_there`. Elsewhere than on
+    Windows: (True, False, None) while it exists."""
     if os.name != 'nt':
         try:
             os.kill(pid, 0)
@@ -98,19 +112,46 @@ def process_created(pid):
             return None
         except PermissionError:
             pass
-        return True
+        return True, False, None
     handle = _kernel32.OpenProcess(0x1000 | 0x00100000, False, pid)  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
     if not handle:
         return None
     try:
-        if _kernel32.WaitForSingleObject(handle, 0) == 0:  # signaled: it has ended
-            return None
         times = [wintypes.FILETIME() for _ in range(4)]
         if not _kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
             return None
-        return times[0].dwHighDateTime << 32 | times[0].dwLowDateTime
+        created = times[0].dwHighDateTime << 32 | times[0].dwLowDateTime
+        ended = _kernel32.WaitForSingleObject(handle, 0) == 0  # signaled
+        counters = _MemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        memory = None
+        if _kernel32.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            memory = max(counters.WorkingSetSize, counters.PagefileUsage)
+        return created, ended, memory
     finally:
         _kernel32.CloseHandle(handle)
+
+
+def process_created(pid):
+    """Process `pid`'s creation time while it can be opened, else None."""
+    state = process_state(pid)
+    return state[0] if state else None
+
+
+def still_there(ended, memory, limit=EXITED_MEMORY_LIMIT):
+    """Why a process (one of ours, still openable) counts as present, or None if it is gone.
+
+    Running: present. Ended but still holding `limit` bytes or more: present,
+    the memory (and perhaps the card) is still taken. Ended with the memory
+    unknown: present (we cannot tell). Ended with little memory but held open
+    by someone else: gone, or a foreign handle would hold the lease for ever."""
+    if not ended:
+        return 'running'
+    if memory is None:
+        return 'exited, memory unknown'
+    if memory >= limit:
+        return f'exited, memory still held: {memory >> 20} MB'
+    return None
 
 
 class ProcessTree:
@@ -169,18 +210,26 @@ class ProcessTree:
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
 
     def present(self):
-        """The processes seen that still run as themselves (the same creation time)."""
+        """{pid: why} for the processes seen that are still there as themselves (the
+        same creation time): running, or ended with their memory still held."""
         if os.name != 'nt':
             if self.root is None:
-                return []
+                return {}
             try:
                 os.killpg(self.root, 0)
             except ProcessLookupError:
-                return []
+                return {}
             except PermissionError:
                 pass
-            return [self.root]
-        return sorted(pid for pid, created in self.seen.items() if process_created(pid) == created)
+            return {self.root: 'running'}
+        still = {}
+        for pid, created in sorted(self.seen.items()):
+            state = process_state(pid)
+            if state and state[0] == created:
+                why = still_there(state[1], state[2])
+                if why:
+                    still[pid] = why
+        return still
 
     def close(self):
         if self.job is not None:
@@ -237,7 +286,8 @@ def run_command(command, cwd, output, timeout, grace=180):
     while still and time.monotonic() - waiting < grace:
         time.sleep(0.5)
         still = tree.present()
-    result['tree'] = {'pids_seen': sorted(tree.seen), 'still_present': still,
+    result['tree'] = {'pids_seen': sorted(tree.seen), 'still_present': sorted(still),
+                      'why': {str(pid): why for pid, why in sorted(still.items())},
                       'waited_seconds': round(time.monotonic() - waiting, 3), 'job': tree.job is not None}
     result['tree_gone'] = not still
     tree.close()
@@ -301,7 +351,7 @@ def gpu_lease(script, owner):
             tree = lease.kept.get('tree', {})
             raise LeaseHeld(f'GPU reservation LEFT TAKEN by {owner}: processes of '
                             f'{lease.kept.get("name") or lease.kept.get("command")} were still present after '
-                            f'{tree.get("waited_seconds")} s (PIDs {tree.get("still_present")}). Make sure they are '
+                            f'{tree.get("waited_seconds")} s ({tree.get("why") or tree.get("still_present")}). Make sure they are '
                             f'gone, then release it by hand: {lease.release_by_hand()}')
         released = subprocess.run(command + ['release', '--owner', owner],
                                   capture_output=True, text=True, timeout=20)
@@ -314,8 +364,9 @@ def left_running(row, lease):
     the GPU reservation (if any) is kept."""
     if row.get('tree_gone', True):
         return False
-    still = row.get('tree', {}).get('still_present')
-    row.update(status='error', reason=f'Processes of the command still present after the exit grace: PIDs {still}')
+    tree = row.get('tree', {})
+    still = tree.get('why') or tree.get('still_present')
+    row.update(status='error', reason=f'Processes of the command still present after the exit grace: {still}')
     if lease is not None:
         lease.keep(row)
     return True

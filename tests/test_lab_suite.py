@@ -242,7 +242,7 @@ class SuiteTests(unittest.TestCase):
     def test_processes_left_running_keep_the_lease_taken(self):
         helper = self.lease_helper()
         saved = lab.ProcessTree.present
-        lab.ProcessTree.present = lambda tree: [424242]  # as if a process of the tree would not go
+        lab.ProcessTree.present = lambda tree: {424242: 'running'}  # as if a process of the tree would not go
         try:
             with self.assertRaises(lab.LeaseHeld) as held:
                 with lab.gpu_lease(helper, 'synthetic-owner') as lease:
@@ -255,8 +255,34 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(row['status'], 'error')
         self.assertEqual(helper.with_suffix('.state').read_text(), 'claim', 'the lease was released')
         message = str(held.exception)
-        for part in ('synthetic-owner', '424242', 'release --owner synthetic-owner'):
+        for part in ('synthetic-owner', '424242', 'running', 'release --owner synthetic-owner'):
             self.assertIn(part, message)
+        self.assertEqual(row['tree']['why'], {'424242': 'running'})
+
+    def test_an_ended_process_is_gone_only_once_its_memory_is(self):
+        limit = lab.EXITED_MEMORY_LIMIT
+        self.assertEqual(lab.still_there(False, 1 << 20), 'running')
+        self.assertEqual(lab.still_there(True, 3 << 30), 'exited, memory still held: 3072 MB')
+        self.assertEqual(lab.still_there(True, limit), f'exited, memory still held: {limit >> 20} MB')
+        self.assertIsNone(lab.still_there(True, limit - 1), 'an ended process with little memory, held open by someone')
+        self.assertEqual(lab.still_there(True, None), 'exited, memory unknown')
+
+    @unittest.skipUnless(os.name == 'nt', 'ended processes are inspected on Windows')
+    def test_an_ended_process_still_holding_gb_keeps_the_lease_taken(self):
+        helper = self.lease_helper()
+        real = lab.process_state
+        lab.process_state = lambda pid: (lambda s: s and (s[0], True, 3 << 30))(real(pid))  # ended, 3 GB still held
+        try:
+            with self.assertRaises(lab.LeaseHeld) as held:
+                with lab.gpu_lease(helper, 'synthetic-owner') as lease:
+                    row = lab.run_command([sys.executable, '-c', 'pass'], self.root, self.root / 'held', 5, grace=.3)
+                    self.assertTrue(lab.left_running(row, lease))
+        finally:
+            lab.process_state = real
+        self.assertFalse(row['tree_gone'])
+        self.assertEqual(set(row['tree']['why'].values()), {'exited, memory still held: 3072 MB'})
+        self.assertEqual(helper.with_suffix('.state').read_text(), 'claim', 'the lease was released')
+        self.assertIn('memory still held', str(held.exception))
 
     @unittest.skipUnless(os.name == 'nt', 'creation times identify processes on Windows')
     def test_a_reused_pid_is_not_one_of_ours(self):
@@ -265,12 +291,16 @@ class SuiteTests(unittest.TestCase):
         self.assertIsNotNone(created)
         tree = lab.ProcessTree()
         tree.seen = {me: created + 1}  # the same PID, another process
-        self.assertEqual(tree.present(), [])
+        self.assertEqual(tree.present(), {})
         tree.seen = {me: created}
-        self.assertEqual(tree.present(), [me])
+        self.assertEqual(tree.present(), {me: 'running'})
         ended = subprocess.Popen([sys.executable, '-c', 'pass'])
-        ended.wait()  # ended, while Popen still holds it open: not running
-        self.assertIsNone(lab.process_created(ended.pid))
+        ended.wait()  # ended, while Popen still holds it open, with its memory given back: gone
+        created, finished, memory = lab.process_state(ended.pid)
+        self.assertTrue(finished)
+        self.assertLess(memory, lab.EXITED_MEMORY_LIMIT)
+        tree.seen = {ended.pid: created}
+        self.assertEqual(tree.present(), {})
 
     def test_a_normal_command_does_not_wait_for_nothing(self):
         row = lab.run_command([sys.executable, '-c', 'pass'], self.root, self.root / 'quick', 5, grace=60)

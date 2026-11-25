@@ -32,8 +32,14 @@ is never taken for one of ours. A timeout or an interruption ends the whole job.
 
 When a command has ended, every process seen in it must be gone before anything
 else happens, waiting up to `--exit-grace` seconds (180 by default: a process
-of many GB takes a while to leave). Each command's `result.json` records
-`tree` (`pids_seen`, `still_present`, `waited_seconds`, `job`) and `tree_gone`.
+of many GB takes a while to leave). A process is gone when it can no longer be
+opened, or when it has ended and holds less than 64 MiB (the larger of its
+working set and its committed memory). A process that has ended but is still
+giving back GB counts as present: the memory, and perhaps the card, are still
+taken. One that has ended with little memory, held open only by someone else's
+handle, counts as gone. Each command's `result.json` records `tree`
+(`pids_seen`, `still_present`, `why` for each of those, such as `running` or
+`exited, memory still held: 2400 MB`, `waited_seconds`, `job`) and `tree_gone`.
 
 If processes are still present after the grace, that command is an `error`,
 nothing more runs, and the **GPU reservation is left taken on purpose**: another
