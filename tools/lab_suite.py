@@ -206,7 +206,7 @@ def code_checks(args, directory, owner):
 # `settings` may not set them (a second source would make the run ambiguous).
 RESERVED_SETTINGS = {'VICTORY_HEAP_SYNC_TABLES', 'VICTORY_INDIRECT_WINDOW', 'VICTORY_PROFILE',
                      'VICTORY_FRAME_LOG', 'VICTORY_CAPTURE', 'VICTORY_KEYS', 'VICTORY_CARD_METER',
-                     'VICTORY_STACKS'}
+                     'VICTORY_STACKS', 'VICTORY_CONFIG', 'VICTORY_LOG'}
 
 
 def case_settings(case):
