@@ -645,7 +645,7 @@ fn record_gather_as(
     {
         return false;
     }
-    let constants = [kind, stride, records, 0u32, 4u32, 0u32];
+    let constants = [kind, stride, records, 0u32, 4u32, 0u32, 0u32];
     let first = [uav_barrier(), transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
     let second = [
         uav_barrier(),
@@ -660,12 +660,24 @@ fn record_gather_as(
         l.ResourceBarrier(&first);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
-        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, src_gpu);
         l.SetComputeRootShaderResourceView(2, table_gpu);
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
-        l.Dispatch(records.div_ceil(64), 1, 1);
+        // One group per 64 records, in order, as `record_clamp_as`: the
+        // shader takes its records from `base` on (its group's thread is
+        // `base + gi`), and the chunks charge the budget in record order.
+        let mut offset: u32 = 0;
+        while offset < records {
+            let mut chunk = constants;
+            chunk[6] = offset;
+            l.SetComputeRoot32BitConstants(0, 7, chunk.as_ptr().cast(), 0);
+            l.Dispatch(1, 1, 1);
+            offset += 64;
+            if offset < records {
+                l.ResourceBarrier(&[uav_barrier()]);
+            }
+        }
         l.ResourceBarrier(&second);
     }
     true
@@ -1680,6 +1692,76 @@ void main() {
         // The source is read only.
         // SAFETY: a mapped buffer.
         assert_eq!(unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), total) }, &src[..]);
+    }
+
+    /// More records than one chunk of 64: every chunk takes its own (the
+    /// shader's record is `base + gi`), so slots past 64 are filled too and
+    /// each record is charged once.
+    #[test]
+    fn warp_gathered_records_past_one_chunk_land_in_their_slots() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 12;
+        const RECORDS: u32 = 130;
+        // Record i at a place of its own, out of order: 37 is prime to 130.
+        let at = |i: u32| 0x20 + (i * 37 % RECORDS) * 64;
+        let total = (0x20 + RECORDS * 64) as usize;
+        let mut src = vec![0x5Au8; total];
+        for i in 0..RECORDS {
+            for (w, word) in [i + 1, 1, 1].into_iter().enumerate() {
+                let byte = (at(i) as usize) + w * 4;
+                src[byte..byte + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let slots = (GATHER_MOST * STRIDE) as u64;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(u64::from(GATHER_MOST) * 4);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(slots);
+        let dst_buf = warp.default_uav(slots);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+            std::ptr::write_bytes(table_ptr, 0, GATHER_MOST as usize * 4);
+            for i in 0..RECORDS {
+                (table_ptr as *mut u32).add(i as usize).write_volatile(at(i));
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0xEE, slots as usize);
+        }
+        assert!(record_gather_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            &src_buf,
+            table_gpu,
+            (KIND_MESH, STRIDE, RECORDS),
+        ));
+        // SAFETY: an open list; the scratch buffer is copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, slots);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (spent, out) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), RECORDS as usize * 3).to_vec(),
+            )
+        };
+        for i in 0..RECORDS as usize {
+            assert_eq!(&out[i * 3..i * 3 + 3], [i as u32 + 1, 1, 1], "slot {i}");
+        }
+        let charged: u32 = (1..=RECORDS).map(|groups| groups * 128).sum();
+        assert_eq!(spent, charged, "each record charged once");
     }
 
     #[test]
