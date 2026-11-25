@@ -1711,6 +1711,7 @@ impl<'a> Lower<'a> {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
+        let mut near = None;
         let h = if a.param == CODE {
             None
         } else {
@@ -1720,6 +1721,13 @@ impl<'a> Lower<'a> {
                 words: [0, 0],
             };
             if let Some(bias) = self.root_bias(a.param) {
+                // `VICTORY_BVH_BOUNDS=1`: far from the root view, nothing.
+                if Self::builder_bounds_here(self.x.native) {
+                    let n = self.near_root(off);
+                    let zero = self.s.m.i32(0);
+                    off = self.s.m.select(c, n, off, zero);
+                    near = Some(n);
+                }
                 off = self.s.m.bin(c, Bin::Add, off, bias);
             }
             Some(self.handle((b, i), &src, false, (11, 0))?)
@@ -1745,6 +1753,7 @@ impl<'a> Lower<'a> {
         };
         if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
             for (k, x) in self.raw_dwords(h, off, n).into_iter().enumerate() {
+                let x = self.bounded(near, false, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -1771,9 +1780,49 @@ impl<'a> Lower<'a> {
                         .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
                 }
             };
+            let x = self.bounded(near, false, x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// `VICTORY_BVH_BOUNDS=1` and a program with a spilled user-data table
+    /// (the ray-tracing structure builder's stages): its reads through root
+    /// views stay near them ([`Lower::near_root`], [`Lower::bounded`]).
+    fn builder_bounds_here(native: &NativeProgram) -> bool {
+        super::builder_bounds() && crate::spill::is_spilled(native)
+    }
+
+    /// Whether byte `off` of a root view (from the title's address, not the
+    /// host view's start) is near the view: from 16 MiB below it to 64 MiB
+    /// above. No structure is near 64 MiB (the greatest seen has 14). One
+    /// whose memory was written over says it has gigabytes, and the
+    /// builder's copy of it went through all other structures' memory after
+    /// it and, past 2 GiB, before it. Nothing is there instead.
+    fn near_root(&mut self, off: V) -> V {
+        let c = self.cur;
+        let (below, all) = (self.s.m.i32(16 << 20), self.s.m.i32(80 << 20));
+        let at = self.s.m.bin(c, Bin::Add, off, below);
+        self.s.m.cmp(c, pred::IULT, at, all)
+    }
+
+    /// A dword read through a root view with `near` ([`Lower::near_root`]):
+    /// 0 where it was not near; with `size` (the size in a structure's
+    /// header, see `smem`) also 0 where it cannot be one (1 MiB or more).
+    /// `x` itself without `near`.
+    fn bounded(&mut self, near: Option<V>, size: bool, x: V) -> V {
+        let Some(n) = near else {
+            return x;
+        };
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let mut x = self.s.m.select(c, n, x, zero);
+        if size {
+            let most = self.s.m.i32(1 << 20);
+            let sane = self.s.m.cmp(c, pred::IULT, x, most);
+            x = self.s.m.select(c, sane, x, zero);
+        }
+        x
     }
 
     /// Finds the whole-wave sections and the values they leave.
@@ -6363,8 +6412,29 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
+            // `VICTORY_BVH_BOUNDS=1`, through a root view of the structure
+            // builder: far from the view, nothing, and the size in a
+            // structure's header (its second dword), which a copy of it
+            // loops over, counts as none where it cannot be one.
+            let (mut near, mut size) = (None, false);
+            if let Source::Built { address, .. } = src
+                && address.param != CODE
+                && Self::builder_bounds_here(self.x.native)
+                && let Some(bias) = self.root_bias(address.param)
+            {
+                let c = self.cur;
+                let at = self.s.m.bin(c, Bin::Sub, addr, bias);
+                let n = self.near_root(at);
+                addr = self.s.m.select(c, n, addr, bias);
+                near = Some(n);
+                size = *offset == 4
+                    && count == 1
+                    && address.dynamic.is_none()
+                    && matches!(soffset, Operand::Scalar { code: NULL, .. });
+            }
             if Self::wide_loads() {
                 for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                    let x = self.bounded(near, size, x);
                     self.write(inst, Reg::S(code + k as u8), x, None);
                 }
                 return Ok(());
@@ -6384,6 +6454,7 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                let x = self.bounded(near, size, x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
