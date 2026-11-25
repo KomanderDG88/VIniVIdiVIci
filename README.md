@@ -89,7 +89,7 @@ Recorded on **Windows / RTX 4060 Ti / driver 617.42**. These are synthetic check
 
 Some device/compiler-dependent test paths can return early when prerequisites are unavailable. A suite's “passed” count alone does not certify execution of every hardware path. WARP does not cover the paired `WaveSize(32)` path here.
 
-**Known test issue:** a subsequent full GPU-suite run on `158676e` reported an intermittent failure in the WARP in-place-buffer test's memory-decommit cleanup (170 passed, 1 failed, 5 ignored). It is being investigated separately; the 19 descriptor/host tests pass. The table records checkpoints, not a claim that every current full-suite run is clean.
+**GPU test suite, stabilised:** the intermittent failures of the full GPU suite (the WARP in-place-buffer test's decommit, a WARP access violation with tests running at once, and the indirect budget test's group order) are fixed by fxceless/victory-fork#878 (MamaLeVrai), #875 (eazyves) and a clamp that dispatches one group per 64 records, after #864 (xiaotu030202). Thirty runs of the whole `victory-gpu` test binary on an RTX 4060 Ti: 30 of 30 clean (171 passed, 5 ignored), against 25 of 30 before. The clamp change costs about 1.4 µs per 64 records and is not a frame-rate improvement.
 
 The page-boundary and texture-overflow regressions were also checked by removing their respective fixes: the tests detect the resulting wrong behavior.
 

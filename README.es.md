@@ -58,7 +58,7 @@ En Windows, con RTX 4060 Ti y controlador 617.42:
 
 Algunas rutas de prueba se omiten si falta compilador o dispositivo: el contador de pruebas superadas no garantiza que se hayan ejecutado todas las rutas de hardware. WARP no cubre aquí la ruta por parejas con `WaveSize(32)`.
 
-**Fallo de pruebas conocido:** una ejecución posterior de la batería completa de GPU sobre `158676e` registró un fallo intermitente al liberar memoria en el test de buffers in-place de WARP (170 superadas, 1 fallida, 5 ignoradas). Se investiga por separado; las 19 pruebas de descriptores pasan. Las cifras anteriores son resultados de versiones concretas, no una garantía de que cada ejecución completa salga limpia.
+**Batería de GPU, estabilizada:** los fallos intermitentes de la batería completa de GPU (la liberación de memoria del test de buffers in-place de WARP, una violación de acceso de WARP con tests simultáneos y el orden de grupos del test de presupuesto indirecto) quedan corregidos con fxceless/victory-fork#878 (MamaLeVrai), #875 (eazyves) y un recorte que lanza un grupo por cada 64 registros, a partir del #864 (xiaotu030202). Treinta ejecuciones del binario completo de tests de `victory-gpu` en una RTX 4060 Ti: 30 de 30 limpias (171 superadas, 5 ignoradas), frente a 25 de 30 antes. El cambio del recorte cuesta unos 1,4 µs por cada 64 registros y no es una mejora de fps.
 
 Los comandos de verificación y sus requisitos están en [Validation](README.md#validation). Estas cifras describen pruebas sintéticas, **no rendimiento del juego**.
 
