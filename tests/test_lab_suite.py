@@ -139,7 +139,7 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(lab.case_settings({'name': 'c'}), {})
         self.assertIsNone(lab.settings_argument({}))
 
-    def runtime_case(self, settings, launched):
+    def runtime_case(self, settings, launched, keys=None, launched_keys=None):
         """runtime_checks over a fake runner: returns (commands run, result rows)."""
         root = Path(tempfile.mkdtemp(dir=self.root))  # one per call: a test may run several cases
         binary = root / 'victory.exe'
@@ -150,6 +150,8 @@ class SuiteTests(unittest.TestCase):
                 'sha256': hashlib.sha256(b'synthetic').hexdigest(), 'max_seconds': 120}
         if settings is not None:
             case['settings'] = settings
+        if keys is not None:
+            case['keys'] = keys
         manifest = root / 'manifest.json'
         lab.write_json(manifest, {'runner': str(runner), 'lease_script': 'unused', 'cases': [case]})
         commands = []
@@ -159,7 +161,10 @@ class SuiteTests(unittest.TestCase):
             label = command[command.index('-Label') + 1]
             run = Path(command[command.index('-RunRoot') + 1]) / (label + '-1')
             run.mkdir(parents=True)
-            lab.write_json(run / 'launch.json', {'commit': 'synthetic', 'sha256': 'synthetic', 'settings': launched})
+            launch = {'commit': 'synthetic', 'sha256': 'synthetic', 'settings': launched}
+            if launched_keys is not None:
+                launch['keys'] = launched_keys
+            lab.write_json(run / 'launch.json', launch)
             lab.write_json(run / 'result.json', {'reason': 'time_limit', 'exit_code': -1})
             (run / 'stderr.log').write_text('')
             (run / 'memory.jsonl').write_text(json.dumps({'ram_mb': 1024, 'process_private_gib': 2}) + '\n')
@@ -331,6 +336,50 @@ class SuiteTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'VICTORY_STACKS'):
             self.runtime_case({'VICTORY_STACKS': '1'}, {})
         self.assertFalse(list(self.root.glob('*/out')), 'a case ran before its settings were checked')
+
+    def test_keys_are_checked_as_the_layer_reads_them(self):
+        good = ('150:Enter', '150:Enter,430:W~5', '430:W~5*3/12', '0:a', '1.5:Esc*2', '10:Tab*100/0.4',
+                '300:L~0.2*2/0.4', '90:9~60')
+        for keys in good:
+            self.assertEqual(lab.case_keys({'name': 'c', 'keys': keys}, 3600), keys)
+        self.assertIsNone(lab.case_keys({'name': 'c'}, 600))
+        bad = ('', ' 150:Enter', '150:Enter, 430:W', '150 :Enter', 'Enter', '150:', ':Enter', '150:Space', '150:WW',
+               '150:W~0.1', '150:W~61', '150:W~', '150:W*0', '150:W*101', '150:W*2/0.3', '150:W~5*2/5', '150:W~12*2',
+               '150:W/3', '-1:W', '1e2:W', 'nan:W', '150:W;calc', '150:"W"', '150:Enter,,430:W', '1:W' + ',1:W' * 70,
+               150, ['150:Enter'])
+        for keys in bad:
+            with self.assertRaises(ValueError, msg=repr(keys)):
+                lab.case_keys({'name': 'c', 'keys': keys}, 3600)
+        # A press that would end after the session is over was never pressed.
+        self.assertEqual(lab.case_keys({'name': 'c', 'keys': '595:W~5'}, 600), '595:W~5')
+        for keys in ('596:W~5', '600:Enter', '430:W~5*20/12'):
+            with self.assertRaisesRegex(ValueError, 'ends after'):
+                lab.case_keys({'name': 'c', 'keys': keys}, 600)
+
+    def test_keys_reach_the_runner_and_must_be_applied(self):
+        keys = '30:Enter,60:W~5*3/12'
+        commands, rows = self.runtime_case(None, {}, keys=keys, launched_keys=keys)
+        command = commands[0]
+        self.assertEqual(command[command.index('-Keys') + 1], keys)
+        self.assertEqual(rows[0]['requested_keys'], keys)
+        self.assertEqual(rows[0]['runtime']['keys'], keys)
+        self.assertEqual(rows[0]['status'], 'inconclusive')
+        # Asked for and not declared by the runner, or declared otherwise: failed.
+        for launched in (None, '30:Enter'):
+            _, rows = self.runtime_case(None, {}, keys=keys, launched_keys=launched)
+            self.assertEqual(rows[0]['status'], 'failed')
+            self.assertIn('keys', rows[0]['reason'])
+        # A case without keys adds no argument and asks for nothing.
+        commands, rows = self.runtime_case(None, {})
+        self.assertNotIn('-Keys', commands[0])
+        self.assertIsNone(rows[0]['requested_keys'])
+
+    def test_invalid_keys_stop_before_any_launch(self):
+        with self.assertRaisesRegex(ValueError, 'ends after'):
+            self.runtime_case(None, {}, keys='150:Enter')  # the case runs 120 seconds
+        with self.assertRaisesRegex(ValueError, 'Unknown key'):
+            self.runtime_case(None, {}, keys='30:Space')
+        self.assertFalse(list(self.root.glob('*/out')), 'a case ran before its keys were checked')
 
 
 if __name__ == '__main__':

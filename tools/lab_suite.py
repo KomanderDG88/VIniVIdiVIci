@@ -415,7 +415,7 @@ def runtime_summary(run):
         hi = min(lo + 1, len(ordered) - 1)
         return round(ordered[lo] + (ordered[hi] - ordered[lo]) * (position - lo), 3)
     return {'run_dir': str(run), 'commit': launch['commit'], 'binary_sha256': launch['sha256'],
-            'console': launch.get('console'), 'settings': launch.get('settings'),
+            'console': launch.get('console'), 'settings': launch.get('settings'), 'keys': launch.get('keys'),
             'profile': launch.get('profile', False), 'end': end,
             'high_draw_scene_candidate': first_scene.isoformat() if first_scene else None,
             'visual_quality': 'unverified', 'player_control': 'unverified',
@@ -508,6 +508,52 @@ def settings_mismatch(requested, launched):
             for name, value in requested.items() if str(launched.get(name)) != value]
 
 
+# The keys a scripted press may name, and its limits, as the layer reads
+# VICTORY_KEYS (crates/victory-hle/src/modules/gameinput/script.rs).
+KEY_NAMES = {'Enter', 'Esc', 'Tab', 'Back', 'Up', 'Down', 'Left', 'Right'}
+KEY_SHORTEST_HOLD, KEY_LONGEST_HOLD, KEY_USUAL_GAP = 0.2, 60.0, 10.0
+_NUMBER = r'\d+(?:\.\d+)?'
+_KEYS_ENTRY = re.compile(rf'({_NUMBER}):([A-Za-z0-9]+)(?:~({_NUMBER}))?(?:\*(\d+)(?:/({_NUMBER}))?)?')
+
+
+def case_keys(case, duration):
+    """A case's optional `keys`, a VICTORY_KEYS script, validated; None without one.
+
+    Entries are separated by commas, without spaces:
+    `<seconds>:<key>[~<hold>][*<times>[/<gap>]]`. A key is a letter, a digit or
+    one of KEY_NAMES; a hold lasts 0.2 to 60 seconds; a press repeats 1 to 100
+    times, `gap` seconds apart (10 unless given), and the gap leaves room for the
+    hold. The last press must end within the case's `duration`: a key asked for
+    after the session is over was never pressed.
+    """
+    keys = case.get('keys')
+    if keys is None:
+        return None
+    name = case['name']
+    if not isinstance(keys, str) or not re.fullmatch(r'[A-Za-z0-9:.,~*/]{1,256}', keys):
+        raise ValueError(f'keys must be a VICTORY_KEYS script of at most 256 characters, without spaces: {name}')
+    for entry in keys.split(','):
+        match = _KEYS_ENTRY.fullmatch(entry)
+        if not match:
+            raise ValueError(f'Invalid keys entry {entry!r} in case {name}')
+        at, key, hold, times, gap = match.groups()
+        if key not in KEY_NAMES and len(key) != 1:
+            raise ValueError(f'Unknown key {key!r} in keys entry {entry!r} of case {name}')
+        hold = None if hold is None else float(hold)
+        if hold is not None and not KEY_SHORTEST_HOLD <= hold <= KEY_LONGEST_HOLD:
+            raise ValueError(f'A hold lasts 0.2 to 60 seconds: keys entry {entry!r} of case {name}')
+        times = 1 if times is None else int(times)
+        gap = KEY_USUAL_GAP if gap is None else float(gap)
+        if not 1 <= times <= 100:
+            raise ValueError(f'A press repeats 1 to 100 times: keys entry {entry!r} of case {name}')
+        held = KEY_SHORTEST_HOLD if hold is None else hold
+        if times > 1 and gap < held + KEY_SHORTEST_HOLD:
+            raise ValueError(f'The gap leaves no room for the hold: keys entry {entry!r} of case {name}')
+        if float(at) + (times - 1) * gap + held > duration:
+            raise ValueError(f'keys entry {entry!r} ends after the {duration} seconds of case {name}')
+    return keys
+
+
 def runtime_checks(args, directory, owner):
     manifest = json.loads(Path(args.manifest).read_text(encoding='utf-8-sig'))
     runner = Path(manifest['runner']).resolve()
@@ -525,6 +571,8 @@ def runtime_checks(args, directory, owner):
         raise ValueError('No runtime cases selected')
     # Every case's settings are checked before any GPU reservation or launch.
     requested = {case['name']: case_settings(case) for case in cases}
+    # And its scripted keys, against the time the case runs.
+    scripted = {case['name']: case_keys(case, int(case.get('max_seconds', 600))) for case in cases}
     for index, case in enumerate(cases):
         if not re.fullmatch(r'[a-z0-9-]+', case['name']):
             raise ValueError('Case names use lowercase letters, digits and hyphens')
@@ -550,10 +598,14 @@ def runtime_checks(args, directory, owner):
         settings = requested[case['name']]
         if settings:
             command.extend(['-Settings', settings_argument(settings)])
+        keys = scripted[case['name']]
+        if keys:
+            command.extend(['-Keys', keys])
         try:
             with gpu_lease(manifest['lease_script'], owner) as lease:
                 row = run_command(command, args.repo, folder, duration + 120, getattr(args, 'exit_grace', 180))
-                row.update(name=case['name'], runner_sha256=sha256(runner), requested_settings=settings)
+                row.update(name=case['name'], runner_sha256=sha256(runner), requested_settings=settings,
+                           requested_keys=keys)
                 left_running(row, lease)
         except LeaseHeld as held:
             # The game's processes did not all go: nothing more runs, and the reservation stays taken.
@@ -572,6 +624,10 @@ def runtime_checks(args, directory, owner):
                 missing = settings_mismatch(settings, row['runtime'].get('settings'))
                 if missing:
                     row.update(status='failed', reason='Requested settings not applied by the runner: ' + ', '.join(missing))
+                # Nor can keys asked for and not scripted by the runner.
+                elif keys and row['runtime'].get('keys') != keys:
+                    row.update(status='failed', reason='Requested keys not applied by the runner: asked '
+                               f'{keys!r}, launch.json {row["runtime"].get("keys")!r}')
             except (OSError, ValueError, KeyError) as error:
                 row.update(status='failed', error='Missing or invalid runtime evidence: ' + str(error))
         elif row['status'] == 'passed':

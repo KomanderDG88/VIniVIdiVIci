@@ -66,7 +66,7 @@ The manifest is a local file, not an artifact to publish. Its top-level keys are
 `runner` (a trusted PowerShell runtime runner), `lease_script` and `cases`.
 Each case contains `name`, `binary`, `commit`, `sha256`, and optionally `console`
 (`series-x` or `series-s`), `heap_sync_tables`, `max_seconds`, `profile`,
-`indirect_window` and `settings`. `--case NAME` selects one case. Use the same build and scene
+`indirect_window`, `settings` and `keys`. `--case NAME` selects one case. Use the same build and scene
 when testing a single setting; declare cold caches and competing applications.
 
 `settings` is an object of further switches, one measurement per manifest line:
@@ -84,10 +84,26 @@ the argument is left out when a case has none. The report keeps
 not declare with the same value under `settings` fails the case, so a setting
 asked for and not applied never passes for measured.
 
+`keys` scripts input for a run nobody plays by hand, in the layer's own form
+(`VICTORY_KEYS`, diagnostics builds): entries separated by commas, without
+spaces, each `<seconds>:<key>[~<hold>][*<times>[/<gap>]]`, as in
+`"150:Enter,430:W~5*3/12"`. A key is a letter, a digit, or `Enter`, `Esc`, `Tab`,
+`Back`, `Up`, `Down`, `Left`, `Right`; a hold lasts 0.2 to 60 seconds; a press
+repeats 1 to 100 times, `gap` seconds apart (10 unless given), and the gap must
+leave room for the hold. The suite checks the whole script before anything runs,
+and refuses a press that would end after the case's `max_seconds`: it would
+never be pressed. The script reaches the adapter as `-Keys "<script>"`, the
+argument is left out when a case has none, and the report keeps `requested_keys`;
+a script the adapter's `launch.json` does not declare unchanged under `keys`
+fails the case. `VICTORY_KEYS` itself stays refused under `settings`;
+`VICTORY_KEYS_READS` goes there. That the title read a key is in the layer's
+log; that anything moved on screen is not: control stays unverified until seen.
+
 The runtime adapter accepts `-Binary`, `-Commit`, `-ExpectedSha256`, `-Label`,
 `-HeapSyncTables`, `-ConsoleMode`, `-MaxSeconds`, `-RunRoot`, `-LeaseOwner` and
-`-LeaseManagedExternally`, plus optional `-Profile`, `-IndirectWindow` and
-`-Settings` (applied as environment variables and declared in launch.json).
+`-LeaseManagedExternally`, plus optional `-Profile`, `-IndirectWindow`,
+`-Settings` (applied as environment variables and declared in launch.json) and
+`-Keys` (set as `VICTORY_KEYS` and declared in launch.json as `keys`).
 It must verify the externally held lease without releasing it, retain its
 memory guards, stop its own child, and create exactly one fresh directory
 under RunRoot with launch.json, result.json, stderr.log and memory.jsonl.
