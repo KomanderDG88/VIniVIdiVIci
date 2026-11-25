@@ -148,6 +148,11 @@ pub(crate) struct Shader {
     /// ([`crate::ambient::REFLECTED`]).
     #[cfg(windows)]
     pub(crate) ends_reflections: bool,
+    /// It adds the lamps' light to what the air scatters, the last program
+    /// that writes that volume ([`crate::ambient::AIR_PROGRAM`]); only while
+    /// the air is bounded (`VICTORY_AMBIENT_AIR`).
+    #[cfg(windows)]
+    pub(crate) scatters_air: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -244,6 +249,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                     && bytes
                         .windows(crate::ambient::REFLECTED.len())
                         .any(|w| w == crate::ambient::REFLECTED),
+                #[cfg(windows)]
+                scatters_air: ambient
+                    && stage == "compute"
+                    && crate::ambient::air() > 0.0
+                    && holds(bytes, crate::ambient::AIR_PROGRAM),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]

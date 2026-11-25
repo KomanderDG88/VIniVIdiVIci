@@ -3923,7 +3923,7 @@ impl State {
         let Some(stage) = p
             .stages
             .first()
-            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections || s.shader.scatters_air)
         else {
             return false;
         };
@@ -3941,6 +3941,13 @@ impl State {
                 _ => None,
             }
         };
+        if stage.shader.scatters_air {
+            // What the air scatters, bounded by the light around.
+            return match view(ResourceType::Uav, crate::ambient::AIR) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::bound_air(list, r as This),
+                _ => false,
+            };
+        }
         if !stage.shader.resolves_light {
             // The reflections, held to the light around.
             return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
