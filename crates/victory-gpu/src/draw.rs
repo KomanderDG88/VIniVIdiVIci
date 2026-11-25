@@ -3417,7 +3417,8 @@ impl State {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
+                        let slot = (std::ptr::from_ref(heap) as usize, index);
+                        list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at(index, gpu, size);
                         #[cfg(feature = "diagnostics")]
                         {
@@ -3624,7 +3625,7 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host(move || {
+            list.defer_host_read(from, n * 3 * stride, move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
                 // `crate::watch::title_memory_reading`).

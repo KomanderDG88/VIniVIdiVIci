@@ -2396,16 +2396,19 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    /// A copy of title memory into the list's own upload memory; if a
+    /// descriptor slot shows that memory and nothing else does (a constant
+    /// buffer of a table made for the draw), the title heap and the slot.
+    Fill(usize, usize, usize, Option<(usize, u32)>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
-    /// Work that writes host memory only.
-    Host(Box<dyn Fn() + Send>),
+    /// Work that writes host memory only, and the title memory it reads
+    /// (from, to; empty for none).
+    Host(Box<dyn Fn() + Send>, (usize, usize)),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -2939,6 +2942,8 @@ struct Sent {
     back: Vec<Declared>,
     /// Title-memory ranges written when its shader textures are copied back.
     texture_back_ranges: Vec<(usize, usize)>,
+    /// What was taken off it to be done on the card.
+    own: Option<card_steps::Taken>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -2955,6 +2960,8 @@ struct Flight {
     card: Option<CardPlan>,
     back: Vec<Declared>,
     texture_back_ranges: Vec<(usize, usize)>,
+    /// The list of ours that ran ahead of them ([`card_steps`]).
+    own: Option<card_steps::Taken>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -2988,6 +2995,8 @@ struct Line {
     /// With [`relay`]: the bottom-of-pipe writes of the flights being
     /// landed (taken out of `line`, not done yet), for [`late_met`].
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
+    /// With [`card_steps`]: what the flights being landed write.
+    landing: Vec<card_steps::Writer>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -3003,6 +3012,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     poke: false,
     landed: Vec::new(),
     in_hand: Vec::new(),
+    landing: Vec::new(),
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -3073,20 +3083,65 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
-    let written = {
+    let (written, copied, copies) = {
         let line = line();
         if line.written.is_empty() {
             return None;
         }
-        line.written.clone()
+        (line.written.clone(), card_steps::copied_ranges(&line), card_steps::copies(&line))
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&written, &copied, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+}
+
+/// Whether flights that write `written` stop a read of `len` bytes at
+/// `src` on the CPU now: it is not read ahead of them ([`fill_ahead`]),
+/// and never where a copy done on the card ([`card_steps`], `copied`: in
+/// order, joined) has not landed yet: title memory does not hold its bytes
+/// yet, where the CPU's copy had put them at once.
+fn read_blocked(written: &[(usize, usize)], copied: &[(usize, usize)], src: usize, len: usize) -> bool {
+    touches(written, src, src + len) && !(fill_ahead::on() && !touches(copied, src, src + len))
+}
+
+/// Whether they stop a title buffer copy, and if so whether by its source.
+fn copy_blocked(written: &[(usize, usize)], copied: &[(usize, usize)], dst: usize, src: usize, len: usize) -> Option<bool> {
+    let read = read_blocked(written, copied, src, len);
+    (read || touches(written, dst, dst + len)).then_some(read)
+}
+
+/// With [`card_steps`] taking steps of `runs` off the CPU: the reads ahead
+/// of flights ([`fill_ahead`]) among the steps it leaves there, noted as
+/// [`blocked_by`] notes them (it is not asked then).
+fn read_ahead_rest(runs: &[&HostList], own: &card_steps::Taken) {
+    if !fill_ahead::on() {
+        return;
+    }
+    let (written, copied) = {
+        let line = line();
+        (line.written.clone(), card_steps::copied_ranges(&line))
+    };
+    for list in runs {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            if own.takes(list, i) {
+                continue;
+            }
+            let (src, len) = match step {
+                &Step::Copy(dst, src, len) if !touches(&written, dst, dst + len) => (src, len),
+                &Step::Fill(_, src, len, _) => (src, len),
+                _ => continue,
+            };
+            if touches(&written, src, src + len) && !touches(&copied, src, src + len) {
+                fill_ahead::read(src, len);
+            }
+        }
+    }
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
-/// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+/// counted for the frame line. `copied`: what copies done on the card
+/// ([`card_steps`]) write and has not landed (in order, joined; empty
+/// without its stage 2), which is never read ahead.
+fn blocked_by(written: &[(usize, usize)], copied: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -3102,7 +3157,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::on() && !touches(copied, src, src + len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3116,11 +3171,11 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                &Step::Fill(_, src, len) => {
+                &Step::Fill(_, src, len, _) => {
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::on() && !touches(copied, src, src + len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3144,7 +3199,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
     }
@@ -4043,6 +4098,9 @@ fn relay_worker() {
                         _ => None,
                     })
                     .collect();
+                if card_steps::stage() > 0 {
+                    line.landing = card_steps::writers(&items);
+                }
                 break Ok(items);
             }
         };
@@ -4116,6 +4174,7 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     fill_check::line();
     fill_ahead::line(frames);
+    card_steps::log(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4230,6 +4289,8 @@ fn late_line(frames: f64) {
         );
     }
 }
+
+mod card_steps;
 
 #[cfg(test)]
 mod late_tests {
@@ -5730,6 +5791,9 @@ impl Host {
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
+                    if let Some(own) = flight.own {
+                        own.landed();
+                    }
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
@@ -5753,10 +5817,12 @@ impl Host {
                 poke,
                 landed: kept,
                 in_hand,
+                landing,
                 ..
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
+            landing.clear();
             // What is still in the air, from the flights that are.
             written.clear();
             *lists = 0;
@@ -5991,6 +6057,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 texture_back_ranges: sent.texture_back_ranges,
+                own: sent.own,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -6042,6 +6109,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 texture_back_ranges: sent.texture_back_ranges,
+                own: sent.own,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -6225,17 +6293,37 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        // Or the reads are done on the card, behind the flights
+        // ([`card_steps`]; never without `VICTORY_CARD_STEPS`).
+        let own = if late { self.card_steps(runs) } else { None };
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
+        } else if own.is_none()
+            && let Some(why) = late_blocked(runs)
+        {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| {
+                    blocked_by(&line.written, &card_steps::copied_ranges(line), runs, false).is_none()
+                        && !card_steps::copied_read(&card_steps::copies(line), runs)
+                });
             } else {
                 self.settle(&mut submitted, why);
             }
         }
+        if let Some(own) = &own {
+            read_ahead_rest(runs, own);
+        }
+        // That list runs first, and is one of the submission's from here on.
+        let with: Vec<&HostList>;
+        let runs = match &own {
+            Some(own) => {
+                with = std::iter::once(own.list()).chain(runs.iter().copied()).collect();
+                &with[..]
+            }
+            None => runs,
+        };
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
         crate::descriptor::sync_heaps();
@@ -6313,7 +6401,7 @@ impl Host {
         }
         part = prep_part(0, part);
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -6377,6 +6465,7 @@ impl Host {
                 card,
                 back,
                 texture_back_ranges,
+                own,
                 writes,
             };
             working(was_working);
@@ -7706,7 +7795,15 @@ impl HostList {
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+            .push(Step::Fill(dst as usize, src as usize, len, None));
+    }
+
+    /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
+    /// title heap's address, and the slot) shows.
+    pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+        self.deferred()
+            .copies
+            .push(Step::Fill(dst as usize, src as usize, len, Some(slot)));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7836,7 +7933,7 @@ impl HostList {
             // list's last run (mesh dispatches: the largest group count
             // asked for, the groups asked in all; with the card's copy, as
             // the list's end copied them here): taken, then zeroed.
-            deferred.copies.push(Step::Host(Box::new(move || unsafe {
+            let notes = Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
@@ -7844,7 +7941,8 @@ impl HostList {
                 for k in 0..3 {
                     words.add(k).write_volatile(0);
                 }
-            })));
+            });
+            deferred.copies.push(Step::Host(notes, (0, 0)));
             drop(deferred);
             if let Some(card) = card {
                 self.zero_card_budget(card);
@@ -8034,7 +8132,13 @@ impl HostList {
 
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work)));
+        self.deferred().copies.push(Step::Host(Box::new(work), (0, 0)));
+    }
+
+    /// As [`HostList::defer_host`], for work that reads `len` bytes of title
+    /// memory at `from`.
+    pub(crate) fn defer_host_read(&self, from: usize, len: usize, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Host(Box::new(work), (from, from + len)));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -8045,11 +8149,16 @@ impl HostList {
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
-    /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    /// lists of a submission, through many ranges). Copies and fills that
+    /// `taken` names (by their place) are left out: they are done on the
+    /// card ([`card_steps`]).
+    fn run_deferred(&self, batch: &mut Batch, taken: impl Fn(usize) -> bool) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        for (i, step) in self.deferred().copies.iter().enumerate() {
+            if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
+                continue;
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -8068,7 +8177,7 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                &Step::Fill(dst, src, len, _) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -8089,7 +8198,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
+                Step::Run(work) | Step::Host(work, _) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
