@@ -17,7 +17,7 @@ pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&wide(name), false).unwrap_or_else(|| host::get_module_handle_w(name))
+    find_module(&wide(name), false, "GetModuleHandle", 0).unwrap_or_else(|| host::get_module_handle_w(name))
 }
 
 /// See [`GetModuleHandleW`].
@@ -25,7 +25,7 @@ pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
+    find_module(&narrow(name), false, "GetModuleHandle", 0).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
 /// A NUL-terminated string from the title.
@@ -107,7 +107,7 @@ pub extern "system" fn LoadLibraryExA(
     flags: u32,
 ) -> *mut c_void {
     if !name.is_null()
-        && let Some(handle) = find_module(&narrow(name), runs_code(flags))
+        && let Some(handle) = find_module(&narrow(name), runs_code(flags), "LoadLibrary", flags)
     {
         return handle;
     }
@@ -121,7 +121,7 @@ pub extern "system" fn LoadLibraryExW(
     flags: u32,
 ) -> *mut c_void {
     if !name.is_null()
-        && let Some(handle) = find_module(&wide(name), runs_code(flags))
+        && let Some(handle) = find_module(&wide(name), runs_code(flags), "LoadLibrary", flags)
     {
         return handle;
     }
@@ -294,7 +294,7 @@ fn handle(m: &HleModule) -> *mut c_void {
 /// name to the host, which only DLLs `HostPolicy` passes through get (as at
 /// import binding); others fail. With `load`, a title DLL not mapped yet is
 /// mapped now.
-fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
+fn find_module(path: &str, load: bool, by: &'static str, flags: u32) -> Option<*mut c_void> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     // As the Windows loader does, a name without extension means a DLL.
     let file = if file.contains('.') {
@@ -332,19 +332,31 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     }
     // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
     // the console does not have it.
-    refuse(&file);
+    refuse(&file, path, by, load, flags);
     host::set_last_error(ERROR_MOD_NOT_FOUND);
     Some(std::ptr::null_mut())
 }
 
-/// Logs a DLL name the title is refused, once.
-fn refuse(file: &str) {
-    static REFUSED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Logs a DLL name the title is refused, once for each way it was asked for: the call
+/// (`GetModuleHandle` only asks whether it is loaded; a `LoadLibrary` whose flags run no code
+/// asks for its data), the flags and the path as the title gave it. The same words stand for
+/// three different things otherwise: a title DLL not loaded yet that is only asked about, one
+/// asked for as data, and a DLL the title cannot have.
+fn refuse(file: &str, path: &str, by: &'static str, load: bool, flags: u32) {
+    static REFUSED: std::sync::Mutex<Vec<(String, &'static str, bool)>> = std::sync::Mutex::new(Vec::new());
     let file = file.to_ascii_lowercase();
     let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
-    if !refused.contains(&file) {
-        tracing::warn!(dll = file, "a host DLL outside the host policy: refused");
-        refused.push(file);
+    let key = (file, by, load);
+    if !refused.contains(&key) {
+        tracing::warn!(
+            dll = key.0,
+            asked = path,
+            by,
+            runs_code = load,
+            flags = format_args!("{flags:#x}"),
+            "a host DLL outside the host policy: refused"
+        );
+        refused.push(key);
     }
 }
 
