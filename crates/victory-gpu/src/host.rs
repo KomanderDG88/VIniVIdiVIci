@@ -8591,7 +8591,7 @@ impl Meter {
                         *n as f64 / frames
                     );
                 }
-                crate::pipeline::rt_skin_line(frames);
+                crate::pipeline::rt_work_line(frames);
             }
         }
         if self.caption.is_none() {

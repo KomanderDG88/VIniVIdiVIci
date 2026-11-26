@@ -78,6 +78,10 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// The kinds of work only for rays it is, of those whose switch is on
+    /// ([`RtWork`], [`rt_work_of`]; compute only).
+    #[cfg(windows)]
+    rt_work: u8,
 }
 
 impl std::fmt::Debug for Shader {
@@ -147,6 +151,16 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                // Looked for only while one of the switches is on (read
+                // once); the census only in diagnostics builds.
+                #[cfg(windows)]
+                rt_work: if stage == "compute" {
+                    #[cfg(feature = "diagnostics")]
+                    rt_census(bytes);
+                    rt_work_of(bytes)
+                } else {
+                    0
+                },
             })
         })
         .clone()
@@ -427,101 +441,230 @@ pub(crate) fn walk_held(this: This) -> bool {
     true
 }
 
-/// Whether a compute container is one of the title's `bvh_skinning`
-/// programs, by the name it carries: they pose every animated mesh (and
-/// its motion) once more, only for the ray-tracing structures, which the
-/// structure builder makes from what they write.
+/// Whether the container `bytes` holds `name` anywhere.
 #[cfg(windows)]
-fn skins_for_rays(bytes: &[u8]) -> bool {
-    const NAME: &[u8] = b"bvh_skinningCS";
-    bytes.windows(NAME.len()).any(|w| w == NAME)
+fn holds(bytes: &[u8], name: &[u8]) -> bool {
+    bytes.windows(name.len()).any(|w| w == name)
 }
 
-/// `VICTORY_RT_SKIN_SKIP=1` (off by default): dispatches of the title's
-/// `bvh_skinning` programs ([`skins_for_rays`]) are left out, direct and
-/// indirect. Only while the structure builder is off (without
-/// `VICTORY_BVH_BUILDER=1`): then nothing reads what they write. Meant
-/// with `VICTORY_BVH_NO_HIT=1` or `VICTORY_BVH_HOLD=1`, under which no
-/// ray reads the structures either. Read once, when pipelines are made:
-/// off, no container is looked at. `alt`: the pipelines are marked as
-/// with `1`, and a dispatch is left out only in an ON turn
-/// ([`crate::AltTurn`]: twenty seconds without, twenty with, in turn,
-/// each change said in the log).
+/// A kind of work the title does only for rays, which a switch can leave
+/// out while the structure builder is off (without `VICTORY_BVH_BUILDER=1`),
+/// each read once (`1` on, `alt` in turn, anything else off: the default).
+/// A compute container is of the kind if it holds `name`. Off, no container
+/// is looked at for it. `alt`: the pipelines are marked as with `1`, and a
+/// dispatch is left out only in an ON turn of the kind's own
+/// [`crate::AltTurn`] (twenty seconds without, twenty with, in turn, each
+/// change said in the log). What the passes would have written stays as
+/// the title left it: the picture has to be looked at.
 ///
-/// 0 off (or the builder may run), 1 on, 2 in turn.
+/// - `VICTORY_RT_SKIN_SKIP`: the `bvh_skinning` programs, which pose every
+///   animated mesh (and its motion) once more, only for the ray-tracing
+///   structures the builder makes from what they write. Meant with
+///   `VICTORY_BVH_NO_HIT=1` or `VICTORY_BVH_HOLD=1`, under which no ray
+///   reads the structures either. From edsuuu/VI-BR-PORT ab4571df
+///   (GPL-3.0): the largest share of the card's time in a cutscene there
+///   (~6 ms a dispatch, hundreds a frame). Matched by `bvh_skinning` with
+///   no stage after it, so the hair's (`CSGenerateHairVB`) is one of them
+///   too; the picture's own skinning, which may share `ComputeSkinning` in
+///   its names, is not matched by that alone.
+/// - `VICTORY_RT_RESOLVE_SKIP`: `CS_RaytracingResolve*`, which shade what a
+///   ray hit (some 1,000 programs).
+/// - `VICTORY_ACTIVATE_RAYS_SKIP`: `CS_ScreenProbes_ActivateRays*`, which
+///   pick the screen probes that cast rays.
+/// - `VICTORY_HAIR_VB_SKIP`: `CSGenerateHairVB`, the hair's geometry made
+///   for the structures (8 % of the card's time in the opening cutscene
+///   there).
 ///
-/// From edsuuu/VI-BR-PORT ab4571df (GPL-3.0), where it rides on their
-/// `VICTORY_RT_MISS=1`: the largest share of the card's time in a cutscene
-/// there (~6 ms a dispatch, hundreds a frame).
+/// The last three adapted from edsuuu/VI-BR-PORT f1e5e454 / 24f8d2ed
+/// (GPL-3.0; from codec-d/cool_fox `make.rs`). Their rules for the tracing
+/// itself (`CS_RaytraceVBuffer*`, `CS_ScreenProbes_TraceRays*_BVH*`) are
+/// not taken: `VICTORY_BVH_HOLD` holds back exactly the programs whose code
+/// walks the structures.
+///
+/// None of the kinds ever takes a program [`crate::ambient`] follows
+/// ([`ambient_follows`]), whatever its name holds besides.
 #[cfg(windows)]
-fn rt_skin_skip_mode() -> u8 {
-    static MODE: OnceLock<u8> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        if builder_allowed() {
-            return 0;
+struct RtWork {
+    switch: &'static str,
+    /// What a dispatch left out is, as the log says it (no program names).
+    what: &'static str,
+    name: &'static [u8],
+    turn: crate::AltTurn,
+    /// Pipelines of the kind known so far.
+    #[cfg(feature = "diagnostics")]
+    pipelines: std::sync::atomic::AtomicU64,
+    /// Dispatches since the last frame line: left out direct, left out
+    /// indirect, run direct, run indirect (run: in the off turns of `alt`).
+    #[cfg(feature = "diagnostics")]
+    dispatches: [std::sync::atomic::AtomicU64; 4],
+}
+
+#[cfg(windows)]
+impl RtWork {
+    const fn new(switch: &'static str, what: &'static str, name: &'static [u8]) -> Self {
+        Self {
+            switch,
+            what,
+            name,
+            turn: crate::AltTurn::new(),
+            #[cfg(feature = "diagnostics")]
+            pipelines: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "diagnostics")]
+            dispatches: [const { std::sync::atomic::AtomicU64::new(0) }; 4],
         }
-        match std::env::var("VICTORY_RT_SKIN_SKIP").as_deref() {
+    }
+}
+
+/// The kinds ([`RtWork`]); bit `i` of [`Shader::rt_work`] and
+/// [`Pipeline::rt_work`] is `RT_WORK[i]`.
+#[cfg(windows)]
+static RT_WORK: [RtWork; 4] = [
+    RtWork::new(
+        "VICTORY_RT_SKIN_SKIP",
+        "dispatches of skinning only for the ray-tracing structures are left out",
+        b"bvh_skinning",
+    ),
+    RtWork::new(
+        "VICTORY_RT_RESOLVE_SKIP",
+        "dispatches of programs that shade what rays hit are left out",
+        b"CS_RaytracingResolve",
+    ),
+    RtWork::new(
+        "VICTORY_ACTIVATE_RAYS_SKIP",
+        "dispatches of programs that pick the screen probes casting rays are left out",
+        b"CS_ScreenProbes_ActivateRays",
+    ),
+    RtWork::new(
+        "VICTORY_HAIR_VB_SKIP",
+        "dispatches of programs that make hair geometry for the ray-tracing structures are left out",
+        b"CSGenerateHairVB",
+    ),
+];
+
+/// Each kind's switch ([`RtWork`]): 0 off (or the builder may run), 1 on,
+/// 2 in turn.
+#[cfg(windows)]
+fn rt_skip_modes() -> [u8; 4] {
+    static MODES: OnceLock<[u8; 4]> = OnceLock::new();
+    *MODES.get_or_init(|| {
+        if builder_allowed() {
+            return [0; 4];
+        }
+        RT_WORK.each_ref().map(|k| match std::env::var(k.switch).as_deref() {
             Ok("1") => 1,
             Ok("alt") => 2,
             _ => 0,
-        }
+        })
     })
 }
 
-/// At pipeline creation: whether `bvh_skinning` programs are looked for
-/// and marked ([`rt_skin_skip_mode`]: `1` or `alt`).
+/// Whether [`crate::ambient`] follows the program in `bytes`: the stand-in
+/// for indirect light hangs on `CS_ScreenProbes_TemporalResolve*`
+/// ([`crate::ambient::resolves`]: its light image is replaced right after
+/// it, in the dispatch hook these skips return before), and the
+/// reflections' hold on `CS_UpdateHistory` ([`crate::ambient::REFLECTED`]);
+/// the sky ([`crate::ambient::SKY`]) is a pixel program, taken out too in
+/// case a container holds it. Looked at whether the ambient light is on or
+/// not: those passes light the picture either way. No [`RtWork`] kind takes
+/// such a program, so `VICTORY_RT_RESOLVE_SKIP` (whose `Resolve` is the rays'
+/// hit shading, not the probes' temporal resolve) never leaves one out.
 #[cfg(windows)]
-fn rt_skin_skip_on() -> bool {
-    rt_skin_skip_mode() != 0
+fn ambient_follows(bytes: &[u8]) -> bool {
+    crate::ambient::resolves(bytes) || holds(bytes, crate::ambient::REFLECTED) || holds(bytes, crate::ambient::SKY)
+}
+
+/// The kinds the compute container `bytes` is, of those whose switch is on
+/// ([`rt_skip_modes`]); none for a program the ambient light follows.
+#[cfg(windows)]
+fn rt_work_of(bytes: &[u8]) -> u8 {
+    let modes = rt_skip_modes();
+    if modes == [0; 4] || ambient_follows(bytes) {
+        return 0;
+    }
+    RT_WORK
+        .iter()
+        .zip(modes)
+        .enumerate()
+        .filter(|(_, (k, mode))| *mode != 0 && holds(bytes, k.name))
+        .fold(0, |work, (i, _)| work | (1 << i))
 }
 
 /// Whether a dispatch with the title's pipeline `this` is left out because
-/// it only feeds the ray-tracing structures nothing builds
-/// ([`rt_skin_skip_mode`]; with `alt` only in an ON turn).
+/// it only serves rays nothing can use ([`RtWork`]): of a kind whose switch
+/// is `1`, or `alt` in an ON turn of that kind.
 #[cfg(windows)]
-pub(crate) fn skips_rt_skin(this: This, indirect: bool) -> bool {
-    if this.is_null() || !pipeline(this).rt_skin {
+pub(crate) fn skips_rt_work(this: This, indirect: bool) -> bool {
+    if this.is_null() {
         return false;
     }
-    let skip = if rt_skin_skip_mode() != 2 {
-        true
-    } else {
-        static TURN: crate::AltTurn = crate::AltTurn::new();
-        TURN.on(
-            "dispatches of bvh_skinning programs are left out",
-            "VICTORY_RT_SKIN_SKIP",
-            "off, run as usual",
-        )
-    };
-    #[cfg(feature = "diagnostics")]
-    RT_SKIN_DISPATCHES[usize::from(!skip) * 2 + usize::from(indirect)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let work = pipeline(this).rt_work;
+    if work == 0 {
+        return false;
+    }
+    let modes = rt_skip_modes();
+    let mut skip = false;
+    for (i, (kind, mode)) in RT_WORK.iter().zip(modes).enumerate() {
+        if work & (1 << i) == 0 || mode == 0 {
+            continue;
+        }
+        let left = mode == 1 || kind.turn.on(kind.what, kind.switch, "off, run as usual");
+        #[cfg(feature = "diagnostics")]
+        kind.dispatches[usize::from(!left) * 2 + usize::from(indirect)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        skip |= left;
+    }
     #[cfg(not(feature = "diagnostics"))]
     let _ = indirect;
     skip
 }
 
-/// bvh_skinning pipelines known so far ([`skins_for_rays`]).
-#[cfg(feature = "diagnostics")]
-static RT_SKIN_PIPELINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A count of compute containers by what their names hold, nothing left
+/// out for it (diagnostics): `bvh_skinning`; `ComputeSkinning` without
+/// `bvh` (the picture's own skinning, if it shares that name); and
+/// `GenerateHairVB`. Each container once, when first seen.
+#[cfg(all(windows, feature = "diagnostics"))]
+static RT_CENSUS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Dispatches of bvh_skinning pipelines since the last frame line: left
-/// out direct, left out indirect, run direct, run indirect (run: in the
-/// off turns of `=alt`).
-#[cfg(feature = "diagnostics")]
-static RT_SKIN_DISPATCHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-
-/// The frame line's part of [`skips_rt_skin`]: per frame over `frames`.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn rt_skin_line(frames: f64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let [left_direct, left_indirect, ran_direct, ran_indirect] = RT_SKIN_DISPATCHES.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames.max(1.0));
-    if rt_skin_skip_mode() == 0 {
-        return;
+/// Counts the compute container `bytes` in [`RT_CENSUS`].
+#[cfg(all(windows, feature = "diagnostics"))]
+fn rt_census(bytes: &[u8]) {
+    let kinds = [
+        holds(bytes, b"bvh_skinning"),
+        holds(bytes, b"ComputeSkinning") && !holds(bytes, b"bvh"),
+        holds(bytes, b"GenerateHairVB"),
+    ];
+    for (count, is) in RT_CENSUS.iter().zip(kinds) {
+        if is {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
-    tracing::info!(
-        "bvh_skinning dispatches per frame (VICTORY_RT_SKIN_SKIP): left out {left_direct:.1} direct, {left_indirect:.1} indirect; run {ran_direct:.1} direct, {ran_indirect:.1} indirect (the off turns of alt); {} such pipelines known",
-        RT_SKIN_PIPELINES.load(Relaxed)
-    );
+}
+
+/// The frame line's part of [`skips_rt_work`], per frame over `frames`: a
+/// line for each kind whose switch is on, and the three numbers of
+/// [`RT_CENSUS`], in its order, whenever they changed.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn rt_work_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for (kind, mode) in RT_WORK.iter().zip(rt_skip_modes()) {
+        let [left_direct, left_indirect, ran_direct, ran_indirect] =
+            kind.dispatches.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames.max(1.0));
+        if mode == 0 {
+            continue;
+        }
+        tracing::info!(
+            "ray-only dispatches per frame ({}): left out {left_direct:.1} direct, {left_indirect:.1} indirect; run {ran_direct:.1} direct, {ran_indirect:.1} indirect (the off turns of alt); {} such pipelines known",
+            kind.switch,
+            kind.pipelines.load(Relaxed)
+        );
+    }
+    static SAID: Mutex<[u64; 3]> = Mutex::new([0; 3]);
+    let census = RT_CENSUS.each_ref().map(|c| c.load(Relaxed));
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if census != *said {
+        *said = census;
+        let [a, b, c] = census;
+        tracing::info!("ray census of compute containers (pipeline.rs RT_CENSUS): {a} {b} {c}");
+    }
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -665,10 +808,11 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
-    /// One of the title's skinning passes for the ray-tracing structures,
-    /// left out ([`skips_rt_skin`]).
+    /// The kinds of work only for rays its compute stage is, whose
+    /// dispatches can be left out ([`skips_rt_work`]): bit `i` is
+    /// [`RT_WORK`]`[i]`.
     #[cfg(windows)]
-    rt_skin: bool,
+    rt_work: u8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -861,18 +1005,17 @@ fn hand_out(
         #[cfg(windows)]
         builder,
         #[cfg(windows)]
-        rt_skin: {
-            let skin = rt_skin_skip_on()
-                && shaders
-                    .iter()
-                    .any(|s| s.stage == "compute" && skins_for_rays(&s.container));
+        rt_work: {
+            let work = shaders.iter().fold(0, |work, s| work | s.rt_work);
             #[cfg(feature = "diagnostics")]
-            if skin {
-                let n = RT_SKIN_PIPELINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let hash = shaders.iter().find(|s| s.stage == "compute").map_or("", |s| s.hash.as_str());
-                tracing::info!(shader = hash, so_far = n, "a bvh_skinning program known (VICTORY_RT_SKIN_SKIP): its dispatches can be left out");
+            for (i, kind) in RT_WORK.iter().enumerate() {
+                if work & (1 << i) != 0 {
+                    let n = kind.pipelines.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let hash = shaders.iter().find(|s| s.stage == "compute").map_or("", |s| s.hash.as_str());
+                    tracing::info!(shader = hash, switch = kind.switch, so_far = n, "a program of work only for rays known: its dispatches can be left out");
+                }
             }
-            skin
+            work
         },
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
@@ -1109,18 +1252,31 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
-    /// The title's skinning passes for the ray-tracing structures are known
-    /// by the name in their container; other skinning programs are not.
+    /// The kinds of work only for rays are known by the names in their
+    /// container; the picture's own skinning and the programs the ambient
+    /// light follows are none of them. (Every switch is off in tests: the
+    /// names are matched as [`rt_work_of`] does with all of them on.)
     #[cfg(windows)]
     #[test]
-    fn ray_skinning_programs_are_known_by_name() {
-        assert!(skins_for_rays(
-            b"..\0bvh_skinningCSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."
-        ));
-        assert!(skins_for_rays(b"bvh_skinningCS"));
-        assert!(!skins_for_rays(b"PS_PedSkin_0001"));
-        assert!(!skins_for_rays(b"bvh_skinningPS"));
-        assert!(!skins_for_rays(b""));
+    fn ray_work_programs_are_known_by_name() {
+        let kinds = |bytes: &[u8]| -> u8 {
+            if ambient_follows(bytes) {
+                return 0;
+            }
+            RT_WORK.iter().enumerate().filter(|(_, k)| holds(bytes, k.name)).fold(0, |w, (i, _)| w | (1 << i))
+        };
+        assert_eq!(kinds(b"..\0bvh_skinningCSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."), 0b0001);
+        assert_eq!(kinds(b"bvh_skinningCS"), 0b0001);
+        assert_eq!(kinds(b"bvh_skinning_smh"), 0b0001);
+        assert_eq!(kinds(b"..\0CSComputeSkinning_0_Wrapped\0.."), 0);
+        assert_eq!(kinds(b"PS_PedSkin_0001"), 0);
+        assert_eq!(kinds(b"..\0CS_RaytracingResolve_Opaque_12345678_Wrapped\0.."), 0b0010);
+        assert_eq!(kinds(b"..\0CS_ScreenProbes_ActivateRays_0_Wrapped\0.."), 0b0100);
+        assert_eq!(kinds(b"bvh_skinning_smh\0CSGenerateHairVB_c88a8f19_Wrapped\0.."), 0b1001);
+        assert_eq!(kinds(b"..\0CS_ScreenProbes_TemporalResolve_Wave64\0.."), 0);
+        assert_eq!(kinds(b"CS_RaytracingResolve\0CS_ScreenProbes_TemporalResolve\0"), 0);
+        assert_eq!(kinds(b"CS_RaytracingResolve\0CS_UpdateHistory\0"), 0);
+        assert_eq!(kinds(b""), 0);
     }
 
     /// Which stores give title-memory copies as written: a vector store

@@ -3611,8 +3611,9 @@ impl State {
             crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=1)".to_owned());
             return;
         }
-        // A skinning pass only for structures nothing builds.
-        if crate::pipeline::skips_rt_skin(self.pipeline as This, false) {
+        // Work only for rays nothing can use (skinning for structures nothing
+        // builds, hit shading, probe ray picking, hair geometry for them).
+        if crate::pipeline::skips_rt_work(self.pipeline as This, false) {
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
@@ -4681,8 +4682,9 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
-        // A skinning pass only for structures nothing builds.
-        if crate::pipeline::skips_rt_skin(self.pipeline as This, true) {
+        // Work only for rays nothing can use (skinning for structures nothing
+        // builds, hit shading, probe ray picking, hair geometry for them).
+        if crate::pipeline::skips_rt_work(self.pipeline as This, true) {
             return false;
         }
         // A program that walks ray-tracing structures nothing has built:
