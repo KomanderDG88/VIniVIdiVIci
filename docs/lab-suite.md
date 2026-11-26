@@ -141,6 +141,10 @@ nothing of the title.
   second, median and 95th percentile frame, how many scripted keys the title
   read, the least free memory, the peak of the process's private memory and why
   the run ended.
+  It also says how many logical processors other programs kept busy during
+  the window (median and most, from the layer's own line of the machine's load)
+  and warns when the median is above two: such a run was not measured on a
+  quiet machine and is not to be compared.
 
 Only batches that lie wholly inside the window count, and the layer rounds a
 batch's length, so two runs can be compared with each other but the figures are

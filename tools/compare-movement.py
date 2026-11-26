@@ -15,13 +15,24 @@ spec = importlib.util.spec_from_file_location('movement', Path(__file__).with_na
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 KEY = re.compile(r'let go after its hold .*key=(76|87) at=([\d.]+) reads=(\d+)')
+LOAD = re.compile(r"processors (\d+(?:\.\d+)?) % busy, all programs; this process kept (\d+(?:\.\d+)?) of (\d+) processors busy")
 
 def measure(path):
     start = mod.find_start(path, 76, 540)
     end_window = start + dt.timedelta(seconds=280)
-    values, seconds, key_reads = [], 0.0, {'76': [], '87': []}
+    values, seconds, key_reads, other_cpu = [], 0.0, {'76': [], '87': []}, []
+    latest_observation = None
     with Path(path).open(encoding='utf8', errors='replace') as f:
         for line in f:
+            lm = LOAD.search(line)
+            if lm:
+                try:
+                    when = dt.datetime.fromisoformat(line.split()[0].replace('Z', '+00:00'))
+                    latest_observation = max(latest_observation, when) if latest_observation else when
+                    if start <= when <= end_window:
+                        other_cpu.append(max(0.0, float(lm[1]) * int(lm[3]) / 100 - float(lm[2])))
+                except (ValueError, IndexError):
+                    pass
             km = KEY.search(line)
             if km:
                 when = dt.datetime.fromisoformat(line.split()[0].replace('Z', '+00:00'))
@@ -32,6 +43,7 @@ def measure(path):
                 continue
             try:
                 end = dt.datetime.fromisoformat(m[1].replace('Z', '+00:00'))
+                latest_observation = max(latest_observation, end) if latest_observation else end
                 count, duration = int(m[2]), float(m[3])
                 frame_ms = [int(x) for x in m[4].split()]
             except ValueError:
@@ -53,12 +65,17 @@ def measure(path):
             'run_end_reason': run_result.get('reason'),
             'min_free_ram_mb': min((x['ram_mb'] for x in memory), default=None),
             'max_private_gib': max((x['process_private_gib'] for x in memory), default=None),
-            'complete_window': dt.datetime.now(dt.timezone.utc) >= end_window,
+            'complete_window': latest_observation is not None and latest_observation >= end_window,
+            'last_observation': latest_observation.isoformat() if latest_observation else None,
             'frames': len(values), 'logged_seconds': round(seconds, 1),
             'coverage_pct': round(100 * seconds / 280, 1),
             'fps': round(len(values)/seconds, 3) if seconds else None,
             'median_ms': statistics.median(values) if values else None,
             'p95_ms': values[int((len(values)-1)*.95)] if values else None,
+            'other_cpu_logical_median': round(statistics.median(other_cpu), 2) if other_cpu else None,
+            'other_cpu_logical_max': round(max(other_cpu), 2) if other_cpu else None,
+            'other_cpu_samples': len(other_cpu),
+            'other_cpu_warning': 'median above 2 logical processors; repeat under similar load' if other_cpu and statistics.median(other_cpu) > 2 else ('no load samples' if not other_cpu else None),
             'inputs': {key: {'events': len(v), 'missed': sum(x == 0 for x in v), 'minimum_reads': min(v) if v else None} for key,v in key_reads.items()}}
 
 if __name__ == '__main__':
