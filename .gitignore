@@ -76,3 +76,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Python bytecode caches (the lab suite and its tests)
+__pycache__/
