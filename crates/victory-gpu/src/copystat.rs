@@ -436,6 +436,44 @@ mod command_tests {
 }
 
 #[cfg(test)]
+mod lock_tests {
+    use super::{held_line, lock_split_line};
+
+    /// The sums are microseconds since the last line: shown in
+    /// milliseconds per frame.
+    #[test]
+    fn lock_lines_are_per_frame() {
+        assert_eq!(
+            lock_split_line(2.0, 3000, [40_000, 30_000, 5000, 2000, 1000, 600]),
+            "  the submission lock per frame, main submitting thread: waited for it 1.5 ms (other holders); \
+             before submitting, under it: settles for reads 20.0 ms (of them waiting for the card 15.0), \
+             heap sync 2.5, sweep 1.0, waiting makes 0.5, the rest 0.3"
+        );
+        assert_eq!(
+            held_line(4.0, [[8000, 4000], [2000, 0], [0, 0], [400, 400], [1000, 200]]),
+            "  the submission lock held per frame, by site: submit 2.0 ms (waiting for the card 1.0), \
+             send_late 0.5 ms (waiting for the card 0.0), execute 0.0 ms (waiting for the card 0.0), \
+             settle_now 0.1 ms (waiting for the card 0.1), other 0.2 ms (waiting for the card 0.1)"
+        );
+    }
+
+    /// A [`super::Held`] counts the card waits made while it lives, at
+    /// the site it is at then.
+    #[test]
+    fn held_counts_card_waits_by_site() {
+        use super::{HELD_US, Held, Site, stood_for_card};
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = HELD_US[Site::Execute as usize][1].load(Relaxed);
+        stood_for_card(7);
+        let held = Held::new(Site::Submit);
+        held.at(Site::Execute);
+        stood_for_card(1000);
+        drop(held);
+        assert!(HELD_US[Site::Execute as usize][1].load(Relaxed) >= before + 1000);
+    }
+}
+
+#[cfg(test)]
 mod counter_tests {
     /// Every counter has a slot: the last one too (run 324 ended with an
     /// index past the end of a fixed-size array).
@@ -973,6 +1011,11 @@ struct Submitter {
     between_ours: u64,
     /// Waiting for the submission lock; running inside submissions.
     lock: u64,
+    /// Of `lock`: waiting to get it ([`LockSplit::waited`]), and the work
+    /// done under it before the submission counted as started
+    /// ([`LockSplit::before`]).
+    waited: u64,
+    before: [u64; 6],
     inside_user: u64,
     inside_kernel: u64,
 }
@@ -1091,9 +1134,22 @@ pub(crate) fn submission_begins() {
     }
 }
 
+/// Of a submission's "waiting for the submission lock" (microseconds):
+/// the wait to get the lock (other holders), and what the submitting
+/// thread did under it before the submission counted as started.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct LockSplit {
+    pub(crate) waited: u64,
+    /// Settles of flights before it (for what it reads; a waited
+    /// submission settles all), of them waiting for the card, the pass over
+    /// the view heap (`sync_heaps`), the sweep, the waiting slots made
+    /// (`make_waiting`), and the rest.
+    pub(crate) before: [u64; 6],
+}
+
 /// The submission returns; it waited `lock` microseconds for the
-/// submission lock.
-pub(crate) fn submission_ends(lock: u64) {
+/// submission lock, or did work under it before it started (`split`).
+pub(crate) fn submission_ends(lock: u64, split: &LockSplit) {
     let now = now_us();
     SUBMITTED_AT.store(now, Relaxed);
     let (user, kernel) = thread_times();
@@ -1104,8 +1160,116 @@ pub(crate) fn submission_ends(lock: u64) {
     let s = submitter(&mut all, thread_id());
     s.submissions += 1;
     s.lock += lock;
+    s.waited += split.waited;
+    for (all, part) in s.before.iter_mut().zip(split.before) {
+        *all += part;
+    }
     s.inside_user += user.saturating_sub(u);
     s.inside_kernel += kernel.saturating_sub(k);
+}
+
+/// Where the submission lock is held ([`Held`]): preparing a submission
+/// until it goes to the card; the rest of a submission sent ahead
+/// (`send_late`); the wait for a waited one and its copy-back (`execute`);
+/// a settle of the flights (`settle_now`); anything else.
+#[derive(Clone, Copy)]
+pub(crate) enum Site {
+    Submit,
+    SendLate,
+    Execute,
+    SettleNow,
+    Other,
+}
+
+const SITES: [&str; 5] = ["submit", "send_late", "execute", "settle_now", "other"];
+
+/// By [`Site`], since the last line: microseconds the submission lock was
+/// held there, and of them waiting for the card ([`stood_for_card`]).
+static HELD_US: [[AtomicU64; 2]; 5] = [const { [const { AtomicU64::new(0) }; 2] }; 5];
+
+thread_local! {
+    /// Microseconds this thread stood waiting for the card (or for flights
+    /// to land) so far: a [`Held`] counts what this grows by while it lives.
+    static STOOD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The thread waited `us` microseconds for the card (the holder of the
+/// submission lock does).
+pub(crate) fn stood_for_card(us: u64) {
+    STOOD.with(|s| s.set(s.get() + us));
+}
+
+/// [`STOOD`] of this thread so far.
+pub(crate) fn stood_so_far() -> u64 {
+    STOOD.with(std::cell::Cell::get)
+}
+
+/// The submission lock is held from the making of this to its drop, at a
+/// [`Site`] that [`Held::at`] may change on the way: the time goes to
+/// [`HELD_US`].
+pub(crate) struct Held {
+    site: std::cell::Cell<Site>,
+    since: std::cell::Cell<std::time::Instant>,
+    stood: std::cell::Cell<u64>,
+}
+
+impl Held {
+    pub(crate) fn new(site: Site) -> Self {
+        Held {
+            site: std::cell::Cell::new(site),
+            since: std::cell::Cell::new(std::time::Instant::now()),
+            stood: std::cell::Cell::new(stood_so_far()),
+        }
+    }
+
+    /// The time so far goes to the site until now; what follows to `site`.
+    pub(crate) fn at(&self, site: Site) {
+        self.count();
+        self.site.set(site);
+    }
+
+    fn count(&self) {
+        let now = std::time::Instant::now();
+        let stood = stood_so_far();
+        let held = &HELD_US[self.site.get() as usize];
+        held[0].fetch_add((now - self.since.replace(now)).as_micros() as u64, Relaxed);
+        held[1].fetch_add(stood.saturating_sub(self.stood.replace(stood)), Relaxed);
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.count();
+    }
+}
+
+/// The line of the main submitting thread's [`LockSplit`] sums
+/// (microseconds), per frame.
+fn lock_split_line(frames: f64, waited: u64, before: [u64; 6]) -> String {
+    let ms = |v: u64| v as f64 / 1e3 / frames;
+    format!(
+        "  the submission lock per frame, main submitting thread: waited for it {:.1} ms (other holders); \
+         before submitting, under it: settles for reads {:.1} ms (of them waiting for the card {:.1}), \
+         heap sync {:.1}, sweep {:.1}, waiting makes {:.1}, the rest {:.1}",
+        ms(waited),
+        ms(before[0]),
+        ms(before[1]),
+        ms(before[2]),
+        ms(before[3]),
+        ms(before[4]),
+        ms(before[5]),
+    )
+}
+
+/// The line of [`HELD_US`] sums (microseconds), per frame.
+fn held_line(frames: f64, held: [[u64; 2]; 5]) -> String {
+    let ms = |v: u64| v as f64 / 1e3 / frames;
+    let sites: Vec<String> = SITES
+        .iter()
+        .zip(held)
+        .map(|(name, [held, stood])| format!("{name} {:.1} ms (waiting for the card {:.1})", ms(held), ms(stood)))
+        .collect();
+    format!("  the submission lock held per frame, by site: {}", sites.join(", "))
 }
 
 /// The title calls its present (before our own copy to the window runs).
@@ -1388,6 +1552,7 @@ pub(crate) fn log(frames: f64) {
     }
     let mut submitters = std::mem::take(&mut *SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner()));
     submitters.sort_by_key(|s| std::cmp::Reverse(s.1.submissions));
+    let mut first = true;
     for (id, s) in submitters.into_iter().take(4) {
         let per = |v: u64| v as f64 / 1e3 / frames;
         tracing::info!(
@@ -1403,7 +1568,13 @@ pub(crate) fn log(frames: f64) {
             per(s.inside_kernel),
             per(s.lock),
         );
+        if first {
+            tracing::info!("{}", lock_split_line(frames, s.waited, s.before));
+            first = false;
+        }
     }
+    let held = HELD_US.each_ref().map(|site| site.each_ref().map(|a| a.swap(0, Relaxed)));
+    tracing::info!("{}", held_line(frames, held));
     let mut recorders = std::mem::take(&mut *RECORDERS.lock().unwrap_or_else(|e| e.into_inner()));
     recorders.sort_by_key(|r| std::cmp::Reverse(r.1));
     let busiest: Vec<String> = recorders

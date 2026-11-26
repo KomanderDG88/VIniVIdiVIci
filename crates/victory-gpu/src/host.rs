@@ -1061,7 +1061,40 @@ fn worked() -> u64 {
 /// The thread that holds the submission lock stood waiting for the card
 /// from `since` until now ([`CARD_CLOCK_US`]).
 fn stood(since: std::time::Instant) {
-    card_clock_us(2, since.elapsed().as_micros() as u64);
+    let us = since.elapsed().as_micros() as u64;
+    card_clock_us(2, us);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::stood_for_card(us);
+}
+
+/// The submission lock's guard ([`Host::lock_submitted`]): its value, and
+/// with diagnostics where it is held and for how long
+/// (`crate::copystat::Held`).
+struct Locked<'a> {
+    #[cfg(feature = "diagnostics")]
+    held: crate::copystat::Held,
+    value: std::sync::MutexGuard<'a, u64>,
+}
+
+impl Locked<'_> {
+    /// From here on the lock is held at `site`.
+    #[cfg(feature = "diagnostics")]
+    fn at(&self, site: crate::copystat::Site) {
+        self.held.at(site);
+    }
+}
+
+impl std::ops::Deref for Locked<'_> {
+    type Target = u64;
+    fn deref(&self) -> &u64 {
+        &self.value
+    }
+}
+
+impl std::ops::DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut u64 {
+        &mut self.value
+    }
 }
 
 /// What [`CARD_CLOCK_US`] is measured with.
@@ -4371,7 +4404,9 @@ pub(crate) fn settle_now(why: usize) {
     };
     // Title submissions held back to be merged are settled too: first.
     merge_send(if why == WHY_VALUE { crate::merge::Why::Value } else { crate::merge::Why::Settle });
-    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let mut submitted = host.lock_submitted();
+    #[cfg(feature = "diagnostics")]
+    submitted.at(crate::copystat::Site::SettleNow);
     host.settle(&mut submitted, why);
 }
 
@@ -4468,7 +4503,9 @@ fn late_helper() {
             }
         }
         {
-            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let mut submitted = host.lock_submitted();
+            #[cfg(feature = "diagnostics")]
+            submitted.at(crate::copystat::Site::Other);
             // Something newer went up meanwhile: the card is waited for
             // again, the submitting thread is not held up for it.
             if line().target != target {
@@ -6625,6 +6662,8 @@ impl Host {
         let Some((submitted, sent)) = self.submit(&[list], true, &[]) else {
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        submitted.at(crate::copystat::Site::Other);
         let number = sent.number;
         {
             let mut line = line();
@@ -6840,13 +6879,25 @@ impl Host {
         crate::watch::ask_once(ranges);
     }
 
+    /// Takes the submission lock; with diagnostics the time it is held is
+    /// counted, at the site [`Locked::at`] names (`crate::copystat::Held`;
+    /// "other" until then).
+    fn lock_submitted(&self) -> Locked<'_> {
+        let value = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        Locked {
+            #[cfg(feature = "diagnostics")]
+            held: crate::copystat::Held::new(crate::copystat::Site::Other),
+            value,
+        }
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
     /// still held. `joins`: where in `runs` each title submission merged
     /// behind others begins ([`crate::merge::level`]); its first list waits
     /// for everything before it (`merging::join_barriers`).
-    fn submit<'a>(&'a self, runs: &[&HostList], late: bool, joins: &[usize]) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+    fn submit<'a>(&'a self, runs: &[&HostList], late: bool, joins: &[usize]) -> Option<(Locked<'a>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -6855,7 +6906,19 @@ impl Host {
         crate::profile::seen(crate::profile::Seen::Submit);
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = self.lock_submitted();
+        #[cfg(feature = "diagnostics")]
+        submitted.at(crate::copystat::Site::Submit);
+        // What the lock figure below (`lock`) is made of: the wait to get the
+        // lock, and the parts of what is done under it before `started`
+        // (`crate::copystat::LockSplit`).
+        #[cfg(feature = "diagnostics")]
+        let got = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let mut split = crate::copystat::LockSplit {
+            waited: (got - called).as_micros() as u64,
+            ..Default::default()
+        };
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
@@ -6865,6 +6928,8 @@ impl Host {
         // Or the reads are done on the card, behind the flights
         // ([`card_steps`]; never without `VICTORY_CARD_STEPS`).
         let own = if late { self.card_steps(runs) } else { None };
+        #[cfg(feature = "diagnostics")]
+        let (reads, stood_before) = (std::time::Instant::now(), crate::copystat::stood_so_far());
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
@@ -6880,6 +6945,11 @@ impl Host {
             } else {
                 self.settle(&mut submitted, why);
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            split.before[0] = reads.elapsed().as_micros() as u64;
+            split.before[1] = crate::copystat::stood_so_far().saturating_sub(stood_before);
         }
         if let Some(own) = &own {
             read_ahead_rest(runs, own);
@@ -6899,9 +6969,16 @@ impl Host {
         // prepares, from after the sweep to before the lists go to the card
         // (`crate::descriptor::sync_beside`).
         let beside = crate::descriptor::sync_beside();
+        #[cfg(feature = "diagnostics")]
+        let heaps = std::time::Instant::now();
         if !beside {
             crate::descriptor::sync_heaps();
         }
+        #[cfg(feature = "diagnostics")]
+        let sweeping = {
+            split.before[2] = heaps.elapsed().as_micros() as u64;
+            std::time::Instant::now()
+        };
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6918,6 +6995,11 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        let makes = {
+            split.before[3] = sweeping.elapsed().as_micros() as u64;
+            std::time::Instant::now()
+        };
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run (with the pass, beside, after it).
@@ -6926,12 +7008,22 @@ impl Host {
         } else {
             crate::descriptor::make_waiting();
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            split.before[4] = makes.elapsed().as_micros() as u64;
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        {
+            let under = (started - got).as_micros() as u64;
+            let parts = split.before[0] + split.before[2] + split.before[3] + split.before[4];
+            split.before[5] = under.saturating_sub(parts);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
@@ -7045,7 +7137,10 @@ impl Host {
             submission_us(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::submission_ends(lock);
+            crate::copystat::submission_ends(lock, &split);
+            // The rest is the caller's (`send_late`).
+            #[cfg(feature = "diagnostics")]
+            submitted.at(crate::copystat::Site::SendLate);
             let sent = Sent {
                 number: this_submission,
                 card,
@@ -7070,6 +7165,9 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // The wait for the card and the copy-back.
+        #[cfg(feature = "diagnostics")]
+        submitted.at(crate::copystat::Site::Execute);
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -7192,7 +7290,7 @@ impl Host {
         self.log_messages();
         submitting(0, 0);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::submission_ends(lock);
+        crate::copystat::submission_ends(lock, &split);
         // With the relay: nothing is in the air now, so no fetch still to
         // be merged is older than the sends to card copies so far, and
         // their notes can go.
