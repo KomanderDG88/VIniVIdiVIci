@@ -256,16 +256,13 @@ fn cold_skip() -> bool {
         0 => false,
         1 => true,
         _ => {
-            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
-            static LAST: AtomicU8 = AtomicU8::new(2);
-            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
-                tracing::info!(
-                    "refreshes pass over chunks with no write since from now (VICTORY_COLD_SKIP=alt): {}",
-                    if on { "ON" } else { "off, every page looked at as usual" }
-                );
-            }
-            on
+            // The turns of every `alt` switch (`VICTORY_ALT_FLIP=1`: ON first).
+            static TURN: crate::AltTurn = crate::AltTurn::new();
+            TURN.on(
+                "refreshes pass over chunks with no write since",
+                "VICTORY_COLD_SKIP",
+                "off, every page looked at as usual",
+            )
         }
     }
 }
