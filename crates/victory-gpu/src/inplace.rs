@@ -228,7 +228,7 @@ fn place_stretch(start: u64, len: u64, section: usize, offset: u64) -> Option<Pl
     if cover((start - lead) as usize, bytes as usize) != Cover::Run(section, from) {
         return refused("its pages are not all of the run", None);
     }
-    let section_bytes = views().sections.iter().find(|s| s.0 == section)?.1;
+    let section_bytes = views().sections.get(&section)?.0;
     if from + bytes > section_bytes {
         return refused("past the section", None);
     }
@@ -255,6 +255,7 @@ fn place_stretch(start: u64, len: u64, section: usize, offset: u64) -> Option<Pl
                 view.committed[block / 64] |= 1u64 << (block % 64);
             }
         }
+        view.placed = true;
         view.base + from as usize
     };
     let host = crate::host::host()?;
@@ -402,11 +403,11 @@ struct Views {
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    sections: BTreeMap<usize, (u64, bool)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -415,18 +416,23 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    {
-        let mut v = views();
-        v.sections.retain(|s| s.0 != section);
-        v.sections.push((section, bytes, committed));
-    }
-    // A view of our own made on an earlier section that had this handle's
-    // number shows that section's pages, not this one's: it is forgotten
-    // (left mapped: nothing reads it any more) and the next store through
-    // a view of ours maps this section.
-    let gone = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
-    if gone.is_some() {
-        tracing::info!(section, "a section handle's number came round again: our own view of the earlier section is forgotten");
+    views().sections.insert(section, (bytes, committed));
+}
+
+/// The last page and title view of this section are gone. Release our
+/// copy-back view before Windows can give the handle to another section.
+pub fn title_memory_section_closed(section: usize) {
+    views().sections.remove(&section);
+    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(view)) = own.as_mut().and_then(|views| views.remove(&section)) {
+        if view.placed {
+            // A heap opened in place on it may still be held by a list or
+            // a slot: forgotten, left mapped, as before sections were closed.
+            return;
+        }
+        // SAFETY: write_own uses this mapping only while it holds OWN, and
+        // no heap was opened on it.
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view.base as *mut c_void }) };
     }
 }
 
@@ -616,6 +622,9 @@ struct Own {
     base: usize,
     bytes: u64,
     committed: Vec<u64>,
+    /// A heap was opened on this view ([`place_stretch`]): it may outlive
+    /// the section's last title view, so the view is never unmapped.
+    placed: bool,
 }
 
 /// Maps a view of our own on the whole of `section` (`bytes` long): `None`
@@ -633,7 +642,7 @@ fn own_view(section: usize, bytes: u64) -> Option<Own> {
         return None;
     }
     tracing::info!(section, mb = bytes >> 20, "a view of our own on a section of title pages");
-    Some(Own { base: at.Value as usize, bytes, committed: vec![0; (bytes as usize).div_ceil(K64).div_ceil(64)] })
+    Some(Own { base: at.Value as usize, bytes, committed: vec![0; (bytes as usize).div_ceil(K64).div_ceil(64)], placed: false })
 }
 
 /// Our own views by section handle; `None` in a section's place if the
@@ -664,7 +673,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         if shown.len() > crate::watch::MANY_VIEWS {
             return None;
         }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+        let &(section_bytes, _) = v.sections.get(&section)?;
         (section, offset, shown, section_bytes)
     };
     if offset + bytes.len() as u64 > section_bytes {
@@ -1286,9 +1295,13 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    let mut groups = BTreeMap::new();
+    for &section in v.sections.values() {
+        *groups.entry(section).or_insert(0usize) += 1;
+    }
+    for ((bytes, committed), count) in groups {
         lines.push(format!(
-            "census, a section of {} MB, {}",
+            "census, {count} sections of {} MB each, {}",
             bytes >> 20,
             if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
         ));
