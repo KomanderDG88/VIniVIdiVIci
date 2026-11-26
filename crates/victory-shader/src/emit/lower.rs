@@ -958,6 +958,14 @@ use super::ticket::{count_ticket, ticket_on};
 /// `VICTORY_BPERMUTE_HALVES` (on unless `0`): a wave64 `ds_bpermute_b32` permutes within each
 /// 32-lane half, as RDNA 2 does; `0` brings back the whole-wave permute (and its refusal across
 /// two host waves). Read by the translator, so it joins the shader cache key (`build.rs`).
+/// `VICTORY_FMAC_MODS` (on unless `0`): the VOP3 abs and neg bit 2 of `v_fmac_f32`,
+/// `v_mac_f32` and `v_mac_legacy_f32` apply to the accumulator; `0` reads it without them, as
+/// before. Read by the translator, so it joins the shader cache key (`build.rs`).
+fn fmac_mods() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FMAC_MODS").is_none_or(|v| v != "0"))
+}
+
 fn bpermute_halves() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BPERMUTE_HALVES").is_none_or(|v| v != "0"))
@@ -7787,10 +7795,11 @@ impl<'a> Lower<'a> {
                         self.as_float(x)
                     }
                 };
-                if v.abs >> 2 & 1 != 0 {
+                let mods = fmac_mods();
+                if mods && v.abs >> 2 & 1 != 0 {
                     acc = self.unary(6, acc);
                 }
-                if v.neg >> 2 & 1 != 0 {
+                if mods && v.neg >> 2 & 1 != 0 {
                     let z = self.s.m.f32(0x8000_0000);
                     acc = self.s.m.bin(c, Bin::Sub, z, acc);
                 }
