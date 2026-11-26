@@ -417,12 +417,18 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
+/// `VICTORY_BVH_BUILDER=1`: the builder may run (see [`Builder`]).
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -432,7 +438,20 @@ pub(crate) fn builder_runs() -> bool {
     if b.whole {
         return true;
     }
+    // How many were not made yet, and how long making them here took.
+    #[cfg(feature = "diagnostics")]
+    let (unmade, started) = (
+        b.pipelines.iter().filter(|p| !make::made(p)).count(),
+        std::time::Instant::now(),
+    );
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
+    #[cfg(feature = "diagnostics")]
+    tracing::info!(
+        unmade,
+        of = b.pipelines.len(),
+        ms = started.elapsed().as_millis() as u64,
+        "the ray-tracing structure builder's first dispatch: pipelines not made yet, made here"
+    );
     if missing > 0 {
         b.off = true;
         for p in b.pipelines.iter().filter(|p| !make::now(p)) {
@@ -675,6 +694,11 @@ fn hand_out(
         // Named once each (gfx41): which programs are the builder's, to
         // match against the refused and untranslated ones.
         tracing::info!(n = b.pipelines.len(), ?shaders, "a pipeline of the ray-tracing structure builder");
+        // Made ahead of the pipelines draws ask for, long before the
+        // first builder dispatch, which needs all of them at once.
+        if builder_allowed() {
+            make::ahead(&host);
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),

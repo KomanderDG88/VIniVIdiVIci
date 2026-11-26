@@ -260,6 +260,35 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// Whether `p` has been made (with or without a host pipeline).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn made(p: &Pending) -> bool {
+    p.made.get().is_some()
+}
+
+/// At the title's creation of a pipeline that must be made before its
+/// first use, all at once with others (the ray-tracing structure
+/// builder's, with `VICTORY_BVH_BUILDER=1`): queued at once, ahead of the
+/// pipelines draws have asked for. Made only on demand, the builder's were
+/// never queued (its dispatches are dropped until it runs, and its first
+/// one made all 53 in place: a 30 s frame, after which the title ended
+/// itself). Without workers, nothing (made in place as before).
+pub(crate) fn ahead(p: &Arc<Pending>) {
+    if p.shaders.is_empty()
+        || p.queue_state.load(Ordering::Relaxed) >= REQUESTED
+        || !workers()
+    {
+        return;
+    }
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(new) = queue.push_ahead(p) {
+        if new {
+            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        }
+        AVAILABLE.notify_one();
+    }
+}
+
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
@@ -359,6 +388,9 @@ const MAKING: u8 = 3;
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    /// Pipelines queued at creation to be made before any requested one
+    /// ([`ahead`]; empty without `VICTORY_BVH_BUILDER=1`).
+    ahead: VecDeque<Arc<Pending>>,
     /// Requested screen passes ([`screen_workers`]): before the others,
     /// and the only work of the screen workers. Always empty with the
     /// switch off.
@@ -370,6 +402,7 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            ahead: VecDeque::new(),
             screen: VecDeque::new(),
         }
     }
@@ -392,12 +425,29 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
+    /// Queues `p` as requested, ahead of the requested pipelines
+    /// ([`ahead`]); as [`Queue::push`].
+    fn push_ahead(&mut self, p: &Arc<Pending>) -> Option<bool> {
+        let prev = p.queue_state.load(Ordering::Relaxed);
+        if prev >= REQUESTED {
+            return None;
+        }
+        p.queue_state.store(REQUESTED, Ordering::Relaxed);
+        self.ahead.push_back(p.clone());
+        Some(prev == NOT_QUEUED)
+    }
+
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.screen.pop_front().or_else(|| self.requested.pop_front()).or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+        let p = self
+            .screen
+            .pop_front()
+            .or_else(|| self.ahead.pop_front())
+            .or_else(|| self.requested.pop_front())
+            .or_else(|| {
+                // An early entry can have been promoted and claimed already.
+                std::iter::from_fn(|| self.early.pop_front())
+                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -657,6 +707,28 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
+        assert!(queue.pop().is_none());
+    }
+
+    /// A pipeline queued ahead (the structure builder's) is made before
+    /// the requested ones, in the order queued, and once.
+    #[test]
+    fn pipelines_queued_ahead_come_before_requested_ones() {
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let first = Arc::new(Pending::new(Vec::new(), None));
+        let second = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+
+        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
+        assert_eq!(queue.push(&first, EARLY), Some(true));
+        assert_eq!(queue.push_ahead(&first), Some(false));
+        assert_eq!(queue.push_ahead(&second), Some(true));
+        assert_eq!(queue.push_ahead(&second), None);
+        assert_eq!(queue.push(&second, REQUESTED), None);
+
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &first));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &second));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
         assert!(queue.pop().is_none());
     }
 
