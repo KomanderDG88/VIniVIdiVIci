@@ -100,6 +100,16 @@ const KEPT_PIECES: u32 = 64;
 /// address is not that heap ([`HostHeap::release`]).
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Whether a range of dynamic slots is given back only to the heap that
+/// took it (fork pull request #1324): on by default, a fix;
+/// `VICTORY_HEAP_IDENTITY=0` gives it back to whatever heap is at that
+/// address, as before, for an A/B of the faces that turn black and back
+/// (two live lists sharing slots, one rewriting the other's descriptors).
+fn heap_identity() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_IDENTITY").is_none_or(|v| v != "0"))
+}
+
 /// Whether the recording threads are spared the heap's two busiest locks
 /// (`VICTORY_HEAP_LOCKS=1`; after fork pull request #1146, part 1; OFF
 /// unless set until a run of ours has carried it).
@@ -2579,7 +2589,7 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
-        if id != self.id {
+        if id != self.id && heap_identity() {
             return;
         }
         let Some(at) = first.checked_sub(self.count) else {
