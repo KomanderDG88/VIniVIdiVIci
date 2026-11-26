@@ -3687,6 +3687,87 @@ impl State {
         });
     }
 
+    /// For a dispatch of the title's card-memory defragmenter
+    /// (`crate::pipeline::skips_defrag`; diagnostics), once per program
+    /// (by its shader's hash, no names), once its host pipeline is made:
+    /// the unordered access views it writes through, as the title binds
+    /// them now (a table's view: the resource's size and the view's own
+    /// words, its counter resource if any; a root view: the address and the
+    /// buffer it falls in), and whether it can store to memory by address
+    /// besides. Which of them is the move plan decides whether clearing
+    /// them could stand in for the dispatch.
+    #[cfg(feature = "diagnostics")]
+    fn defrag_report(&self) {
+        use std::fmt::Write;
+        use std::sync::Mutex;
+        let class = crate::pipeline::defrag_class_of(self.pipeline as This);
+        if class == 0 {
+            return;
+        }
+        let Some(stage) = crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.stages.first()) else {
+            return;
+        };
+        static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        {
+            let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+            if said.contains(&stage.shader.hash) {
+                return;
+            }
+            said.push(stage.shader.hash.clone());
+        }
+        let t = stage.translated();
+        let mut text = String::new();
+        let mut n = 0;
+        for u in t.used.iter().filter(|u| u.kind == ResourceType::Uav) {
+            n += 1;
+            let _ = write!(text, " | u{} ", u.lower_bound);
+            match (u.root, self.compute.get(usize::from(u.slot))) {
+                (RootType::Table, Some(Root::Table(table))) => {
+                    let _ = write!(text, "table {} + {} dwords: ", u.slot, u.table_offset_dwords);
+                    match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                        Some(View::Unordered(r, counter, desc)) => {
+                            match crate::resource::host_made(r as This) {
+                                Some(res) => {
+                                    // SAFETY: a live resource.
+                                    let d = unsafe { res.GetDesc() };
+                                    let _ = write!(text, "resource {r:#x} dimension {} width {:#x}", d.Dimension.0, d.Width);
+                                }
+                                None => {
+                                    let _ = write!(text, "resource {r:#x} (no host copy made)");
+                                }
+                            }
+                            let _ = write!(text, " view {desc:x?} counter {counter:#x}");
+                        }
+                        Some(View::Placed(unordered, _, view)) => {
+                            let _ = write!(text, "memory view (unordered {unordered}) {view:x?}");
+                        }
+                        Some(_) => text.push_str("not an unordered access view"),
+                        None => text.push_str("no view"),
+                    }
+                }
+                (RootType::Descriptor, Some(Root::View(a))) => {
+                    let _ = write!(text, "root view {} at {a:#x}", u.slot);
+                    match crate::shadow::extent(*a) {
+                        Some((start, len)) => {
+                            let _ = write!(text, " in buffer {start:#x}+{len:#x}");
+                        }
+                        None => text.push_str(" in no buffer"),
+                    }
+                }
+                (root, _) => {
+                    let _ = write!(text, "{root:?} at slot {} (not bound as expected)", u.slot);
+                }
+            }
+        }
+        tracing::info!(
+            "a dispatch of the title's card-memory defragmenter ({}, shader {}): {n} unordered access views{text}; stores to buffers {}, by address {}",
+            crate::pipeline::DEFRAG_CLASSES[usize::from(class - 1)],
+            stage.shader.hash,
+            t.stores,
+            t.address_stores
+        );
+    }
+
     /// Whether the shaders of the pipeline bound now can store to buffers
     /// (or the pipeline is not known): a draw with them may write the
     /// arguments of draws after it, which ends a list's gathering
@@ -3765,6 +3846,13 @@ impl State {
         // Work only for rays nothing can use (skinning for structures nothing
         // builds, hit shading, probe ray picking, hair geometry for them).
         if crate::pipeline::skips_rt_work(self.pipeline as This, false) {
+            return;
+        }
+        // The title's card-memory defragmenter: counted, its planner left
+        // out with `VICTORY_SKIP_DEFRAG=1`.
+        #[cfg(feature = "diagnostics")]
+        self.defrag_report();
+        if crate::pipeline::skips_defrag(self.pipeline as This, false) {
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
@@ -4836,6 +4924,13 @@ impl State {
         // Work only for rays nothing can use (skinning for structures nothing
         // builds, hit shading, probe ray picking, hair geometry for them).
         if crate::pipeline::skips_rt_work(self.pipeline as This, true) {
+            return false;
+        }
+        // The title's card-memory defragmenter, as in `dispatch`: before the
+        // argument clamp, like the skips above.
+        #[cfg(feature = "diagnostics")]
+        self.defrag_report();
+        if crate::pipeline::skips_defrag(self.pipeline as This, true) {
             return false;
         }
         // A program that walks ray-tracing structures nothing has built:

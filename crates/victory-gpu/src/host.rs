@@ -8866,6 +8866,7 @@ impl Meter {
                     );
                 }
                 crate::pipeline::rt_work_line(frames);
+                crate::pipeline::defrag_line(frames);
             }
         }
         if self.caption.is_none() {

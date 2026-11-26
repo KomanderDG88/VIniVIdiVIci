@@ -158,6 +158,11 @@ pub(crate) struct Shader {
     /// ([`RtWork`], [`rt_work_of`]; compute only).
     #[cfg(windows)]
     rt_work: u8,
+    /// Which program of the title's card-memory defragmenter it is
+    /// ([`defrag_class`]; compute only, looked for only while
+    /// [`defrag_watched`]).
+    #[cfg(windows)]
+    defrag: u8,
     /// Cached [`of_builder`] flag so raw containers can be compressed safely.
     #[cfg(windows)]
     builder_spilled: OnceLock<bool>,
@@ -253,6 +258,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 } else {
                     0
                 },
+                #[cfg(windows)]
+                defrag: if stage == "compute" && defrag_watched() { defrag_class(bytes) } else { 0 },
                 #[cfg(windows)]
                 builder_spilled: OnceLock::new(),
                 #[cfg(windows)]
@@ -905,6 +912,154 @@ pub(crate) fn rt_work_line(frames: f64) {
     }
 }
 
+/// The title's card-memory defragmenter: compute programs whose container
+/// holds [`DEFRAG_FAMILY`] in their names; the one that plans the moves
+/// holds [`DEFRAG_PLANNER`]. Idea from the commit message of
+/// voidopcode/vilocity 29111fec6 (no licence: no code taken): there the
+/// planner took some 230 ms of the card's time a frame in some launches,
+/// which ran at 3 to 5 fps with black faces, a dark bald head and red
+/// jumpsuits; with its outputs cleared it planned no moves and those
+/// launches were fast with the picture intact. Here faces come out black
+/// or multicoloured, differently from session to session.
+///
+/// Diagnostics builds count its dispatches by class in the frame line
+/// ([`defrag_line`]) and say, once per program, which unordered access
+/// views its first dispatch writes through (`draw.rs` `defrag_report`);
+/// nothing changes for it there. Its card time is in the per-pipeline
+/// table of `VICTORY_CARD_METER_PIPELINES=1`, by name.
+///
+/// `VICTORY_SKIP_DEFRAG=1` (read once; anything else: off, the default)
+/// leaves out every dispatch, direct or indirect, of the planner; the rest
+/// of the family runs. What it would have written stays as it was: if the
+/// title does not reset its plan before the planner runs, a plan of an
+/// earlier frame may be carried out again (clearing its outputs, as there,
+/// needs to know which of them is the plan: see [`skips_defrag`]). No
+/// `alt`: what a turn changes in the title's heap outlasts it. The risks:
+/// the title's management of its card memory changes; without
+/// defragmenting, its card heap may fragment and run out of room in a long
+/// session; resources it moved before stay where they went.
+#[cfg(windows)]
+const DEFRAG_FAMILY: &[u8] = b"DefragHeap";
+/// The defragmenter's program that plans the moves ([`DEFRAG_FAMILY`]).
+#[cfg(windows)]
+const DEFRAG_PLANNER: &[u8] = b"DefragHeap_ComputeRelocations";
+
+/// The defragmenter's classes as the log says them (no program names), in
+/// the order of [`defrag_class`] from 1.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) const DEFRAG_CLASSES: [&str; 2] = ["relocation planning", "rest of the family"];
+
+/// Which program of the defragmenter the compute container `bytes` is: 1
+/// the planner ([`DEFRAG_PLANNER`]), 2 another of [`DEFRAG_FAMILY`], 0
+/// none.
+#[cfg(windows)]
+fn defrag_class(bytes: &[u8]) -> u8 {
+    if holds(bytes, DEFRAG_PLANNER) {
+        1
+    } else if holds(bytes, DEFRAG_FAMILY) {
+        2
+    } else {
+        0
+    }
+}
+
+/// Whether a value of `VICTORY_SKIP_DEFRAG` turns it on: `1` only.
+#[cfg(windows)]
+fn skip_defrag_value(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// `VICTORY_SKIP_DEFRAG=1` ([`DEFRAG_FAMILY`]), read once and said in the
+/// log then (with the first compute program the title makes).
+#[cfg(windows)]
+fn skip_defrag() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = skip_defrag_value(std::env::var("VICTORY_SKIP_DEFRAG").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_SKIP_DEFRAG=1: dispatches of the relocation planning of the title's card-memory defragmenter are left out, direct and indirect"
+            );
+            tracing::warn!(
+                "VICTORY_SKIP_DEFRAG=1 changes the title's management of its card memory (an experiment only): without defragmenting, its card heap may fragment and run out of room in a long session"
+            );
+        }
+        on
+    })
+}
+
+/// Whether compute containers are looked at for the defragmenter: in
+/// diagnostics builds, to count it, and with its switch.
+#[cfg(windows)]
+fn defrag_watched() -> bool {
+    cfg!(feature = "diagnostics") || skip_defrag()
+}
+
+/// Defragmenter pipelines known so far, by class ([`DEFRAG_CLASSES`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+static DEFRAG_PIPELINES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Defragmenter dispatches since the last frame line, by class: run
+/// direct, run indirect, left out.
+#[cfg(all(windows, feature = "diagnostics"))]
+static DEFRAG_DISPATCHES: [[std::sync::atomic::AtomicU64; 3]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 2];
+
+/// Which program of the defragmenter the title's pipeline `this` is
+/// ([`defrag_class`]): 0 none.
+#[cfg(windows)]
+pub(crate) fn defrag_class_of(this: This) -> u8 {
+    if this.is_null() { 0 } else { pipeline(this).defrag }
+}
+
+/// Whether a dispatch with the title's pipeline `this` is left out as the
+/// defragmenter's planner under `VICTORY_SKIP_DEFRAG=1`; counted by class
+/// either way (diagnostics).
+///
+/// Not cleared instead: zeroing the planner's outputs (so that the title
+/// reads "no moves planned") needs to know which of the views it writes
+/// through is the plan and how far each reaches. A root view is an address
+/// with no size; a table's view names its range, but whether the program
+/// writes only the plan there (and not, say, the heap's own allocation
+/// records, whose zeroing would lose every allocation) is in its code, not
+/// looked at here. `draw.rs` `defrag_report` says what it binds, for that
+/// choice.
+#[cfg(windows)]
+pub(crate) fn skips_defrag(this: This, indirect: bool) -> bool {
+    let class = defrag_class_of(this);
+    if class == 0 {
+        return false;
+    }
+    let left = class == 1 && skip_defrag();
+    #[cfg(feature = "diagnostics")]
+    DEFRAG_DISPATCHES[usize::from(class - 1)][if left { 2 } else { usize::from(indirect) }]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = indirect;
+    left
+}
+
+/// The frame line's part of [`skips_defrag`], per frame over `frames`,
+/// once a program of the defragmenter is known.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn defrag_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [planner, rest] =
+        DEFRAG_DISPATCHES.each_ref().map(|c| c.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames.max(1.0)));
+    let [planners, others] = DEFRAG_PIPELINES.each_ref().map(|n| n.load(Relaxed));
+    if planners + others == 0 {
+        return;
+    }
+    tracing::info!(
+        "the title's card-memory defragmenter, dispatches per frame: relocation planning run {:.1} direct, {:.1} indirect, left out {:.1} (VICTORY_SKIP_DEFRAG); rest of the family run {:.1} direct, {:.1} indirect; pipelines known: {planners} relocation planning, {others} rest",
+        planner[0],
+        planner[1],
+        planner[2],
+        rest[0],
+        rest[1]
+    );
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -1051,6 +1206,10 @@ struct Pipeline {
     /// [`RT_WORK`]`[i]`.
     #[cfg(windows)]
     rt_work: u8,
+    /// Which program of the title's card-memory defragmenter its compute
+    /// stage is ([`defrag_class`]): 0 none.
+    #[cfg(windows)]
+    defrag: u8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -1254,6 +1413,22 @@ fn hand_out(
                 }
             }
             work
+        },
+        #[cfg(windows)]
+        defrag: {
+            let class = shaders.iter().map(|s| s.defrag).max().unwrap_or(0);
+            #[cfg(feature = "diagnostics")]
+            if class != 0 {
+                let n = DEFRAG_PIPELINES[usize::from(class - 1)].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let hash = shaders.iter().find(|s| s.stage == "compute").map_or("", |s| s.hash.as_str());
+                tracing::info!(
+                    shader = hash,
+                    class = DEFRAG_CLASSES[usize::from(class - 1)],
+                    so_far = n,
+                    "a program of the title's card-memory defragmenter known"
+                );
+            }
+            class
         },
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
@@ -1541,6 +1716,25 @@ mod tests {
         assert_eq!(kinds(b"CS_RaytracingResolve\0CS_ScreenProbes_TemporalResolve\0"), 0);
         assert_eq!(kinds(b"CS_RaytracingResolve\0CS_UpdateHistory\0"), 0);
         assert_eq!(kinds(b""), 0);
+    }
+
+    /// The defragmenter's programs are known by the names in their
+    /// container, the planner apart; only `1` turns its switch on.
+    #[cfg(windows)]
+    #[test]
+    fn defrag_programs_are_known_by_name() {
+        assert_eq!(defrag_class(b"..\0CS_DefragHeap_ComputeRelocations_0_Wrapped\0.."), 1);
+        assert_eq!(defrag_class(b"DefragHeap_ComputeRelocations"), 1);
+        assert_eq!(defrag_class(b"..\0CS_DefragHeap_Move_Wrapped\0.."), 2);
+        assert_eq!(defrag_class(b"DefragHeap_ComputeRelocation"), 2);
+        assert_eq!(defrag_class(b"CS_Defrag\0Heap_ComputeRelocations"), 0);
+        assert_eq!(defrag_class(b"defragheap_computerelocations"), 0);
+        assert_eq!(defrag_class(b""), 0);
+        assert!(skip_defrag_value(Some("1")));
+        assert!(skip_defrag_value(Some(" 1 ")));
+        for off in [None, Some(""), Some("0"), Some("alt"), Some("skip"), Some("clear"), Some("true"), Some("11")] {
+            assert!(!skip_defrag_value(off), "{off:?}");
+        }
     }
 
     /// Which stores give title-memory copies as written: a vector store
