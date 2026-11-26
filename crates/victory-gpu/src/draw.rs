@@ -241,6 +241,18 @@ fn bake_sources_mode() -> (BakeMode, u64) {
     })
 }
 
+/// Whether the title slot at `handle` holds a texture the title placed in
+/// memory that is there (some of it mapped).
+fn placed_there(handle: u64) -> bool {
+    matches!(
+        crate::descriptor::view(handle),
+        Some(View::Placed(false, resource, desc)) if crate::texture::mapped_bytes(
+            (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
+            crate::resource::placed_bytes(&resource).unwrap_or(1) as usize,
+        ) > 0
+    )
+}
+
 /// What a bake draw samples ([`State::bake_sources`]).
 #[derive(Default, Debug)]
 struct BakeSources {
@@ -393,7 +405,7 @@ fn jump_windows() -> bool {
         1 => true,
         _ => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -424,7 +436,7 @@ fn gathers() -> bool {
         1 => true,
         _ => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -525,9 +537,12 @@ pub(crate) struct State {
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
     /// the host list that continues this one after a cut ([`State::replay`]):
-    /// whether a topology was set, the render target and depth handles, the
-    /// viewports, the scissors, the blend factor and the stencil reference.
+    /// whether a topology was set, snapshots of render target and depth
+    /// views, the viewports, scissors, blend factor and stencil reference.
     topology_set: bool,
+    target_views: Vec<Option<crate::descriptor::RtvSnapshot>>,
+    depth_view: Option<crate::descriptor::RtvSnapshot>,
+    /// The handles themselves, for `VICTORY_RT_SNAPSHOT=0` ([`rt_snapshot`]).
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
@@ -1069,6 +1084,24 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Frames between looks at an uploaded texture picked by index once
+/// [`RECHECK_FRAMES`] is through (`VICTORY_HEAP_RECHECK_EVERY=<frames>`; unset
+/// or 0: it is not looked at again, as before). The title streams a
+/// texture's memory in and rewrites it long after its view was written:
+/// runs 338-339 logged changes found at the schedule's last look, and what
+/// changes later stays as it was on the card for the rest of the run (skin
+/// that turns black or red). After RyanCase94's 920423a9.
+fn recheck_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let every = std::env::var("VICTORY_HEAP_RECHECK_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if every > 0 {
+            tracing::info!("uploaded textures picked by index are looked at again every {every} frames (VICTORY_HEAP_RECHECK_EVERY)");
+        }
+        every
+    })
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -1093,6 +1126,15 @@ static HEAP_TEXTURES_SHORT: AtomicU64 = AtomicU64::new(0);
 fn full_card_pass() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FULL_CARD_PASS").is_none_or(|v| v != "0"))
+}
+
+/// Whether the host list that continues a cut one makes its render target
+/// and depth views from the descriptor values the title's SetRenderTargets
+/// saw (`VICTORY_RT_SNAPSHOT=0`: no, from the handles' descriptors as they
+/// are at the cut, which may since have been rewritten to name another view).
+fn rt_snapshot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_SNAPSHOT").is_none_or(|v| v != "0"))
 }
 
 /// Whether a texture that has its host copy is still brought up to date
@@ -1234,6 +1276,11 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the last pass over textures picked by index left slots due
+/// behind it: [`crate::heap_worker`] then runs another at once, and the
+/// textures read ahead go on several threads (`Host::refresh_textures_ahead`).
+pub(crate) static BACKLOG_LEFT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -1306,7 +1353,7 @@ fn table_stages() -> bool {
         mode => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
             let period = if mode == 3 { 40 } else { 20 };
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / period) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / period) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -1445,25 +1492,42 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
         self.target_handles.clear();
         self.target_handles.extend_from_slice(handles);
         self.depth_handle = depth;
+        self.snapshot_targets(handles, depth);
         self.targets_set = true;
-        self.targets.clear();
-        // The formats of the host views, for the draws' pipelines.
-        let mut formats = [0; 9];
-        let mut rtvs = Vec::new();
-        for &h in handles {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
+        self.record_targets(list);
+    }
+
+    /// The descriptor values behind `handles` and `depth`, as they are now.
+    fn snapshot_targets(&mut self, handles: &[u64], depth: u64) {
+        self.target_views.clear();
+        self.target_views.extend(handles.iter().map(|&h| {
+            let record = crate::descriptor::rtv_record(h);
+            if record.is_none() {
                 once!(
                     handle = format_args!("{h:#x}"),
                     "render target without a recorded view"
                 );
-                continue;
-            };
+            }
+            record.map(|r| r.snapshot())
+        }));
+        self.depth_view = crate::descriptor::dsv_record(depth).map(|r| r.snapshot());
+    }
+
+    /// Recreate host views from the values captured at SetRenderTargets,
+    /// not from descriptor slots that the caller may since have rewritten.
+    fn record_targets(&mut self, list: &HostList) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        self.targets.clear();
+        // Preserve the formats of the recreated views for pipeline variants.
+        let mut formats = [0; 9];
+        let mut rtvs = Vec::new();
+        for snapshot in self.target_views.iter().flatten() {
+            let record = snapshot.restore();
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 // A typed null view (or a target without a host copy) still
                 // takes its slot: left out, the next live target would move
@@ -1493,7 +1557,8 @@ impl State {
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let dsv = self.depth_view.and_then(|snapshot| {
+            let record = snapshot.restore();
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             let desc = record.depth_desc();
@@ -1569,9 +1634,7 @@ impl State {
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
     /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
+    /// Render target views retain the descriptor values originally recorded.
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -1580,8 +1643,14 @@ impl State {
             self.set_topology(list, self.topology);
         }
         if self.targets_set {
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+            if !rt_snapshot() {
+                // As before: the views are made again from the handles'
+                // descriptors as they are now.
+                let handles = std::mem::take(&mut self.target_handles);
+                self.snapshot_targets(&handles, self.depth_handle);
+                self.target_handles = handles;
+            }
+            self.record_targets(list);
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
@@ -2664,6 +2733,81 @@ impl State {
         if bake_sources_mode().0 != BakeMode::Off {
             self.bake_sources_pass(list, p);
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::null_samples::on() {
+            self.null_samples(p);
+        }
+    }
+
+    /// `VICTORY_NULL_SAMPLES=count` ([`crate::null_samples`]): after the
+    /// runs above, the slots this draw's pixel shader picks by index, by
+    /// what their host slot shows: a skin bake's [`State::bake_sources`],
+    /// and views selected from root constants as [`State::tables`] finds
+    /// them, but in tables it makes afresh (from the title's records).
+    /// Indices a shader reads from other memory are not known here.
+    #[cfg(feature = "diagnostics")]
+    fn null_samples(&self, p: &HostPipeline) {
+        use crate::descriptor::host::SlotShows;
+        let Some(stage) = p.stages.iter().find(|s| s.shader.stage == "pixel") else {
+            return;
+        };
+        let t = stage.translated();
+        let tables = bake_tables(p);
+        if tables.is_none() && t.host.root_indexed_views.is_empty() {
+            return;
+        }
+        let mut slots: Vec<(&'static crate::descriptor::Heap, u32, u64)> = Vec::new();
+        if let Some(tables) = tables
+            && let Some(heap) = self
+                .heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .map(|&h| crate::descriptor::heap(h as This))
+                .find(|h| !h.samplers())
+            && let Some(host) = heap.host()
+            && let Some(sources) = self.bake_sources(tables, heap, host)
+        {
+            slots.extend(sources.textures.iter().map(|&(index, handle)| (heap, index, handle)));
+        }
+        for index in &t.host.root_indexed_views {
+            let slot = index.table_slot;
+            let fresh = t.used.iter().any(|u| u.root == RootType::Table && u.slot == slot && u.kind == ResourceType::Cbv)
+                || t.host.half_views.iter().any(|h| h.0 == slot);
+            let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(slot)).filter(|_| !fresh) else {
+                continue;
+            };
+            let constant = self.user_value(false, index.constant_slot, RootType::Constants, index.constant_dword);
+            let handle = table + u64::from(index.byte_offset.wrapping_add(constant << index.shift) / 32) * 32;
+            if let Some(heap) = self.heap_of(table)
+                && let Some(at) = heap.index(handle)
+            {
+                slots.push((heap, at, handle));
+            }
+        }
+        let mut c = crate::null_samples::Counts::default();
+        for (heap, index, handle) in slots {
+            let (Some(view), Some(host)) = (crate::descriptor::view(handle), heap.host()) else {
+                continue;
+            };
+            let texture = crate::descriptor::host::is_texture_view(&view);
+            *if texture { &mut c.textures } else { &mut c.buffers } += 1;
+            let Some((shows, queued)) = host.texture_slot_shows(index, handle) else {
+                c.clamped += 1;
+                continue;
+            };
+            if !texture {
+                continue;
+            }
+            match shows {
+                SlotShows::Null => c.null += 1,
+                SlotShows::MadeButNull => c.made_but_null += 1,
+                SlotShows::Other => c.other_copy += 1,
+                SlotShows::This => {}
+            }
+            let shown = matches!(shows, SlotShows::This | SlotShows::Other);
+            c.stale += u32::from(if shown { queued } else { !queued && placed_there(handle) });
+        }
+        crate::null_samples::record(&stage.shader.hash, c);
     }
 
     /// [`State::early_textures`]' runs within budgets of their own.
@@ -2833,12 +2977,7 @@ impl State {
             }
             if host.texture_slot_made_from(index, handle) {
                 sources.ready += 1;
-            } else if let Some(View::Placed(false, resource, desc)) = crate::descriptor::view(handle)
-                && crate::texture::mapped_bytes(
-                    (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
-                    crate::resource::placed_bytes(&resource).unwrap_or(1) as usize,
-                ) > 0
-            {
+            } else if placed_there(handle) {
                 sources.unmade.push(index);
             } else {
                 sources.other += 1;
@@ -2851,16 +2990,8 @@ impl State {
     /// by the title in memory that is there, with a host slot that shows
     /// nothing of them. Counted when the runs before the draw are done.
     fn bake_missing(sources: &BakeSources, host: &crate::descriptor::host::HostHeap) -> u64 {
-        let missing = |&&(index, handle): &&(u32, u64)| {
-            !host.texture_slot_made_from(index, handle)
-                && matches!(
-                    crate::descriptor::view(handle),
-                    Some(View::Placed(false, resource, desc)) if crate::texture::mapped_bytes(
-                        (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
-                        crate::resource::placed_bytes(&resource).unwrap_or(1) as usize,
-                    ) > 0
-                )
-        };
+        let missing =
+            |&&(index, handle): &&(u32, u64)| !host.texture_slot_made_from(index, handle) && placed_there(handle);
         sources.textures.iter().filter(missing).count() as u64
     }
 
@@ -3178,6 +3309,13 @@ impl State {
         // looked at again sooner. Unset: as before.
         let fair = crate::descriptor::host::fair_due() >= 2;
         let began = std::time::Instant::now();
+        // Slots left due behind this pass ([`BACKLOG_LEFT`]): handed as many
+        // as a pass takes, or stopped below on bytes, time or making way.
+        // (A run for a bake draw's own is not the queue's pass: it leaves
+        // the mark as the last pass set it.)
+        if !only {
+            BACKLOG_LEFT.store(due.len() >= 4096, Ordering::Relaxed);
+        }
         for (index, write) in due {
             // A run for a bake draw's own ends at its own bytes, not at the
             // frame's budget or time.
@@ -3187,10 +3325,14 @@ impl State {
                     break;
                 }
             } else if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+                BACKLOG_LEFT.store(true, Ordering::Relaxed);
                 break;
             }
             let ahead = matches!(into, Into::Ahead(_));
             if ahead && crate::heap_worker::make_way() {
+                if !only {
+                    BACKLOG_LEFT.store(true, Ordering::Relaxed);
+                }
                 break;
             }
             // The record the slot has now, and the texture it names held
@@ -3237,7 +3379,13 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        // The schedule is over: looked at again every so many
+                        // frames for as long as the slot shows it
+                        // (`recheck_every`), or never again.
+                        None => match recheck_every() {
+                            0 => host.texture_slot_done(index, write, None),
+                            every => host.texture_slot_recheck(index, write, frame + every, (at, len), print, looks, uploaded),
+                        },
                     }
                     continue;
                 }
@@ -3558,6 +3706,9 @@ impl State {
         if !stores {
             return;
         }
+        // The open segment of gathered records ends whatever the prelude's gathering does
+        // (`crate::indirect::gather_segments`).
+        list.segments_end();
         // Whole, as before: without the switch, for a pipeline the layer
         // does not know, and for shaders that can store through a view
         // that is NOT declared where they are prepared: a buffer picked
@@ -3611,8 +3762,9 @@ impl State {
             crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=1)".to_owned());
             return;
         }
-        // A skinning pass only for structures nothing builds.
-        if crate::pipeline::skips_rt_skin(self.pipeline as This, false) {
+        // Work only for rays nothing can use (skinning for structures nothing
+        // builds, hit shading, probe ray picking, hair geometry for them).
+        if crate::pipeline::skips_rt_work(self.pipeline as This, false) {
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
@@ -4681,8 +4833,9 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
-        // A skinning pass only for structures nothing builds.
-        if crate::pipeline::skips_rt_skin(self.pipeline as This, true) {
+        // Work only for rays nothing can use (skinning for structures nothing
+        // builds, hit shading, probe ray picking, hair geometry for them).
+        if crate::pipeline::skips_rt_work(self.pipeline as This, true) {
             return false;
         }
         // A program that walks ray-tracing structures nothing has built:
@@ -4825,7 +4978,15 @@ impl State {
         if !windowed || first_on_list {
             self.window = None;
         }
-        if !windowed {
+        // An indirect dispatch's own record may take a gathered slot as a draw's does
+        // (`crate::indirect::gather_dispatches`); the dispatch ends the gathering right after that, below.
+        let joins = kind == DISPATCH
+            && max == 1
+            && count.is_none()
+            && !is_spread
+            && gathers()
+            && crate::indirect::gather_dispatches();
+        if !windowed && !joins {
             // A dispatch, or shaders that store to buffers: arguments may
             // be written from here on.
             self.gather_ends(list, true);
@@ -4861,7 +5022,7 @@ impl State {
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
-        let gathered = if hit.is_none() && windowed && gathers() {
+        let gathered = if hit.is_none() && (windowed || joins) && gathers() {
             let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
             #[cfg(feature = "diagnostics")]
             WINDOW_WHY[if slot.is_some() { 12 } else { 13 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4869,6 +5030,10 @@ impl State {
         } else {
             None
         };
+        if joins {
+            // The dispatch's record is taken (or clamped alone below): what the dispatch writes, from here on.
+            self.gather_ends(list, true);
+        }
         let (bounded, at) = match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
@@ -4895,7 +5060,12 @@ impl State {
                 }
                 (scratch, at)
             }
-            (None, Some((scratch, at))) => {
+            (None, Some((scratch, at, recorded))) => {
+                // A segment's pass recorded here bound our pipeline (`crate::indirect::gather_segments`).
+                if recorded {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
                 // The record's bytes are up to date when the list is
                 // submitted, as for a record clamped in the list.
                 args.refresh(list, arguments, len);
@@ -5179,7 +5349,7 @@ fn spread_on() -> bool {
         1 => true,
         _ => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(

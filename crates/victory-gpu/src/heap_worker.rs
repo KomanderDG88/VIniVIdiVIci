@@ -284,5 +284,20 @@ fn worker() {
         while make_way() {
             std::thread::yield_now();
         }
+        // Slots left due: another pass at once over the same heap, unless
+        // a newer one was handed meanwhile. Waiting for the next frame's
+        // kick left this thread idle about half of each frame of the
+        // opening cutscene (112 of 220 ms on a 16 GB machine) while
+        // 20,000 slots were due. `VICTORY_HEAP_WORKER_CHAIN=0`: one pass a
+        // kick, as before.
+        static CHAIN: OnceLock<bool> = OnceLock::new();
+        if *CHAIN.get_or_init(|| std::env::var_os("VICTORY_HEAP_WORKER_CHAIN").is_none_or(|v| v != "0"))
+            && crate::draw::BACKLOG_LEFT.load(Relaxed)
+        {
+            let mut next = lock(&job.heap);
+            if next.is_none() {
+                *next = Some(heap);
+            }
+        }
     }
 }

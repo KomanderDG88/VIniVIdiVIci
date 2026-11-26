@@ -165,7 +165,7 @@ fn heap_locks() -> bool {
         1 => true,
         _ => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -1361,6 +1361,20 @@ pub(crate) static REASKED: [std::sync::atomic::AtomicU64; 2] = [const { std::syn
 pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// [`HostHeap::texture_slot_shows`].
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SlotShows {
+    /// Made from nothing, or from another record and keeping nothing.
+    Null,
+    /// Made from this record, keeping nothing (the host could not make it).
+    MadeButNull,
+    /// A copy made from this record.
+    This,
+    /// A copy made from another record than the title's now.
+    Other,
+}
+
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
@@ -2048,6 +2062,35 @@ impl HostHeap {
             self.note_slot(slot, SLOT_IN_TEXTURES, true);
         }
         [held, slots.len(), slots.len()]
+    }
+
+    /// What host slot `index` shows against the title's record at `handle`
+    /// now (the census's classes, [`HostHeap::placed_slot_census`]), and
+    /// whether it is queued (`crate::null_samples`); `None`: past this
+    /// heap's slots. Takes `made`, a piece of `kept`, the queue, in turn.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn texture_slot_shows(&self, index: u32, handle: u64) -> Option<(SlotShows, bool)> {
+        if index >= self.count {
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let record = (tag == VIEW_TAG).then_some(u64::from(generation) << 32 | u64::from(i));
+        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
+        let kept = self.kept[(index % KEPT_PIECES) as usize]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get((index / KEPT_PIECES) as usize)
+            .is_some_and(Option::is_some);
+        let queued = self.textures.lock().unwrap_or_else(|e| e.into_inner()).slots.contains_key(&index);
+        let this = key != 0 && Some(key) == record;
+        let shows = match (kept && key != 0, this) {
+            (false, false) => SlotShows::Null,
+            (false, true) => SlotShows::MadeButNull,
+            (true, true) => SlotShows::This,
+            (true, false) => SlotShows::Other,
+        };
+        Some((shows, queued))
     }
 
     /// Whether host slot `index` is made from the very record the title

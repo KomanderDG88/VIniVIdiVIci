@@ -56,11 +56,87 @@ pub(crate) struct ComputeHead {
 
 /// A shader container a title passed, shared by every pipeline with the
 /// same bytes.
+/// Guest shader container bytes: raw while hot, zlib-compressed once cold and
+/// cached metadata (`walks`, `of_builder_spilled`, `translated`) is captured.
+#[cfg(windows)]
+enum ContainerBlob {
+    Raw(Arc<[u8]>),
+    Compressed { packed: Vec<u8>, orig_len: usize },
+}
+
+#[cfg(not(windows))]
+enum ContainerBlob {
+    Raw(Arc<[u8]>),
+}
+
+impl ContainerBlob {
+    fn bytes_arc(&self) -> Arc<[u8]> {
+        match self {
+            Self::Raw(bytes) => Arc::clone(bytes),
+            #[cfg(windows)]
+            Self::Compressed { packed, orig_len } => {
+                Arc::from(decompress_container(packed, *orig_len))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<u8> {
+        self.bytes_arc().to_vec()
+    }
+
+    #[cfg(windows)]
+    fn compress(&mut self) -> u64 {
+        let Self::Raw(raw) = self else {
+            return 0;
+        };
+        let orig_len = raw.len();
+        if orig_len < 1024 {
+            return 0;
+        }
+        let mut buf = vec![0u8; zlib_rs::compress_bound(orig_len)];
+        let (packed, rc) =
+            zlib_rs::compress_slice(&mut buf, raw, zlib_rs::DeflateConfig::new(1));
+        if rc != zlib_rs::ReturnCode::Ok {
+            return 0;
+        }
+        let packed_len = packed.len();
+        if packed_len + 256 >= orig_len {
+            return 0;
+        }
+        let saved = (orig_len - packed_len) as u64;
+        let compressed = packed.to_vec();
+        crate::ram_trim::COUNTERS
+            .shader_container_retained_bytes
+            .fetch_sub(saved, std::sync::atomic::Ordering::Relaxed);
+        *self = Self::Compressed {
+            packed: compressed,
+            orig_len,
+        };
+        saved
+    }
+}
+
+#[cfg(windows)]
+fn decompress_container(packed: &[u8], orig_len: usize) -> Vec<u8> {
+    if orig_len == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; orig_len];
+    let mut state = zlib_rs::Inflate::new(true, 15);
+    match state.decompress(packed, &mut out, zlib_rs::InflateFlush::Finish) {
+        Ok(zlib_rs::Status::StreamEnd) if state.total_out() as usize == orig_len => out,
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    container_len: usize,
+    container: std::sync::Mutex<ContainerBlob>,
     /// Its result is replaced by the stand-in for indirect light
     /// ([`crate::ambient`]).
     #[cfg(windows)]
@@ -78,6 +154,19 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// The kinds of work only for rays it is, of those whose switch is on
+    /// ([`RtWork`], [`rt_work_of`]; compute only).
+    #[cfg(windows)]
+    rt_work: u8,
+    /// Cached [`of_builder`] flag so raw containers can be compressed safely.
+    #[cfg(windows)]
+    builder_spilled: OnceLock<bool>,
+    /// Number of active PSO builds currently borrowing this shader's DXIL.
+    #[cfg(windows)]
+    building_dxil: std::sync::atomic::AtomicU32,
+    /// Timestamp (`host::now_ms`) when `dxil` was last needed.
+    #[cfg(windows)]
+    last_dxil_ms: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Shader {
@@ -124,10 +213,17 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             let ambient = crate::ambient::level().is_some();
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::ram_trim::COUNTERS
+                .shader_container_orig_bytes
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::ram_trim::COUNTERS
+                .shader_container_retained_bytes
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
+                container_len: bytes.len(),
+                container: std::sync::Mutex::new(ContainerBlob::Raw(Arc::from(bytes))),
                 // The programs the ambient light acts after, by name: looked
                 // for only while it is on (`VICTORY_AMBIENT`, read once), so
                 // that off it costs no walk of each new shader's container.
@@ -147,6 +243,22 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                // Looked for only while one of the switches is on (read
+                // once); the census only in diagnostics builds.
+                #[cfg(windows)]
+                rt_work: if stage == "compute" {
+                    #[cfg(feature = "diagnostics")]
+                    rt_census(bytes);
+                    rt_work_of(bytes)
+                } else {
+                    0
+                },
+                #[cfg(windows)]
+                builder_spilled: OnceLock::new(),
+                #[cfg(windows)]
+                building_dxil: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(windows)]
+                last_dxil_ms: std::sync::atomic::AtomicU64::new(0),
             })
         })
         .clone()
@@ -163,30 +275,147 @@ pub(crate) struct Translated {
     /// Whether it can store to title memory by address ([`stores_by_address`]):
     /// only then are the host's copies of that memory compared after it.
     pub(crate) address_stores: bool,
+    /// Post-PSO reclaimable DXIL bytecode (`HostShader::dxil` moved here so
+    /// cold shaders can drop DXIL RAM and reload on demand).
+    #[cfg(windows)]
+    dxil: std::sync::Mutex<Option<std::sync::Arc<[u8]>>>,
+}
+
+#[cfg(windows)]
+pub(crate) struct DxilPin<'a>(&'a Shader);
+
+#[cfg(windows)]
+impl Drop for DxilPin<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::AcqRel;
+        // The last build done with it: cold blobs let go at once if the
+        // policy says so, and only with `VICTORY_RAM_TRIM=1`.
+        if self.0.building_dxil.fetch_sub(1, AcqRel) == 1 && crate::ram_trim::aggressive() {
+            let policy = crate::ram_trim::TrimPolicy::cached();
+            if policy.shader_dxil_idle_ms == 0 {
+                self.0.release_dxil();
+            }
+            if policy.shader_container_idle_ms == 0 {
+                self.0.compress_container_if_ready();
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
 impl Shader {
+    /// Pins DXIL bytecode in RAM while a PSO creation call is using it.
+    pub(crate) fn pin_dxil(&self) -> DxilPin<'_> {
+        use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+        self.building_dxil.fetch_add(1, AcqRel);
+        self.last_dxil_ms.store(crate::host::now_ms(), Relaxed);
+        DxilPin(self)
+    }
+
+    fn with_container<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        let bytes = self
+            .container
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bytes_arc();
+        f(&bytes)
+    }
+
+    /// Returns translated DXIL bytecode, reloading/re-translating transparently
+    /// from the guest container / disk cache if previously dropped.
+    pub(crate) fn dxil(&self) -> Option<std::sync::Arc<[u8]>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t = self.translated()?;
+        self.last_dxil_ms.store(crate::host::now_ms(), Relaxed);
+        {
+            let guard = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(bytes) = guard.as_ref() {
+                return Some(bytes.clone());
+            }
+        }
+        let reloaded = self.with_container(|bytes| crate::shader_cache::host_shader(bytes).ok())?;
+        let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(reloaded.dxil);
+        let bytes_len = arc.len() as u64;
+        let mut guard = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.as_ref() {
+            return Some(existing.clone());
+        }
+        *guard = Some(arc.clone());
+        KEPT[3].fetch_add(bytes_len, Relaxed);
+        crate::ram_trim::COUNTERS
+            .shader_dxil_reloaded_bytes
+            .fetch_add(bytes_len, Relaxed);
+        Some(arc)
+    }
+
+    /// Drops retained post-PSO DXIL bytecode if no build currently pins it.
+    pub(crate) fn release_dxil(&self) -> u64 {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        if self.building_dxil.load(Acquire) > 0 {
+            return 0;
+        }
+        let Some(Some(t)) = self.translated.get() else {
+            return 0;
+        };
+        let mut guard = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+        if self.building_dxil.load(Acquire) > 0 {
+            return 0;
+        }
+        let Some(dropped) = guard.take() else {
+            return 0;
+        };
+        let len = dropped.len() as u64;
+        drop(dropped);
+        KEPT[3].fetch_sub(len, Relaxed);
+        crate::ram_trim::COUNTERS
+            .shader_dxil_dropped_bytes
+            .fetch_add(len, Relaxed);
+        len
+    }
+
+    fn compress_container_if_ready(&self) -> u64 {
+        use std::sync::atomic::Ordering::Acquire;
+        if self.translated.get().is_none() || self.building_dxil.load(Acquire) > 0 {
+            return 0;
+        }
+        let Ok(mut guard) = self.container.try_lock() else {
+            return 0;
+        };
+        guard.compress()
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
+        use std::sync::atomic::Ordering::Relaxed;
+        let out = self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
-                // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
-                // translated (`.dxil`), by the hash crash reports name it with
-                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
-                    let dir = std::path::PathBuf::from(dir);
-                    let _ = std::fs::create_dir_all(&dir);
-                    let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
-                    if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                let done = self.with_container(|bytes| {
+                    let done = translate(bytes);
+                    // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
+                    // translated (`.dxil`), by the hash crash reports name it with
+                    if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+                        let dir = std::path::PathBuf::from(dir);
+                        let _ = std::fs::create_dir_all(&dir);
+                        let stem = format!("{}.{}", self.hash, self.stage);
+                        let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), bytes);
+                        if let Ok(t) = &done
+                            && let Some(dxil) = t.dxil.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                        {
+                            let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &**dxil);
+                        }
                     }
-                }
+                    done
+                });
                 if let Ok(t) = &done {
-                    KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let dxil_len = t
+                        .dxil
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .map_or(0, |d| d.len() as u64);
+                    KEPT[2].fetch_add(1, Relaxed);
+                    KEPT[3].fetch_add(dxil_len, Relaxed);
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -205,7 +434,11 @@ impl Shader {
                 }
                 done.ok()
             })
-            .as_ref()
+            .as_ref();
+        if out.is_some() {
+            self.last_dxil_ms.store(crate::host::now_ms(), Relaxed);
+        }
+        out
     }
 }
 
@@ -232,11 +465,14 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
+    let mut host = host;
+    let dxil = std::sync::Mutex::new(Some(std::sync::Arc::from(std::mem::take(&mut host.dxil))));
     Ok(Translated {
         host,
         used,
         stores,
         address_stores,
+        dxil,
     })
 }
 
@@ -279,17 +515,29 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use victory_shader::{Container, FourCC};
     let [shader] = shaders else { return false };
     if shader.stage != "compute" {
         return false;
     }
-    let Ok(c) = Container::parse(&shader.container) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    #[cfg(windows)]
+    {
+        *shader.builder_spilled.get_or_init(|| {
+            shader.with_container(|bytes| {
+                use victory_shader::{Container, FourCC};
+                let Ok(c) = Container::parse(bytes) else {
+                    return false;
+                };
+                c.part(FourCC::DXIL)
+                    .and_then(|part| victory_shader::native_programs(part.data).ok())
+                    .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+            })
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = shader;
+        false
+    }
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -312,7 +560,9 @@ impl Shader {
     /// an `image_bvh_intersect_ray` or `image_bvh64_intersect_ray`. Looked
     /// at once, when a dispatch first asks.
     fn walks(&self) -> bool {
-        *self.walks.get_or_init(|| container_walks(&self.container))
+        *self
+            .walks
+            .get_or_init(|| self.with_container(container_walks))
     }
 }
 
@@ -331,11 +581,13 @@ pub(crate) fn compute_threads(this: This) -> Option<[u32; 3]> {
     if shader.stage != "compute" {
         return None;
     }
-    let c = Container::parse(&shader.container).ok()?;
-    let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
-    programs.iter().find_map(|n| match &n.io {
-        StageIo::Cs(cs) => Some(cs.threads),
-        _ => None,
+    shader.with_container(|bytes| {
+        let c = Container::parse(bytes).ok()?;
+        let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+        programs.iter().find_map(|n| match &n.io {
+            StageIo::Cs(cs) => Some(cs.threads),
+            _ => None,
+        })
     })
 }
 
@@ -427,101 +679,230 @@ pub(crate) fn walk_held(this: This) -> bool {
     true
 }
 
-/// Whether a compute container is one of the title's `bvh_skinning`
-/// programs, by the name it carries: they pose every animated mesh (and
-/// its motion) once more, only for the ray-tracing structures, which the
-/// structure builder makes from what they write.
+/// Whether the container `bytes` holds `name` anywhere.
 #[cfg(windows)]
-fn skins_for_rays(bytes: &[u8]) -> bool {
-    const NAME: &[u8] = b"bvh_skinningCS";
-    bytes.windows(NAME.len()).any(|w| w == NAME)
+fn holds(bytes: &[u8], name: &[u8]) -> bool {
+    bytes.windows(name.len()).any(|w| w == name)
 }
 
-/// `VICTORY_RT_SKIN_SKIP=1` (off by default): dispatches of the title's
-/// `bvh_skinning` programs ([`skins_for_rays`]) are left out, direct and
-/// indirect. Only while the structure builder is off (without
-/// `VICTORY_BVH_BUILDER=1`): then nothing reads what they write. Meant
-/// with `VICTORY_BVH_NO_HIT=1` or `VICTORY_BVH_HOLD=1`, under which no
-/// ray reads the structures either. Read once, when pipelines are made:
-/// off, no container is looked at. `alt`: the pipelines are marked as
-/// with `1`, and a dispatch is left out only in an ON turn
-/// ([`crate::AltTurn`]: twenty seconds without, twenty with, in turn,
-/// each change said in the log).
+/// A kind of work the title does only for rays, which a switch can leave
+/// out while the structure builder is off (without `VICTORY_BVH_BUILDER=1`),
+/// each read once (`1` on, `alt` in turn, anything else off: the default).
+/// A compute container is of the kind if it holds `name`. Off, no container
+/// is looked at for it. `alt`: the pipelines are marked as with `1`, and a
+/// dispatch is left out only in an ON turn of the kind's own
+/// [`crate::AltTurn`] (twenty seconds without, twenty with, in turn, each
+/// change said in the log). What the passes would have written stays as
+/// the title left it: the picture has to be looked at.
 ///
-/// 0 off (or the builder may run), 1 on, 2 in turn.
+/// - `VICTORY_RT_SKIN_SKIP`: the `bvh_skinning` programs, which pose every
+///   animated mesh (and its motion) once more, only for the ray-tracing
+///   structures the builder makes from what they write. Meant with
+///   `VICTORY_BVH_NO_HIT=1` or `VICTORY_BVH_HOLD=1`, under which no ray
+///   reads the structures either. From edsuuu/VI-BR-PORT ab4571df
+///   (GPL-3.0): the largest share of the card's time in a cutscene there
+///   (~6 ms a dispatch, hundreds a frame). Matched by `bvh_skinning` with
+///   no stage after it, so the hair's (`CSGenerateHairVB`) is one of them
+///   too; the picture's own skinning, which may share `ComputeSkinning` in
+///   its names, is not matched by that alone.
+/// - `VICTORY_RT_RESOLVE_SKIP`: `CS_RaytracingResolve*`, which shade what a
+///   ray hit (some 1,000 programs).
+/// - `VICTORY_ACTIVATE_RAYS_SKIP`: `CS_ScreenProbes_ActivateRays*`, which
+///   pick the screen probes that cast rays.
+/// - `VICTORY_HAIR_VB_SKIP`: `CSGenerateHairVB`, the hair's geometry made
+///   for the structures (8 % of the card's time in the opening cutscene
+///   there).
 ///
-/// From edsuuu/VI-BR-PORT ab4571df (GPL-3.0), where it rides on their
-/// `VICTORY_RT_MISS=1`: the largest share of the card's time in a cutscene
-/// there (~6 ms a dispatch, hundreds a frame).
+/// The last three adapted from edsuuu/VI-BR-PORT f1e5e454 / 24f8d2ed
+/// (GPL-3.0; from codec-d/cool_fox `make.rs`). Their rules for the tracing
+/// itself (`CS_RaytraceVBuffer*`, `CS_ScreenProbes_TraceRays*_BVH*`) are
+/// not taken: `VICTORY_BVH_HOLD` holds back exactly the programs whose code
+/// walks the structures.
+///
+/// None of the kinds ever takes a program [`crate::ambient`] follows
+/// ([`ambient_follows`]), whatever its name holds besides.
 #[cfg(windows)]
-fn rt_skin_skip_mode() -> u8 {
-    static MODE: OnceLock<u8> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        if builder_allowed() {
-            return 0;
+struct RtWork {
+    switch: &'static str,
+    /// What a dispatch left out is, as the log says it (no program names).
+    what: &'static str,
+    name: &'static [u8],
+    turn: crate::AltTurn,
+    /// Pipelines of the kind known so far.
+    #[cfg(feature = "diagnostics")]
+    pipelines: std::sync::atomic::AtomicU64,
+    /// Dispatches since the last frame line: left out direct, left out
+    /// indirect, run direct, run indirect (run: in the off turns of `alt`).
+    #[cfg(feature = "diagnostics")]
+    dispatches: [std::sync::atomic::AtomicU64; 4],
+}
+
+#[cfg(windows)]
+impl RtWork {
+    const fn new(switch: &'static str, what: &'static str, name: &'static [u8]) -> Self {
+        Self {
+            switch,
+            what,
+            name,
+            turn: crate::AltTurn::new(),
+            #[cfg(feature = "diagnostics")]
+            pipelines: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "diagnostics")]
+            dispatches: [const { std::sync::atomic::AtomicU64::new(0) }; 4],
         }
-        match std::env::var("VICTORY_RT_SKIN_SKIP").as_deref() {
+    }
+}
+
+/// The kinds ([`RtWork`]); bit `i` of [`Shader::rt_work`] and
+/// [`Pipeline::rt_work`] is `RT_WORK[i]`.
+#[cfg(windows)]
+static RT_WORK: [RtWork; 4] = [
+    RtWork::new(
+        "VICTORY_RT_SKIN_SKIP",
+        "dispatches of skinning only for the ray-tracing structures are left out",
+        b"bvh_skinning",
+    ),
+    RtWork::new(
+        "VICTORY_RT_RESOLVE_SKIP",
+        "dispatches of programs that shade what rays hit are left out",
+        b"CS_RaytracingResolve",
+    ),
+    RtWork::new(
+        "VICTORY_ACTIVATE_RAYS_SKIP",
+        "dispatches of programs that pick the screen probes casting rays are left out",
+        b"CS_ScreenProbes_ActivateRays",
+    ),
+    RtWork::new(
+        "VICTORY_HAIR_VB_SKIP",
+        "dispatches of programs that make hair geometry for the ray-tracing structures are left out",
+        b"CSGenerateHairVB",
+    ),
+];
+
+/// Each kind's switch ([`RtWork`]): 0 off (or the builder may run), 1 on,
+/// 2 in turn.
+#[cfg(windows)]
+fn rt_skip_modes() -> [u8; 4] {
+    static MODES: OnceLock<[u8; 4]> = OnceLock::new();
+    *MODES.get_or_init(|| {
+        if builder_allowed() {
+            return [0; 4];
+        }
+        RT_WORK.each_ref().map(|k| match std::env::var(k.switch).as_deref() {
             Ok("1") => 1,
             Ok("alt") => 2,
             _ => 0,
-        }
+        })
     })
 }
 
-/// At pipeline creation: whether `bvh_skinning` programs are looked for
-/// and marked ([`rt_skin_skip_mode`]: `1` or `alt`).
+/// Whether [`crate::ambient`] follows the program in `bytes`: the stand-in
+/// for indirect light hangs on `CS_ScreenProbes_TemporalResolve*`
+/// ([`crate::ambient::resolves`]: its light image is replaced right after
+/// it, in the dispatch hook these skips return before), and the
+/// reflections' hold on `CS_UpdateHistory` ([`crate::ambient::REFLECTED`]);
+/// the sky ([`crate::ambient::SKY`]) is a pixel program, taken out too in
+/// case a container holds it. Looked at whether the ambient light is on or
+/// not: those passes light the picture either way. No [`RtWork`] kind takes
+/// such a program, so `VICTORY_RT_RESOLVE_SKIP` (whose `Resolve` is the rays'
+/// hit shading, not the probes' temporal resolve) never leaves one out.
 #[cfg(windows)]
-fn rt_skin_skip_on() -> bool {
-    rt_skin_skip_mode() != 0
+fn ambient_follows(bytes: &[u8]) -> bool {
+    crate::ambient::resolves(bytes) || holds(bytes, crate::ambient::REFLECTED) || holds(bytes, crate::ambient::SKY)
+}
+
+/// The kinds the compute container `bytes` is, of those whose switch is on
+/// ([`rt_skip_modes`]); none for a program the ambient light follows.
+#[cfg(windows)]
+fn rt_work_of(bytes: &[u8]) -> u8 {
+    let modes = rt_skip_modes();
+    if modes == [0; 4] || ambient_follows(bytes) {
+        return 0;
+    }
+    RT_WORK
+        .iter()
+        .zip(modes)
+        .enumerate()
+        .filter(|(_, (k, mode))| *mode != 0 && holds(bytes, k.name))
+        .fold(0, |work, (i, _)| work | (1 << i))
 }
 
 /// Whether a dispatch with the title's pipeline `this` is left out because
-/// it only feeds the ray-tracing structures nothing builds
-/// ([`rt_skin_skip_mode`]; with `alt` only in an ON turn).
+/// it only serves rays nothing can use ([`RtWork`]): of a kind whose switch
+/// is `1`, or `alt` in an ON turn of that kind.
 #[cfg(windows)]
-pub(crate) fn skips_rt_skin(this: This, indirect: bool) -> bool {
-    if this.is_null() || !pipeline(this).rt_skin {
+pub(crate) fn skips_rt_work(this: This, indirect: bool) -> bool {
+    if this.is_null() {
         return false;
     }
-    let skip = if rt_skin_skip_mode() != 2 {
-        true
-    } else {
-        static TURN: crate::AltTurn = crate::AltTurn::new();
-        TURN.on(
-            "dispatches of bvh_skinning programs are left out",
-            "VICTORY_RT_SKIN_SKIP",
-            "off, run as usual",
-        )
-    };
-    #[cfg(feature = "diagnostics")]
-    RT_SKIN_DISPATCHES[usize::from(!skip) * 2 + usize::from(indirect)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let work = pipeline(this).rt_work;
+    if work == 0 {
+        return false;
+    }
+    let modes = rt_skip_modes();
+    let mut skip = false;
+    for (i, (kind, mode)) in RT_WORK.iter().zip(modes).enumerate() {
+        if work & (1 << i) == 0 || mode == 0 {
+            continue;
+        }
+        let left = mode == 1 || kind.turn.on(kind.what, kind.switch, "off, run as usual");
+        #[cfg(feature = "diagnostics")]
+        kind.dispatches[usize::from(!left) * 2 + usize::from(indirect)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        skip |= left;
+    }
     #[cfg(not(feature = "diagnostics"))]
     let _ = indirect;
     skip
 }
 
-/// bvh_skinning pipelines known so far ([`skins_for_rays`]).
-#[cfg(feature = "diagnostics")]
-static RT_SKIN_PIPELINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A count of compute containers by what their names hold, nothing left
+/// out for it (diagnostics): `bvh_skinning`; `ComputeSkinning` without
+/// `bvh` (the picture's own skinning, if it shares that name); and
+/// `GenerateHairVB`. Each container once, when first seen.
+#[cfg(all(windows, feature = "diagnostics"))]
+static RT_CENSUS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Dispatches of bvh_skinning pipelines since the last frame line: left
-/// out direct, left out indirect, run direct, run indirect (run: in the
-/// off turns of `=alt`).
-#[cfg(feature = "diagnostics")]
-static RT_SKIN_DISPATCHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-
-/// The frame line's part of [`skips_rt_skin`]: per frame over `frames`.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn rt_skin_line(frames: f64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let [left_direct, left_indirect, ran_direct, ran_indirect] = RT_SKIN_DISPATCHES.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames.max(1.0));
-    if rt_skin_skip_mode() == 0 {
-        return;
+/// Counts the compute container `bytes` in [`RT_CENSUS`].
+#[cfg(all(windows, feature = "diagnostics"))]
+fn rt_census(bytes: &[u8]) {
+    let kinds = [
+        holds(bytes, b"bvh_skinning"),
+        holds(bytes, b"ComputeSkinning") && !holds(bytes, b"bvh"),
+        holds(bytes, b"GenerateHairVB"),
+    ];
+    for (count, is) in RT_CENSUS.iter().zip(kinds) {
+        if is {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
-    tracing::info!(
-        "bvh_skinning dispatches per frame (VICTORY_RT_SKIN_SKIP): left out {left_direct:.1} direct, {left_indirect:.1} indirect; run {ran_direct:.1} direct, {ran_indirect:.1} indirect (the off turns of alt); {} such pipelines known",
-        RT_SKIN_PIPELINES.load(Relaxed)
-    );
+}
+
+/// The frame line's part of [`skips_rt_work`], per frame over `frames`: a
+/// line for each kind whose switch is on, and the three numbers of
+/// [`RT_CENSUS`], in its order, whenever they changed.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn rt_work_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for (kind, mode) in RT_WORK.iter().zip(rt_skip_modes()) {
+        let [left_direct, left_indirect, ran_direct, ran_indirect] =
+            kind.dispatches.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames.max(1.0));
+        if mode == 0 {
+            continue;
+        }
+        tracing::info!(
+            "ray-only dispatches per frame ({}): left out {left_direct:.1} direct, {left_indirect:.1} indirect; run {ran_direct:.1} direct, {ran_indirect:.1} indirect (the off turns of alt); {} such pipelines known",
+            kind.switch,
+            kind.pipelines.load(Relaxed)
+        );
+    }
+    static SAID: Mutex<[u64; 3]> = Mutex::new([0; 3]);
+    let census = RT_CENSUS.each_ref().map(|c| c.load(Relaxed));
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if census != *said {
+        *said = census;
+        let [a, b, c] = census;
+        tracing::info!("ray census of compute containers (pipeline.rs RT_CENSUS): {a} {b} {c}");
+    }
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -665,10 +1046,11 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
-    /// One of the title's skinning passes for the ray-tracing structures,
-    /// left out ([`skips_rt_skin`]).
+    /// The kinds of work only for rays its compute stage is, whose
+    /// dispatches can be left out ([`skips_rt_work`]): bit `i` is
+    /// [`RT_WORK`]`[i]`.
     #[cfg(windows)]
-    rt_skin: bool,
+    rt_work: u8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -692,7 +1074,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container_len, hash = %shader.hash, "first bind");
     }
 }
 
@@ -861,18 +1243,17 @@ fn hand_out(
         #[cfg(windows)]
         builder,
         #[cfg(windows)]
-        rt_skin: {
-            let skin = rt_skin_skip_on()
-                && shaders
-                    .iter()
-                    .any(|s| s.stage == "compute" && skins_for_rays(&s.container));
+        rt_work: {
+            let work = shaders.iter().fold(0, |work, s| work | s.rt_work);
             #[cfg(feature = "diagnostics")]
-            if skin {
-                let n = RT_SKIN_PIPELINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let hash = shaders.iter().find(|s| s.stage == "compute").map_or("", |s| s.hash.as_str());
-                tracing::info!(shader = hash, so_far = n, "a bvh_skinning program known (VICTORY_RT_SKIN_SKIP): its dispatches can be left out");
+            for (i, kind) in RT_WORK.iter().enumerate() {
+                if work & (1 << i) != 0 {
+                    let n = kind.pipelines.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let hash = shaders.iter().find(|s| s.stage == "compute").map_or("", |s| s.hash.as_str());
+                    tracing::info!(shader = hash, switch = kind.switch, so_far = n, "a program of work only for rays known: its dispatches can be left out");
+                }
             }
-            skin
+            work
         },
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
@@ -1074,6 +1455,32 @@ pub(crate) fn trim_library() {
     library::trim();
 }
 
+/// Releases cold post-PSO shader DXIL blobs and zlib-compresses idle guest
+/// containers (`SHADERS`), keeping full hash/container reloadability on demand.
+#[cfg(windows)]
+pub(crate) fn trim_shaders_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let list: Vec<Arc<Shader>> = {
+        let guard = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = guard.as_ref() else {
+            return;
+        };
+        map.values().cloned().collect()
+    };
+    for shader in list {
+        if shader.translated.get().is_none() || shader.building_dxil.load(Acquire) > 0 {
+            continue;
+        }
+        let idle = now.saturating_sub(shader.last_dxil_ms.load(Relaxed));
+        if policy.panic_memory || idle >= policy.shader_dxil_idle_ms {
+            shader.release_dxil();
+        }
+        if policy.panic_memory || idle >= policy.shader_container_idle_ms {
+            shader.compress_container_if_ready();
+        }
+    }
+}
+
 /// The pipeline library's part of the report when the host device is
 /// removed (`library::removal_note`).
 #[cfg(windows)]
@@ -1109,18 +1516,31 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
-    /// The title's skinning passes for the ray-tracing structures are known
-    /// by the name in their container; other skinning programs are not.
+    /// The kinds of work only for rays are known by the names in their
+    /// container; the picture's own skinning and the programs the ambient
+    /// light follows are none of them. (Every switch is off in tests: the
+    /// names are matched as [`rt_work_of`] does with all of them on.)
     #[cfg(windows)]
     #[test]
-    fn ray_skinning_programs_are_known_by_name() {
-        assert!(skins_for_rays(
-            b"..\0bvh_skinningCSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."
-        ));
-        assert!(skins_for_rays(b"bvh_skinningCS"));
-        assert!(!skins_for_rays(b"PS_PedSkin_0001"));
-        assert!(!skins_for_rays(b"bvh_skinningPS"));
-        assert!(!skins_for_rays(b""));
+    fn ray_work_programs_are_known_by_name() {
+        let kinds = |bytes: &[u8]| -> u8 {
+            if ambient_follows(bytes) {
+                return 0;
+            }
+            RT_WORK.iter().enumerate().filter(|(_, k)| holds(bytes, k.name)).fold(0, |w, (i, _)| w | (1 << i))
+        };
+        assert_eq!(kinds(b"..\0bvh_skinningCSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."), 0b0001);
+        assert_eq!(kinds(b"bvh_skinningCS"), 0b0001);
+        assert_eq!(kinds(b"bvh_skinning_smh"), 0b0001);
+        assert_eq!(kinds(b"..\0CSComputeSkinning_0_Wrapped\0.."), 0);
+        assert_eq!(kinds(b"PS_PedSkin_0001"), 0);
+        assert_eq!(kinds(b"..\0CS_RaytracingResolve_Opaque_12345678_Wrapped\0.."), 0b0010);
+        assert_eq!(kinds(b"..\0CS_ScreenProbes_ActivateRays_0_Wrapped\0.."), 0b0100);
+        assert_eq!(kinds(b"bvh_skinning_smh\0CSGenerateHairVB_c88a8f19_Wrapped\0.."), 0b1001);
+        assert_eq!(kinds(b"..\0CS_ScreenProbes_TemporalResolve_Wave64\0.."), 0);
+        assert_eq!(kinds(b"CS_RaytracingResolve\0CS_ScreenProbes_TemporalResolve\0"), 0);
+        assert_eq!(kinds(b"CS_RaytracingResolve\0CS_UpdateHistory\0"), 0);
+        assert_eq!(kinds(b""), 0);
     }
 
     /// Which stores give title-memory copies as written: a vector store
@@ -1166,7 +1586,15 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| {
+                (
+                    s.stage,
+                    s.container
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .to_vec(),
+                )
+            })
             .collect()
     }
 
@@ -1264,5 +1692,175 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ram_trim_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn minimal_stage_container(slot_offset: usize, extra_padding: usize) -> Vec<u8> {
+        // Minimal Xbox `DXIL` part carrying one valid `s_endpgm` native program at `slot_offset`.
+        const ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+        const SLOT_CS: usize = 0x60;
+        const RECORD_SIZE: usize = 0x54;
+        const STAGE_DATA: usize = 0x14c + 8 * (4 + 10 * 10 * 4);
+        let code = 0xbf81_0000u32.to_le_bytes(); // s_endpgm
+        let mut payload = 6u64.to_le_bytes().to_vec();
+        payload.resize(SLOT_CS + 8, 0);
+        for at in [0x08usize, 0x10, 0x18, 0x20, 0x28, 0x30, 0x48, SLOT_CS] {
+            payload[at..at + 8].copy_from_slice(&ABSENT.to_le_bytes());
+        }
+        let record = payload.len() as u64;
+        payload[slot_offset..slot_offset + 8].copy_from_slice(&record.to_le_bytes());
+        let code_at = record + RECORD_SIZE as u64 + STAGE_DATA as u64;
+        payload.extend_from_slice(&code_at.to_le_bytes());
+        payload.extend_from_slice(&(code.len() as u64).to_le_bytes());
+        payload.resize(record as usize + 0x50, 0);
+        payload.extend_from_slice(&(1u32).to_le_bytes()); // 1 VGPR
+        let mut stage_data = vec![0u8; STAGE_DATA];
+        if slot_offset == SLOT_CS {
+            // CS thread group (1, 1, 1) at `STAGE_DATA + 0x28`.
+            for (i, v) in [1u32, 1, 1].into_iter().enumerate() {
+                stage_data[0x28 + i * 4..0x28 + (i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        payload.extend_from_slice(&stage_data);
+        payload.extend_from_slice(&code);
+
+        let mut fssm = b"FSSM".to_vec();
+        fssm.extend_from_slice(&0x101u32.to_le_bytes());
+        fssm.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        fssm.extend_from_slice(&payload);
+
+        let mut buf = vec![0u8; zlib_rs::compress_bound(fssm.len())];
+        let (stream, rc) =
+            zlib_rs::compress_slice(&mut buf, &fssm, zlib_rs::DeflateConfig::new(6));
+        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+        let mut xbch = b"XBCH".to_vec();
+        xbch.extend_from_slice(&3u32.to_le_bytes());
+        xbch.extend_from_slice(&(stream.len() as u64).to_le_bytes());
+        xbch.extend_from_slice(&(fssm.len() as u64).to_le_bytes());
+        xbch.extend_from_slice(stream);
+
+        let pad = vec![0x42u8; extra_padding];
+        let blobs: Vec<(u32, &[u8])> = if extra_padding > 0 {
+            vec![(0x0a, b"xbop"), (0x0d, &xbch), (0x12, &pad)]
+        } else {
+            vec![(0x0a, b"xbop"), (0x0d, &xbch)]
+        };
+        let mut dxil_part = vec![0u8; 0x18];
+        dxil_part.extend_from_slice(b"XDAT");
+        dxil_part.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+        dxil_part.extend_from_slice(&0x24u32.to_le_bytes());
+        let mut off = dxil_part.len() + 12 * blobs.len();
+        for &(kind, blob) in &blobs {
+            for w in [kind, off as u32, blob.len() as u32] {
+                dxil_part.extend_from_slice(&w.to_le_bytes());
+            }
+            off += blob.len();
+        }
+        for (_, blob) in blobs {
+            dxil_part.extend_from_slice(blob);
+        }
+        let dxbc_parts = [(victory_shader::FourCC::DXIL, dxil_part.as_slice())];
+        let table = 32 + 4 * dxbc_parts.len();
+        let total = table + dxbc_parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"DXBC");
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&(dxbc_parts.len() as u32).to_le_bytes());
+        let mut offset = table;
+        for (_, d) in &dxbc_parts {
+            out.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += 8 + d.len();
+        }
+        for (fourcc, d) in dxbc_parts {
+            out.extend_from_slice(&fourcc.0);
+            out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+            out.extend_from_slice(d);
+        }
+        out
+    }
+
+    #[test]
+    fn real_shader_drops_dxil_post_pso_compresses_and_reloads_on_demand() {
+        let orig = minimal_stage_container(0x60, 64 << 10);
+        assert!(orig.len() > (64 << 10));
+        let shader = super::shader("compute", &orig);
+
+        let t = shader.translated().expect("minimal CS translates");
+        let _ = t;
+        assert!(!shader.walks());
+        assert!(!super::of_builder(std::slice::from_ref(&shader)));
+
+        let dxil_first = shader.dxil().expect("DXIL available");
+        let dxil_len = dxil_first.len() as u64;
+        assert!(dxil_len > 0);
+        drop(dxil_first);
+
+        // Pinning DXIL during PSO creation prevents release.
+        let pin = shader.pin_dxil();
+        assert_eq!(shader.release_dxil(), 0, "pinned DXIL must stay in RAM");
+        drop(pin);
+
+        let kept_before = KEPT[3].load(Relaxed);
+        let dropped_before = crate::ram_trim::COUNTERS
+            .shader_dxil_dropped_bytes
+            .load(Relaxed);
+        assert_eq!(shader.release_dxil(), dxil_len);
+        assert!(KEPT[3].load(Relaxed) <= kept_before.saturating_sub(dxil_len));
+        assert!(
+            crate::ram_trim::COUNTERS
+                .shader_dxil_dropped_bytes
+                .load(Relaxed)
+                >= dropped_before + dxil_len
+        );
+
+        // Cold container compression shrinks RAM significantly and roundtrips losslessly.
+        let saved = shader.compress_container_if_ready();
+        assert!(saved > (60 << 10), "expected >60 KiB saved, got {saved}");
+        shader.with_container(|decoded| assert_eq!(decoded, orig.as_slice()));
+
+        // A second PSO later requesting DXIL transparently reloads identical bytes.
+        let reloaded_before = crate::ram_trim::COUNTERS
+            .shader_dxil_reloaded_bytes
+            .load(Relaxed);
+        let dxil_again = shader.dxil().expect("DXIL reloads after drop + compression");
+        assert_eq!(dxil_again.len() as u64, dxil_len);
+        assert!(
+            crate::ram_trim::COUNTERS
+                .shader_dxil_reloaded_bytes
+                .load(Relaxed)
+                >= reloaded_before + dxil_len
+        );
+        drop(dxil_again);
+        let _ = shader.release_dxil();
+    }
+
+    #[test]
+    fn graphics_shader_compresses_and_reloads_dxil_without_walks_or_builder() {
+        let orig = minimal_stage_container(0x30, 64 << 10);
+        let shader = super::shader("pixel", &orig);
+
+        // Translate only — never call `walks()` or `of_builder()`, matching default runs.
+        assert!(shader.translated().is_some(), "minimal PS translates");
+        assert!(shader.walks.get().is_none());
+        assert!(shader.builder_spilled.get().is_none());
+
+        let dxil_len = shader.dxil().expect("PS DXIL available").len() as u64;
+        assert!(dxil_len > 0);
+        assert_eq!(shader.release_dxil(), dxil_len);
+
+        let saved = shader.compress_container_if_ready();
+        assert!(saved > (60 << 10), "graphics shader container must compress (saved={saved})");
+        let dxil_reloaded = shader.dxil().expect("PS DXIL reloads from compressed container");
+        assert_eq!(dxil_reloaded.len() as u64, dxil_len);
+        drop(dxil_reloaded);
+        let _ = shader.release_dxil();
     }
 }

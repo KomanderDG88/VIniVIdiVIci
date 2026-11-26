@@ -225,9 +225,24 @@ fn sweep() {
         return;
     }
     crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
-    crate::texture::let_go_idle();
+    // `VICTORY_RAM_TRIM=1` ([`crate::ram_trim`]): cold shader blobs, the
+    // snapshot pool, spare staging and scratch, idle lists and the card's
+    // fetch buffer trimmed too, by a policy scaled to the host's memory.
+    // Unset: the sweep as before.
+    if !crate::ram_trim::aggressive() {
+        crate::shadow::let_go_idle();
+        crate::texture::let_go_idle();
+        crate::resource::let_go_idle();
+        return;
+    }
+    let policy = crate::ram_trim::TrimPolicy::cached();
+    crate::pipeline::trim_shaders_with(&policy, now);
+    crate::shadow::let_go_idle_with(&policy, now);
+    crate::texture::let_go_idle_with(&policy, now);
     crate::resource::let_go_idle();
+    crate::list::let_go_idle_with(&policy, now);
+    trim_spare_with(&policy, now);
+    trim_card_work_with(&policy, now);
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -278,7 +293,7 @@ pub(crate) fn retire_lean() -> bool {
         1 => true,
         _ => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -391,7 +406,7 @@ fn reaper_on() -> bool {
         1 => true,
         _ => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -1485,6 +1500,36 @@ struct Gather {
     budget: Option<ID3D12Resource>,
     /// Scratch buffers of earlier recordings, kept for the next sets.
     spare: Vec<ID3D12Resource>,
+    /// The passes recorded in the list for records taken after it stopped gathering for its prelude
+    /// (`crate::indirect::gather_segments`).
+    segments: Segments,
+}
+
+/// A list's segments' passes (`crate::indirect::gather_segments`).
+#[derive(Default)]
+struct Segments {
+    /// The list's buffer of slots, `SEGMENT_PASSES` passes of `SEGMENT_PASS` records of `GATHER_STRIDE` bytes: made at
+    /// the first pass and kept across recordings.
+    buffer: Option<ID3D12Resource>,
+    /// Whether a pass of this recording used the buffer: it is in `INDIRECT_ARGUMENT` from the first pass to the
+    /// list's end, else common.
+    used: bool,
+    /// The passes recorded in this recording.
+    passes: u32,
+    /// The passes of the segment open now that take records: none once something that may write arguments ends it.
+    open: Vec<SegmentPass>,
+}
+
+/// A pass of the open segment: its argument buffer (a host copy, its number), kind and stride, its number in the
+/// recording, the records it has, and its table (upload memory of the list: the count, then the records' offsets).
+struct SegmentPass {
+    src: ID3D12Resource,
+    src_id: u64,
+    kind: u32,
+    stride: u32,
+    pass: u32,
+    records: u32,
+    table: usize,
 }
 
 /// The most argument buffers a list gathers from.
@@ -2156,9 +2201,9 @@ fn scratch_pool() -> bool {
 }
 
 /// Things of some sizes that nothing holds now, kept for whoever next asks
-/// for one of the same size.
+/// for one of the same size, alongside the timestamp (`now_ms`) they became idle.
 struct Spare<T> {
-    kept: Vec<(T, u64)>,
+    kept: Vec<(T, u64, u64)>,
     bytes: u64,
 }
 
@@ -2169,20 +2214,44 @@ impl<T> Spare<T> {
 
     /// A kept thing of `size` bytes, the one given last.
     fn take(&mut self, size: u64) -> Option<T> {
-        let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
+        let at = self.kept.iter().rposition(|(_, s, _)| *s == size)?;
         self.bytes -= size;
         Some(self.kept.remove(at).0)
     }
 
     /// Keeps `thing` (`size` bytes) unless that takes the kept bytes past
     /// `most`: then it comes back.
-    fn give(&mut self, thing: T, size: u64, most: u64) -> Option<T> {
+    fn give(&mut self, thing: T, size: u64, most: u64, now: u64) -> Option<T> {
         if self.bytes + size > most {
             return Some(thing);
         }
         self.bytes += size;
-        self.kept.push((thing, size));
+        self.kept.push((thing, size, now));
         None
+    }
+
+    /// Removes oldest entries that have sat idle for at least `idle_ms` until
+    /// total kept bytes drop to or below `warm_bytes` (or all entries if
+    /// `force_empty`).
+    fn trim(&mut self, warm_bytes: u64, idle_ms: u64, now: u64, force_empty: bool) -> Vec<(T, u64)> {
+        let mut freed = Vec::new();
+        while self.bytes > warm_bytes {
+            let Some((_, size, returned_ms)) = self.kept.first() else {
+                break;
+            };
+            let age = now.saturating_sub(*returned_ms);
+            if !force_empty && age < idle_ms {
+                break;
+            }
+            let size = *size;
+            let (thing, _, _) = self.kept.remove(0);
+            self.bytes -= size;
+            freed.push((thing, size));
+        }
+        if self.kept.is_empty() && self.kept.capacity() > 64 {
+            self.kept.shrink_to(16);
+        }
+        freed
     }
 }
 
@@ -2219,12 +2288,13 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
     }
+    let now = now_ms();
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, SPARE_MOST, now)
             } else {
                 Some(chunk)
             };
@@ -2245,6 +2315,39 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// Collected D3D12 COM buffers removed from idle lists so they drop outside locks.
+#[derive(Default)]
+pub(crate) struct TrimmedListCaches(Vec<ID3D12Resource>);
+
+/// Releases cold scratch upload chunks from [`SPARE`] above the host's
+/// [`TrimPolicy`](crate::ram_trim::TrimPolicy) warm byte ceiling.
+fn trim_spare_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let freed = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.trim(
+            policy.scratch_spare_warm_bytes,
+            policy.pool_idle_ms,
+            now,
+            policy.panic_memory,
+        )
+    };
+    if freed.is_empty() {
+        return;
+    }
+    let mut bytes = 0u64;
+    let count = freed.len() as u64;
+    for (_, size) in &freed {
+        bytes += *size;
+    }
+    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    // Drop COM buffers outside `SPARE`'s lock.
+    drop(freed);
+    crate::ram_trim::note_pool_trimmed(bytes);
+}
+
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
@@ -2260,11 +2363,16 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// With `VICTORY_CARD_HASH_WIDE=alt` ([`card_hash_wide_now`]): the compare of [`CARD_COMPARE_WIDE`], `pso`
+    /// being [`CARD_COMPARE`]'s. Both shaders declare the same root signature.
+    pso_wide: Option<ID3D12PipelineState>,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    /// Timestamp (`now_ms`) when `fetched` was last touched by `card_back`.
+    fetched_ms: u64,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -2305,6 +2413,28 @@ struct CardInflight {
 unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
+
+/// Drops an oversized idle `CardWork::fetched` shared staging buffer once no GPU
+/// flights are pending (`!behind` inside `sweep`) and it exceeds the active
+/// `TrimPolicy::fetched_warm_bytes` threshold beyond `pool_idle_ms`.
+fn trim_card_work_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let mut dropped: Option<(ID3D12Resource, usize, u64)> = None;
+    {
+        let mut guard = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(work) = guard.as_mut()
+            && work.out == 0
+            && work.taken == 0
+            && let Some((_, _, size)) = work.fetched
+            && size > policy.fetched_warm_bytes
+            && (policy.panic_memory || now.saturating_sub(work.fetched_ms) >= policy.pool_idle_ms)
+        {
+            dropped = work.fetched.take();
+        }
+    }
+    if let Some((_, _, size)) = dropped {
+        crate::ram_trim::note_pool_trimmed(size);
+    }
+}
 
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one thread per 64 KiB piece (cut at multiples of
@@ -2428,14 +2558,65 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// another hash with another rare pattern of changes it cannot see). Chosen
 /// once and said in the log: stored and compared hashes must agree.
 pub(crate) fn card_hash_wide() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_CARD_HASH_WIDE").is_some_and(|v| v == "1");
-        if on {
+    card_hash_mode() == 1
+}
+
+/// `VICTORY_CARD_HASH_WIDE`: 0 a thread a piece, 1 a group a piece, 2 in turn (`alt`, [`card_hash_wide_now`]).
+fn card_hash_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_CARD_HASH_WIDE").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        if mode == 1 {
             tracing::info!("the card's hashes of copies' pieces are made by a group of 64 threads a piece (VICTORY_CARD_HASH_WIDE=1)");
         }
-        on
+        mode
     })
+}
+
+/// Whether the card's hashes of a submission's pieces are made with [`CARD_COMPARE_WIDE`]: with
+/// `VICTORY_CARD_HASH_WIDE=1` always; with `alt` twenty seconds with, twenty without, in turn, each change said in the
+/// log, so that one run measures the card and the submitting thread in both at equal draws (run 332 compared two
+/// launches: card -8 to -24 ms, submit thread +12 to +20, inside the ±10 ms two launches differ by).
+///
+/// Read once per submission (`Host::card_before`): its pass after ranges were sent up and its compare use the same
+/// form. Why mixing the two forms across submissions is exact: a piece whose hash was stored in one form and is
+/// compared in the other is flagged as differing (two different 128-bit functions of the same bytes agree by chance
+/// about one time in 2^128, the odds a changed piece already has of a same hash in either form). A flagged piece is
+/// fetched and merged, and the merge stores into title memory only the bytes where the card's side differs from the
+/// CPU's (`Shadow::card_merge_relay`): a piece nothing changed stores nothing. So a change of phase costs one fetch of
+/// each piece compared next (two compares in a row without a store, `compare` 1, fetch it again until the next send
+/// stores its hash), never a byte. Each form has its own rare pattern of changes it cannot see, as with `=1`.
+fn card_hash_wide_now() -> bool {
+    match card_hash_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the card's hashes of copies' pieces from now (VICTORY_CARD_HASH_WIDE=alt): {}",
+                    if on { "ON, a group of 64 threads a piece" } else { "off, a thread a piece" }
+                );
+            }
+            on
+        }
+    }
+}
+
+impl CardWork {
+    /// The compare's pipeline for a submission ([`card_hash_wide_now`]) and whether it is the wide form.
+    fn compare_for(&self, wide_now: bool) -> (&ID3D12PipelineState, bool) {
+        match (&self.pso_wide, wide_now) {
+            (Some(wide), true) => (wide, true),
+            _ => (&self.pso, card_hash_wide()),
+        }
+    }
 }
 
 /// The compare's source for this process ([`card_hash_wide`]).
@@ -2444,8 +2625,9 @@ pub(crate) fn card_compare_source() -> &'static str {
 }
 
 /// The groups a compare pass over `pieces` pieces is dispatched with.
-pub(crate) fn card_compare_groups(pieces: u32) -> u32 {
-    if card_hash_wide() { pieces } else { pieces.div_ceil(64) }
+/// (For the form `wide` of the submission, [`CardWork::compare_for`].)
+fn card_compare_groups_as(wide: bool, pieces: u32) -> u32 {
+    if wide { pieces } else { pieces.div_ceil(64) }
 }
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
@@ -2618,7 +2800,7 @@ fn rehash_runs() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let joined = (now_us() / 20_000_000) % 2 == 1;
+            let joined = (now_us() / 20_000_000) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(joined), Ordering::Relaxed) != u8::from(joined) {
                 tracing::info!(
@@ -3175,7 +3357,7 @@ fn settle_room() -> bool {
         1 => true,
         _ => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -3854,7 +4036,7 @@ fn step_index() -> bool {
         1 => true,
         _ => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -4000,6 +4182,9 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         if settle_room() {
             runs_left = (runs_left * 8).min(1 << 16);
         }
+        if let Some(wider) = merge_runs_alt() {
+            runs_left = wider;
+        }
         if card_steps::stage() == 0 {
             // As before: the first span that is stale settles, the ones
             // after it are not merged.
@@ -4017,6 +4202,35 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
     spans
+}
+
+/// The cap of changed runs the merge under flights' writes takes before it settles the flights, in the phases with
+/// `VICTORY_MERGE_RUNS_ALT=N` (unset: none, the cap as set): twenty seconds N (1 to 65,536), twenty seconds the cap
+/// of `VICTORY_MERGE_RUNS` (x8 with [`settle_room`]), in turn, each change said in the log.
+///
+/// Why: run 345 (warm cache, the owner's flag set, which has `VICTORY_SETTLE_ROOM=1` and no `VICTORY_MERGE_RUNS`: a
+/// cap of 4,096) settled 1.4 times a frame for "title memory changed under shader writes", 84.8 ms a frame of the
+/// submitting thread waiting for the card, and every give-up of the merge in its lines was "for more changed runs
+/// than VICTORY_MERGE_RUNS leaves" (5 to 10 a window; 2,000 to 2,500 changed runs a frame are merged). Both ways are
+/// exact: the merge puts the title's changed bytes in beside the flights' writes, a run a copy on the card; the settle
+/// waits for the flights and lands them first. The price of the wider cap is those copies' card time, in the same
+/// phases (the card meter's "send-and-hash lists").
+fn merge_runs_alt() -> Option<usize> {
+    static WIDER: OnceLock<Option<usize>> = OnceLock::new();
+    let wider = (*WIDER.get_or_init(|| {
+        std::env::var("VICTORY_MERGE_RUNS_ALT").ok().and_then(|v| v.trim().parse::<usize>().ok()).map(|n| n.clamp(1, 1 << 16))
+    }))?;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+        tracing::info!(
+            "the merge under flights' writes takes {} changed runs a submission before it settles them, from now (VICTORY_MERGE_RUNS_ALT): {}",
+            if on { wider.to_string() } else { "the cap as set".to_string() },
+            if on { "ON" } else { "off" }
+        );
+    }
+    on.then_some(wider)
 }
 
 /// Whether the list that brings copies in the card's memory up to date
@@ -4047,7 +4261,7 @@ fn sync_batched() -> bool {
         1 => true,
         _ => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -5025,18 +5239,69 @@ impl Host {
                 },
                 ..Default::default()
             })?;
+            // With `alt`: the wide form's pipeline beside it (`pso` is then the thread-a-piece form, as
+            // `card_compare_source` gives it without `=1`). None if it does not build: every submission keeps `pso`.
+            let pso_wide = (card_hash_mode() == 2).then(|| self.make_card_compare_wide(&root)).flatten();
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
                 fetch: list()?,
                 root,
                 pso,
+                pso_wide,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                fetched_ms: 0,
                 taken: 0,
                 out: 0,
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
             })
+        }
+    }
+
+    /// [`CARD_COMPARE_WIDE`]'s pipeline with the compare's root signature `root` (the two shaders declare the same
+    /// one), for `VICTORY_CARD_HASH_WIDE=alt`; `None`, said in the log, if it cannot be made.
+    fn make_card_compare_wide(&self, root: &ID3D12RootSignature) -> Option<ID3D12PipelineState> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let made = (|| -> windows::core::Result<ID3D12PipelineState> {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call; the out pointer is ours.
+            unsafe {
+                D3DCompile(
+                    CARD_COMPARE_WIDE.as_ptr().cast(),
+                    CARD_COMPARE_WIDE.len(),
+                    windows::core::s!("card compare wide"),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )?;
+            }
+            let code = code.ok_or_else(windows::core::Error::empty)?;
+            // SAFETY: the blob's own bytes; a root signature the shader declares as well.
+            unsafe {
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+            }
+        })();
+        match made {
+            Ok(pso) => Some(pso),
+            Err(e) => {
+                tracing::warn!(error = %e, "VICTORY_CARD_HASH_WIDE=alt: the wide compare could not be made; a thread a piece throughout");
+                None
+            }
         }
     }
 
@@ -5201,6 +5466,12 @@ impl Host {
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
+        // The hash form of this submission's passes, one for all of them (`card_hash_wide_now`).
+        let wide_now = card_hash_wide_now();
+        let (compare_pso, wide) = {
+            let (pso, wide) = work.compare_for(wide_now);
+            (pso.clone(), wide)
+        };
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -5315,7 +5586,7 @@ impl Host {
                             if !bound {
                                 bound = true;
                                 list.SetComputeRootSignature(&work.root);
-                                list.SetPipelineState(&work.pso);
+                                list.SetPipelineState(&compare_pso);
                                 list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                             }
                             list.SetComputeRootShaderResourceView(1, w.shadow.buffer.GetGPUVirtualAddress());
@@ -5332,7 +5603,7 @@ impl Host {
                             for run in runs {
                                 let constants = [run.first, run.skew, w.shadow.card_hashed().unwrap_or(w.size) as u32, run.pieces, 0, 0];
                                 list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                                list.Dispatch(card_compare_groups(run.pieces), 1, 1);
+                                list.Dispatch(card_compare_groups_as(wide, run.pieces), 1, 1);
                             }
                         }
                     };
@@ -5445,7 +5716,7 @@ impl Host {
                         },
                     }]);
                     list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
+                    list.SetPipelineState(&compare_pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
@@ -5456,7 +5727,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(card_compare_groups(r.span.pieces), 1, 1);
+                        list.Dispatch(card_compare_groups_as(wide, r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
@@ -6131,6 +6402,9 @@ impl Host {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
                 work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            }
+            if work.fetched.is_some() {
+                work.fetched_ms = now_ms();
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -7321,7 +7595,7 @@ fn wide_refresh() -> bool {
         1 => true,
         _ => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -7369,7 +7643,7 @@ fn refresh_once() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = (now_us() / 20_000_000) % 2 == 1;
+            let on = (now_us() / 20_000_000) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -7742,7 +8016,7 @@ pub(crate) fn list_reuse() -> bool {
         1 => true,
         _ => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -7778,7 +8052,7 @@ fn fills_plain() -> bool {
         1 => true,
         _ => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -7819,7 +8093,7 @@ fn near_writes() -> bool {
         1 => true,
         _ => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -7888,7 +8162,7 @@ fn parallel_refresh() -> bool {
         1 => true,
         _ => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -8517,11 +8791,11 @@ impl Meter {
             }
             {
                 let mode = crate::watch::page_writes();
-                let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
+                let [writes, bytes, guarded, plain, told] = [0, 1, 2, 3, 4].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
                 let [kept, dropped, slots, uploaded] =
                     [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
+                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}; {told} passed to the texture pass); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset = guards and slots, plain reads' textures too; guards, 0 counts only, 1, slots, all)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
                     if mode & 4 != 0 { "told as well" } else { "counted only" },
@@ -8591,7 +8865,7 @@ impl Meter {
                         *n as f64 / frames
                     );
                 }
-                crate::pipeline::rt_skin_line(frames);
+                crate::pipeline::rt_work_line(frames);
             }
         }
         if self.caption.is_none() {

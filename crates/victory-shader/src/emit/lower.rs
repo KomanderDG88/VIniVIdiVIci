@@ -702,6 +702,38 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     if (0..n).any(|r| reads[r] && writes[r]) {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+                let mut list = Vec::new();
+                for (b, block) in p.blocks.iter().enumerate().take(n) {
+                    if all[b] || find(&mut region, b) != r {
+                        continue;
+                    }
+                    for i in &block.insts {
+                        let name = i.name();
+                        if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
+                            continue;
+                        }
+                        // the address register and the instruction that wrote it
+                        let addr = match &i.fields {
+                            Fields::Ds { addr: Some(Operand::Vector { reg, .. }), offset0, offset1, .. } => {
+                                let made = i.read(Reg::V(*reg)).and_then(|v| {
+                                    p.blocks
+                                        .iter()
+                                        .flat_map(|bl| &bl.insts)
+                                        .find(|x| x.writes.iter().any(|w| w.1 == v))
+                                        .map(|x| format!("{:#x} {}", x.machine.offset, x.name()))
+                                });
+                                format!("v{reg} off {offset0}/{offset1} made by {}", made.as_deref().unwrap_or("an input or a phi"))
+                            }
+                            _ => "no address".to_string(),
+                        };
+                        list.push(format!("{:#x} {name} [{addr}]", i.machine.offset));
+                    }
+                }
+                eprintln!("WAVE64-LDS region with reads and writes: {}", list.join("; "));
+            }
+        }
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -10079,8 +10111,12 @@ impl<'a> Lower<'a> {
                 .min(self.s.threads.map_or(u32::MAX, |t| t[0]))
         });
         let mut indices = [z; 3];
+        // Each corner is a 9-bit vertex index with its edge flag above it
+        // (bits 9, 19, 29), which only the console's edge-flag rasterising
+        // reads: with the flag in the index it named a vertex past the
+        // written ones, and the triangle was culled.
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
@@ -10871,6 +10907,30 @@ mod tests {
                 range(ResourceType::Sampler, 1, 1),
             ],
         )
+    }
+
+    #[test]
+    fn a_uniform_branch_can_choose_between_immediate_samplers() {
+        // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
+        let words = [
+            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
+            0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
+            0xBF85_0002,                    // branch to clamp
+            0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
+            0xBE88_03FF, 0x0000_0092,       // clamp all axes
+            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
+            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (mut layout, mut used) = texture_tables();
+        layout[1] = root(RootType::Constants, 1, 1);
+        used.truncate(1);
+        let shader = lower_with(&words, layout, used).unwrap();
+        assert_eq!(shader.samplers.len(), 2);
+        assert!(shader.samplers.contains(&[0, 0, 0, 0]));
+        assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
     }
 
     #[test]

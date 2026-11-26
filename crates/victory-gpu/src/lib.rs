@@ -25,6 +25,8 @@ mod cardmeter;
 mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod shot;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod cold_skip;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -74,6 +76,7 @@ pub mod query;
 pub mod queue;
 #[cfg(windows)]
 mod queue2;
+mod ram_trim;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -86,6 +89,8 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod merge;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod null_samples;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
@@ -115,7 +120,8 @@ pub use watch::{
 /// The `alt` value of a switch: twenty seconds off, twenty on, in turn,
 /// from the first time it is asked, each change said in the log in the
 /// words of `VICTORY_DISPATCH_SPREAD=alt` ("... from now (SWITCH=alt):
-/// ON"). One per switch, in a `static`.
+/// ON"). One per switch, in a `static`. Which half is ON follows
+/// [`alt_on_phase`] (`VICTORY_ALT_FLIP=1`: the first).
 #[cfg(windows)]
 pub(crate) struct AltTurn {
     epoch: std::sync::OnceLock<std::time::Instant>,
@@ -132,10 +138,27 @@ impl AltTurn {
     /// Whether this is an ON turn. `what`: what the switch does, `switch`:
     /// its name, `off`: what an off turn is, as the log says them.
     pub(crate) fn on(&self, what: &str, switch: &str, off: &str) -> bool {
-        let on = (self.epoch.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+        let on = (self.epoch.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == alt_on_phase();
         if self.last.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
             tracing::info!("{what} from now ({switch}=alt): {}", if on { "ON" } else { off });
         }
         on
     }
+}
+
+/// For switches set to `alt` (twenty seconds with, twenty without): which
+/// half of each forty seconds is "with". 1 by default, the second half, as
+/// before; `VICTORY_ALT_FLIP=1` makes it the first.
+///
+/// Why: the phases start with the process, so in a scripted scene (a
+/// cutscene from a save, driven by a key file) each half falls on the same
+/// stretches of the scene in every launch, and the scene's own difference
+/// between those stretches is read as the switch's. Measured on an RTX
+/// 5090 in the opening cutscene: `VICTORY_SYNC_BESIDE=alt` read +11.3 % in
+/// a launch as before and +0.9 % flipped; `VICTORY_REAPER=alt` +14.4 % and
+/// +1.9 %. One launch each way puts "with" on every stretch once: the mean
+/// of the two has the scene taken out.
+pub fn alt_on_phase() -> u64 {
+    static PHASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PHASE.get_or_init(|| u64::from(std::env::var_os("VICTORY_ALT_FLIP").is_none_or(|v| v != "1")))
 }

@@ -789,6 +789,17 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    // Upstream VIctory #3198: textures the card had no room for are asked
+    // for again instead of staying without a host copy for the run.
+    let no_room = crate::resource::NOT_MADE_FOR_NOW.load(Relaxed);
+    if no_room > 0 {
+        tracing::info!(
+            "host textures the card had no room for when asked: {} times since the start, {} of them \
+             made on a later use",
+            no_room,
+            crate::resource::MADE_AFTER_NO_ROOM.load(Relaxed),
+        );
+    }
     let targets = crate::resource::targets_census();
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
@@ -1402,6 +1413,7 @@ pub(crate) fn log(frames: f64) {
         .collect();
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
     log_memory();
+    tracing::info!("  {}", crate::ram_trim::diagnostics_line());
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

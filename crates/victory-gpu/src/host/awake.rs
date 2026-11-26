@@ -47,10 +47,11 @@ static LAST: AtomicU64 = AtomicU64::new(0);
 
 fn wanted() -> bool {
     let (last, now) = (LAST.load(Ordering::Relaxed), now_ms());
-    last != 0 && now + 1 < last + QUIET_MS && (mode() != Mode::ByTurns || now / TURN_MS % 2 == 1)
+    last != 0 && now + 1 < last + QUIET_MS && (mode() != Mode::ByTurns || now / TURN_MS % 2 == crate::alt_on_phase())
 }
 
-/// With `VICTORY_CARD_AWAKE=turns`: this long on, this long off.
+/// With `VICTORY_CARD_AWAKE=turns`: this long on, this long off (which
+/// half is on: [`crate::alt_on_phase`]).
 const TURN_MS: u64 = 20_000;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -78,7 +79,7 @@ pub(super) fn sent(device: &ID3D12Device) {
     let now = now_ms();
     let before = LAST.swap(now + 1, Ordering::Relaxed);
     if mode() == Mode::ByTurns && before.saturating_sub(1) / TURN_MS != now / TURN_MS {
-        tracing::info!(on = now / TURN_MS % 2 == 1, "the card is kept awake, by turns");
+        tracing::info!(on = now / TURN_MS % 2 == crate::alt_on_phase(), "the card is kept awake, by turns");
     }
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {

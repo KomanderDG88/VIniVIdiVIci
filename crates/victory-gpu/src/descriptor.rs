@@ -324,7 +324,7 @@ pub(crate) fn sync_beside() -> bool {
         1 => true,
         _ => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -435,7 +435,7 @@ fn sync_cut() -> bool {
         1 => true,
         _ => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -574,6 +574,13 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        // Its run of title-memory views goes with it: a heap made later at
+        // the same address must not find this one's run (fork pull request
+        // #589, AscilCH).
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::forget_heap(host);
+        }
     }
 }
 
@@ -601,7 +608,42 @@ pub(crate) struct RtvRecord {
 const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
+/// Value snapshot for replaying a command list after a cut. Keep the
+/// resource identity as an integer (like draw::State), never the address
+/// of mutable descriptor storage. The caller still owns the resource
+/// lifetime, as with the original recorded command.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct RtvSnapshot {
+    tag: u32,
+    described: u32,
+    resource: usize,
+    desc: [u32; 6],
+}
+
+#[cfg(windows)]
+impl RtvSnapshot {
+    pub(crate) fn restore(self) -> RtvRecord {
+        RtvRecord {
+            tag: self.tag,
+            described: self.described,
+            resource: self.resource as This,
+            desc: self.desc,
+        }
+    }
+}
+
 impl RtvRecord {
+    #[cfg(windows)]
+    pub(crate) fn snapshot(self) -> RtvSnapshot {
+        RtvSnapshot {
+            tag: self.tag,
+            described: self.described,
+            resource: self.resource as usize,
+            desc: self.desc,
+        }
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -1596,6 +1638,27 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn render_target_snapshot_preserves_original_descriptor_words() {
+        let mut record = super::RtvRecord {
+            tag: super::RTV_TAG,
+            described: 1,
+            resource: 0x1000usize as crate::object::This,
+            desc: [24, 4, 0, 0, 0, 0],
+        };
+        let snapshot = record.snapshot();
+        record.desc[0] = 26;
+        record.resource = 0x2000usize as crate::object::This;
+        let restored = snapshot.restore();
+        assert_eq!(restored.tag, record.tag);
+        assert_eq!(restored.described, record.described);
+        assert_eq!(restored.desc[0], 24);
+        assert_eq!(restored.resource as usize, 0x1000);
+        assert_eq!(record.desc[0], 26);
+        assert_eq!(record.resource as usize, 0x2000);
+    }
+
     use super::*;
     use crate::object::{S_OK, slot};
 
@@ -1635,6 +1698,36 @@ mod tests {
             ),
             5..5
         );
+    }
+
+    /// A released view heap takes its run of title-memory views with it
+    /// (`memory::forget_heap`): a heap made later at the same address starts
+    /// its own run. (Fork pull request #589's test, on our helpers.)
+    #[cfg(windows)]
+    #[test]
+    fn a_released_view_heap_forgets_its_title_memory_run() {
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = device.new_list().expect("a host list");
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let host_heap = heap(h).host().expect("a host view heap");
+        let key = std::ptr::from_ref(host_heap) as usize;
+        assert!(crate::memory::ready(&list, host_heap, &[], &[], false, false).is_some());
+        assert!(crate::memory::has_run(key), "the heap's run is kept while it lives");
+        assert_eq!(object::release_boxed::<Heap>(h), 0);
+        assert!(!crate::memory::has_run(key), "a released heap's run is forgotten");
     }
 
     /// A table made afresh for a draw holds the descriptors its shader
