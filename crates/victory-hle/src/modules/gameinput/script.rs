@@ -18,7 +18,29 @@
 //! (or [`GIVE_UP`]), so that each press is a press. Each press leaves a line
 //! in the log: when it went down, how many reads saw it, and how long it was
 //! held.
+//!
+//! `VICTORY_KEYS_FILE=<path>` (off when unset): keys a runner asks for now.
+//! Each non-empty line is `<key>` or `<key>~<hold>` (no times: pressed when
+//! the file is taken), at most [`FILE_MAX_LINES`] lines and
+//! [`FILE_MAX_BYTES`]; the presses go through the script above (same reads,
+//! same waits, same log lines) and queue behind the presses still down.
+//! The protocol, looked at once a second from the input poll:
+//! 1. The runner writes `<path>.tmp` and renames it to `<path>` (the next
+//!    file only once `<path>` is gone: a rename over it replaces it).
+//! 2. We rename `<path>` to `<path>.taken` (the claim: each file is taken
+//!    once; a failed rename is tried again a second later), then read it.
+//! 3. We rename it to `<path>.done`, or, if any line is not understood or it
+//!    is too long, press nothing and rename it to `<path>.rejected` (both
+//!    overwritten by the next file).
+//!
+//! How the runner detects the prompt: the layer does NOT detect prompts. The
+//! runner decides from its own evidence, e.g. its 1 s captures showing the
+//! prompt, compared over consecutive captures so that a still loading screen
+//! is not taken for one. The first visible frame does NOT mean a prompt. One
+//! key per prompt, and never during a scene.
 
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The shortest a press is held, whatever the reads.
@@ -28,6 +50,9 @@ pub(super) const GIVE_UP: Duration = Duration::from_secs(15);
 /// Reads closer together than this count as one (the title reads every
 /// device in the same frame).
 const SAME_READ_US: u64 = 5_000;
+/// A `VICTORY_KEYS_FILE` longer than this is rejected.
+pub(super) const FILE_MAX_BYTES: usize = 1024;
+pub(super) const FILE_MAX_LINES: usize = 16;
 
 /// One scripted press of a key.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,15 +117,7 @@ fn entry_presses(entry: &str) -> Option<Vec<Press>> {
         Some((key, repeat)) => (key, Some(repeat)),
         None => (rest, None),
     };
-    let (key, hold) = match key.split_once('~') {
-        Some((key, hold)) => (key, Some(seconds(hold)?)),
-        None => (key, None),
-    };
-    // Held at least the shortest hold, at most a minute.
-    if hold.is_some_and(|h| h < MIN_HOLD || h > Duration::from_secs(60)) {
-        return None;
-    }
-    let vk = key_code(key.trim())?;
+    let (vk, hold) = key_hold(key)?;
     let (times, gap) = match repeat {
         None => (1, Duration::ZERO),
         Some(repeat) => {
@@ -125,6 +142,67 @@ fn entry_presses(entry: &str) -> Option<Vec<Press>> {
             })
             .collect(),
     )
+}
+
+/// `<key>` or `<key>~<hold>`.
+fn key_hold(key: &str) -> Option<(u8, Option<Duration>)> {
+    let (key, hold) = match key.split_once('~') {
+        Some((key, hold)) => (key, Some(seconds(hold)?)),
+        None => (key, None),
+    };
+    // Held at least the shortest hold, at most a minute.
+    if hold.is_some_and(|h| h < MIN_HOLD || h > Duration::from_secs(60)) {
+        return None;
+    }
+    Some((key_code(key.trim())?, hold))
+}
+
+/// Parses a `VICTORY_KEYS_FILE`: its presses (pressed when added, see
+/// [`Script::add_now`]), or, if anything is wrong, what (nothing pressed).
+pub(super) fn parse_file(text: &str) -> Result<Vec<Press>, Vec<String>> {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if text.len() > FILE_MAX_BYTES || lines.len() > FILE_MAX_LINES {
+        return Err(vec![format!("longer than {FILE_MAX_BYTES} bytes or {FILE_MAX_LINES} lines")]);
+    }
+    let mut presses = Vec::new();
+    let mut bad = Vec::new();
+    for line in lines {
+        match key_hold(line) {
+            Some((vk, hold)) => presses.push(Press { at: Duration::ZERO, vk, hold }),
+            None => bad.push(line.to_owned()),
+        }
+    }
+    match (presses.is_empty(), bad.is_empty()) {
+        (true, true) => Err(vec!["no keys".to_owned()]),
+        (_, true) => Ok(presses),
+        _ => Err(bad),
+    }
+}
+
+/// Takes the `VICTORY_KEYS_FILE` at `path` by the protocol of the module:
+/// `Ok(None)` when there is none.
+pub(super) fn take_file(path: &Path) -> io::Result<Option<Result<Vec<Press>, Vec<String>>>> {
+    let beside = |suffix: &str| {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        PathBuf::from(p)
+    };
+    let taken = beside(".taken");
+    match std::fs::rename(path, &taken) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        claim => claim?,
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&taken)?
+        .take(FILE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let parsed = match std::str::from_utf8(&bytes) {
+        Ok(text) => parse_file(text),
+        Err(_) => Err(vec!["not UTF-8".to_owned()]),
+    };
+    // Where it is left is for the runner to look at; a failure changes nothing.
+    let _ = std::fs::rename(&taken, beside(if parsed.is_ok() { ".done" } else { ".rejected" }));
+    Ok(Some(parsed))
 }
 
 fn seconds(text: &str) -> Option<Duration> {
@@ -185,6 +263,13 @@ impl Script {
             last_read_us: None,
             released: Vec::new(),
         }
+    }
+
+    /// Adds `press` due at `now` (its own `at` is not looked at), after
+    /// the presses due by then: it waits behind those of the same key.
+    pub(super) fn add_now(&mut self, press: Press, now: Duration) {
+        let i = self.presses.partition_point(|(p, _, _)| p.at <= now);
+        self.presses.insert(i, (Press { at: now, ..press }, State::Waiting, 0));
     }
 
     /// The keys down at `now` (after input starts; `now_us` on the hub's
@@ -528,5 +613,86 @@ mod tests {
             presses.iter().map(|p| p.at).collect::<Vec<_>>(),
             [secs(2.0), secs(12.0)]
         );
+    }
+
+    fn file(text: &str) -> Vec<Press> {
+        parse_file(text).unwrap()
+    }
+
+    #[test]
+    fn a_keys_file_is_pressed_whole_or_not_at_all() {
+        let presses = file("Enter
+
+  W~2 
+");
+        assert_eq!(presses.iter().map(|p| (p.vk, p.hold)).collect::<Vec<_>>(), [(ENTER, None), (b'W', Some(secs(2.0)))]);
+        assert_eq!(parse_file("Enter
+F13
+5:Enter
+W~0.1
+Esc"), Err(vec!["F13".into(), "5:Enter".into(), "W~0.1".into()]));
+        assert!(parse_file(&"Enter
+".repeat(FILE_MAX_LINES + 1)).is_err());
+        assert!(parse_file(&format!("{}Enter", " ".repeat(FILE_MAX_BYTES))).is_err());
+        assert!(parse_file(" 
+").is_err());
+    }
+
+    /// A key from a file while the same key is still down waits until a
+    /// read has seen it up, then is a press of its own.
+    #[test]
+    fn a_file_key_waits_behind_the_same_key_down() {
+        let mut script = Script::new(parse("0:Enter").0, 1);
+        let (_, mut notes) = run(&mut script, 0.0, 0.1, &[0.05]);
+        script.add_now(file("Enter")[0], secs(0.1));
+        let (seen, more) = run(&mut script, 0.1, 3.0, &[1.0, 2.0]);
+        notes.extend(more);
+        assert_eq!(seen.iter().map(|(_, k)| k.contains(&ENTER)).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(notes.iter().filter(|n| matches!(n, Note::Down { .. })).count(), 2, "{notes:?}");
+        assert!(script.finished());
+    }
+
+    #[test]
+    fn two_files_in_a_row_are_both_pressed() {
+        let mut script = Script::new(Vec::new(), 1);
+        for p in file("Enter") {
+            script.add_now(p, secs(1.0));
+        }
+        let (_, mut notes) = run(&mut script, 0.0, 1.1, &[0.5]);
+        for p in file("Esc
+Enter") {
+            script.add_now(p, secs(1.1));
+        }
+        let reads: Vec<f64> = (3..20).map(|i| f64::from(i) * 0.5).collect();
+        notes.extend(run(&mut script, 1.1, 10.0, &reads).1);
+        let downs: Vec<u8> = notes.iter().filter_map(|n| match n {
+            Note::Down { vk, .. } => Some(*vk),
+            _ => None,
+        }).collect();
+        assert_eq!(downs, [ENTER, 0x1B, ENTER], "{notes:?}");
+        assert_eq!(notes.iter().filter(|n| matches!(n, Note::Seen { .. })).count(), 3);
+        assert!(script.finished());
+    }
+
+    #[test]
+    fn a_keys_file_is_claimed_once_and_left_done_or_rejected() {
+        let dir = std::env::temp_dir().join(format!("victory-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys");
+        let at = |s: &str| dir.join(format!("keys{s}"));
+        assert!(take_file(&path).unwrap().is_none());
+        std::fs::write(&path, "Enter
+").unwrap();
+        assert_eq!(take_file(&path).unwrap().unwrap().unwrap().len(), 1);
+        assert!(!path.exists() && at(".done").exists() && !at(".taken").exists());
+        assert!(take_file(&path).unwrap().is_none(), "taken once");
+        std::fs::write(&path, "Enter
+nope
+").unwrap();
+        assert_eq!(take_file(&path).unwrap().unwrap(), Err(vec!["nope".into()]));
+        assert!(!path.exists() && at(".rejected").exists());
+        std::fs::write(&path, "Esc").unwrap();
+        assert!(take_file(&path).unwrap().unwrap().is_ok(), ".done overwritten");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

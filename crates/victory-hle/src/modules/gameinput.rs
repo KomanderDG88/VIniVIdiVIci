@@ -1249,16 +1249,20 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS`, keys pressed on a script (see
-    /// `super::script`), with or without focus; the stand-in pad's table maps
-    /// them to buttons too.
+    /// Debugging aid: `VICTORY_KEYS` and `VICTORY_KEYS_FILE`, keys pressed
+    /// on a script (see `super::script`), with or without focus; the
+    /// stand-in pad's table maps them to buttons too.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         let mut script = super::lock(&SCRIPT);
-        let Some((start, script)) = script.as_mut() else {
+        let Some((start, script, file)) = script.as_mut() else {
             return Vec::new();
         };
-        let (down, notes) = script.down(start.elapsed(), super::now());
+        let now = start.elapsed();
+        if let Some(file) = file {
+            file.poll(script, now);
+        }
+        let (down, notes) = script.down(now, super::now());
         for note in notes {
             match note {
                 super::script::Note::Down { vk, at } => {
@@ -1305,16 +1309,63 @@ mod host {
         down
     }
 
-    /// The script of `VICTORY_KEYS`, from when input starts.
+    /// `VICTORY_KEYS_FILE`: where, when last looked at, the last error said.
     #[cfg(feature = "diagnostics")]
-    static SCRIPT: LazyLock<Mutex<Option<(Instant, super::script::Script)>>> =
+    struct KeysFile {
+        path: std::path::PathBuf,
+        checked: Option<Instant>,
+        error: Option<String>,
+    }
+
+    #[cfg(feature = "diagnostics")]
+    impl KeysFile {
+        /// Takes the file into `script` if there is one; once a second.
+        fn poll(&mut self, script: &mut super::script::Script, now: Duration) {
+            if self.checked.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+                return;
+            }
+            self.checked = Some(Instant::now());
+            let path = self.path.display();
+            match super::script::take_file(&self.path) {
+                Ok(None) => {}
+                Ok(Some(Ok(presses))) => {
+                    let keys: Vec<u8> = presses.iter().map(|p| p.vk).collect();
+                    tracing::info!(%path, ?keys, at = now.as_secs_f64(), "keys from VICTORY_KEYS_FILE taken");
+                    for press in presses {
+                        script.add_now(press, now);
+                    }
+                }
+                Ok(Some(Err(bad))) => {
+                    tracing::warn!(%path, ?bad, "VICTORY_KEYS_FILE rejected (left as .rejected): nothing pressed")
+                }
+                Err(e) if self.error.as_deref() != Some(&e.to_string()) => {
+                    tracing::warn!(%path, error = %e, "VICTORY_KEYS_FILE not taken, tried again each second");
+                    self.error = Some(e.to_string());
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// The script of `VICTORY_KEYS` (and `VICTORY_KEYS_FILE`), from when
+    /// input starts.
+    #[cfg(feature = "diagnostics")]
+    #[allow(clippy::type_complexity)]
+    static SCRIPT: LazyLock<Mutex<Option<(Instant, super::script::Script, Option<KeysFile>)>>> =
         LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let (presses, bad) = super::script::parse(&list);
             if !bad.is_empty() {
                 tracing::warn!(?bad, "VICTORY_KEYS entries not understood, left out");
             }
-            if presses.is_empty() {
+            let file = std::env::var_os("VICTORY_KEYS_FILE")
+                .filter(|p| !p.is_empty())
+                .map(|p| KeysFile {
+                    path: p.into(),
+                    checked: None,
+                    error: None,
+                });
+            if presses.is_empty() && file.is_none() {
                 return Mutex::new(None);
             }
             let need = std::env::var("VICTORY_KEYS_READS")
@@ -1325,11 +1376,13 @@ mod host {
             tracing::info!(
                 presses = presses.len(),
                 need,
-                "scripted keys (VICTORY_KEYS)"
+                file = ?file.as_ref().map(|f| f.path.display().to_string()),
+                "scripted keys (VICTORY_KEYS, VICTORY_KEYS_FILE)"
             );
             Mutex::new(Some((
                 Instant::now(),
                 super::script::Script::new(presses, need),
+                file,
             )))
         });
 
@@ -1337,7 +1390,7 @@ mod host {
     /// clock): it counts for the scripted keys down then.
     #[cfg(feature = "diagnostics")]
     pub(super) fn title_read(timestamp: u64) {
-        if let Some((_, script)) = super::lock(&SCRIPT).as_mut() {
+        if let Some((_, script, _)) = super::lock(&SCRIPT).as_mut() {
             script.read(timestamp, super::now());
         }
     }
