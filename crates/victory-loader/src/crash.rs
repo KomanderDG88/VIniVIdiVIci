@@ -197,6 +197,51 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
+/// The kinds of AMD-only instructions emulated ([`emulate_amd_only`]),
+/// counted in [`AMD_EMULATED`]: `clzero`, `monitorx`, `mwaitx`, `rdpru`, and
+/// the others (`clwb` and its loops, SSE4a).
+#[derive(Clone, Copy)]
+enum AmdKind {
+    Clzero,
+    Monitorx,
+    Mwaitx,
+    Rdpru,
+    Other,
+}
+
+/// AMD-only instructions emulated since the start, by [`AmdKind`]; each is
+/// an exception (about a microsecond, and a kernel round trip).
+static AMD_EMULATED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Counts one emulation and, at most every five seconds, says the counts
+/// per second since the last line, in every build: the measure that tells
+/// whether rewriting the sites (`VICTORY_PATCH_WAITS`, `VICTORY_PATCH_CLZERO`)
+/// can pay here (another project counted some 25,000 a second on Intel).
+/// One faulting thread wins the line (a compare-exchange on the time), so
+/// the others only count.
+fn note_amd(kind: AmdKind) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    AMD_EMULATED[kind as usize].fetch_add(1, Relaxed);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static BEFORE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let last = LAST_MS.load(Relaxed);
+    if now < last + 5_000 || LAST_MS.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let seconds = (now - last).max(1) as f64 / 1e3;
+    let rate = |k: usize| {
+        let total = AMD_EMULATED[k].load(Relaxed);
+        (total - BEFORE[k].swap(total, Relaxed)) as f64 / seconds
+    };
+    let [clzero, monitorx, mwaitx, rdpru, other] = [rate(0), rate(1), rate(2), rate(3), rate(4)];
+    tracing::info!(
+        "AMD-only instructions emulated per second: clzero {clzero:.0}, monitorx {monitorx:.0}, mwaitx {mwaitx:.0}, rdpru {rdpru:.0}, others {other:.0}; {:.0} in all",
+        clzero + monitorx + mwaitx + rdpru + other
+    );
+}
+
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
 /// line at `rax` (see [`clzero`] for the loops around it);
@@ -216,10 +261,17 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         }
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => return clzero(context),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
+            [0x0f, 0x01, 0xfc] => {
+                note_amd(AmdKind::Clzero);
+                return clzero(context);
+            }
+            [0x0f, 0x01, 0xfa] => note_amd(AmdKind::Monitorx),
+            [0x0f, 0x01, 0xfb] => {
+                note_amd(AmdKind::Mwaitx);
+                std::thread::yield_now();
+            }
             [0x0f, 0x01, 0xfd] => {
+                note_amd(AmdKind::Rdpru);
                 // Flags are left as they are: a Zen 3 changes none, for
                 // known counters or not (measured in user mode).
                 let known = context.Rcx as u32 <= 1;
@@ -244,9 +296,11 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     let flags = cmp_flags(end, limit);
                     context.EFlags = context.EFlags & !CMP_FLAGS | flags;
                     context.Rip += pass.len as u64;
+                    note_amd(AmdKind::Other);
                     return true;
                 }
                 if let Some(len) = clwb_len(&bytes[..n]) {
+                    note_amd(AmdKind::Other);
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
                     return true;
@@ -254,6 +308,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
+                note_amd(AmdKind::Other);
                 context.Rip += len as u64;
                 return true;
             }
