@@ -612,7 +612,7 @@ impl Host {
                         from: *at,
                         to: *at + *len,
                     },
-                    Step::Run(_) => Does::Run,
+                    Step::Run(..) => Does::Run,
                     Step::GpuWrite(..) | Step::Host(..) => continue,
                 });
                 steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
