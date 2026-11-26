@@ -41,6 +41,19 @@ pub(crate) struct GraphicsState {
     samples: DXGI_SAMPLE_DESC,
 }
 
+impl GraphicsState {
+    /// Whether these are a pass over the screen's pixels: no vertex input,
+    /// no depth or stencil test, triangles. The title fills its lighting
+    /// tables with such passes, once (`make::screen_workers`); their shaders
+    /// are few.
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+}
+
 impl Default for GraphicsState {
     fn default() -> Self {
         let target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -1236,6 +1249,51 @@ mod tests {
             t[0] = uint3(0, 1, 2);
         }";
     const PS: &str = "float4 main() : SV_Target { return 1; }";
+
+    /// A pass over the screen: triangles, no vertex input, and no depth or
+    /// stencil test (no depth view declared, or one with both tests off).
+    /// Anything else is not one.
+    #[test]
+    fn screen_passes_are_told_apart() {
+        let screen = || {
+            let mut g = GraphicsState::declaring(DXGI_FORMAT_R16G16_FLOAT.0);
+            g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            g
+        };
+        // No depth view (the default state's depth test is on, unused).
+        assert!(screen().screen_pass());
+        // A depth view with both tests off.
+        let mut g = screen();
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        g.depth.DepthEnable = false.into();
+        assert!(g.screen_pass());
+        // A depth view and the depth test on.
+        let mut g = screen();
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        assert!(!g.screen_pass());
+        // A depth view and the stencil test on.
+        let mut g = screen();
+        g.depth_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        g.depth.DepthEnable = false.into();
+        g.depth.StencilEnable = true.into();
+        assert!(!g.screen_pass());
+        // Vertex input.
+        let mut g = screen();
+        g.names = vec![c"POSITION".to_owned()];
+        g.inputs = vec![D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(g.names[0].as_ptr().cast()),
+            Format: DXGI_FORMAT_R32G32B32_FLOAT,
+            ..Default::default()
+        }];
+        assert!(!g.screen_pass());
+        // Not triangles.
+        let mut g = screen();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        assert!(!g.screen_pass());
+        let mut g = screen();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+        assert!(!g.screen_pass());
+    }
 
     /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
     fn dxc() -> Option<PathBuf> {

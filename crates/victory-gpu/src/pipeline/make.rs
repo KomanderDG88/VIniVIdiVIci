@@ -43,6 +43,12 @@ pub(crate) struct Pending {
     /// ([`for_formats`]): a chain from the title's pipeline, one link per
     /// set of formats met, never shortened.
     variant: OnceLock<Arc<Pending>>,
+    /// A pass over the screen ([`GraphicsState::screen_pass`]) with
+    /// [`screen_workers`] on: made by workers of its own, before the
+    /// others, and waited for within a budget of its own.
+    screen: bool,
+    /// When it began to be made (screen passes only: [`given_up`]).
+    begun: OnceLock<Instant>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -59,7 +65,10 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let screen = screen_workers() && graphics.as_ref().is_some_and(|g| g.screen_pass());
         Pending {
+            screen,
+            begun: OnceLock::new(),
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             shaders,
@@ -73,6 +82,9 @@ impl Pending {
     }
 
     fn make(&self) {
+        if self.screen {
+            let _ = self.begun.set(Instant::now());
+        }
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         let (lock, done) = &DONE;
@@ -236,18 +248,29 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Whether `p` is a screen pass the host's driver has been at for longer
+/// than [`SCREEN_BUDGET`]: no frame waits for it any more (a driver
+/// compile that never ends would otherwise cost every frame the whole
+/// budget). Never for other pipelines.
+fn given_up(p: &Pending) -> bool {
+    p.screen && p.begun.get().is_some_and(|at| at.elapsed() > SCREEN_BUDGET)
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
-    if budget.is_zero() {
+    if budget.is_zero() || given_up(p) {
         return;
     }
+    // Screen passes: a budget of their own, longer ([`screen_workers`]).
+    let budget = if p.screen { SCREEN_BUDGET } else { budget };
     // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    // taken by a thread waiting now); the second is the screen passes'.
+    static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    let frame_spent = &SPENTS[usize::from(p.screen)];
     let shared = shared_budget();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -263,17 +286,20 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !given_up(p) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
+        // A screen pass's wait is woken now and then to see whether it has
+        // been given up on.
+        let rest = if p.screen { rest.min(Duration::from_millis(250)) } else { rest };
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -299,6 +325,10 @@ const MAKING: u8 = 3;
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    /// Requested screen passes ([`screen_workers`]): before the others,
+    /// and the only work of the screen workers. Always empty with the
+    /// switch off.
+    screen: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -306,6 +336,7 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            screen: VecDeque::new(),
         }
     }
 
@@ -317,7 +348,9 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
+        if priority == REQUESTED && p.screen {
+            self.screen.push_back(p.clone());
+        } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
@@ -326,7 +359,7 @@ impl Queue {
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
+        let p = self.screen.pop_front().or_else(|| self.requested.pop_front()).or_else(|| {
             // An early entry can have been promoted and claimed already.
             std::iter::from_fn(|| self.early.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
@@ -334,10 +367,22 @@ impl Queue {
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
+
+    /// The next screen pass to make, if one is queued (the screen
+    /// workers' only work).
+    fn pop_screen(&mut self) -> Option<Arc<Pending>> {
+        let p = self.screen.pop_front()?;
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        Some(p)
+    }
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
+/// Signalled when a screen pass is queued: the screen workers wait on
+/// this, not on [`AVAILABLE`], so that they never take a wake-up meant for
+/// the other workers (a pipeline left queued with them all asleep).
+static SCREEN_AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -356,6 +401,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
+        if p.screen && priority == REQUESTED {
+            SCREEN_AVAILABLE.notify_one();
+        }
         AVAILABLE.notify_one();
     }
 }
@@ -369,6 +417,50 @@ fn next() -> Arc<Pending> {
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
+
+/// The next screen pass to make (the screen workers').
+fn next_screen() -> Arc<Pending> {
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some(p) = queue.pop_screen() {
+            return p;
+        }
+        queue = SCREEN_AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Whether passes over the screen (no vertex input, no depth or stencil
+/// test: [`GraphicsState::screen_pass`]) have workers and a wait budget of
+/// their own: `VICTORY_SCREEN_WORKERS=1` (off by default; unset, pipelines
+/// are made and waited for exactly as before).
+///
+/// Why: the title fills its lighting tables (`PS_IntegrateEnvBRDF*`,
+/// `PS_AreaLightIlluminance`) with draws it makes ONCE, at the world's
+/// first frame. Behind a world's worth of pipelines to make (hundreds) they
+/// waited past the frame's budget and were dropped, and never drawn again:
+/// no diffuse light, a grey, sepia picture (white bloom indoors). With it,
+/// two workers of their own make such pipelines first (the others take
+/// them first too), and a draw with one waits up to [`SCREEN_BUDGET`] in a
+/// frame instead of being dropped after the usual budget.
+///
+/// Risk: a hitch of up to 12 s in a frame (on first entering the world,
+/// with an empty pipeline cache) while those pipelines are made; and two
+/// more threads compiling at normal priority beside the title's.
+/// It changes only which pipelines are made first and how long a frame
+/// waits for them, never what a draw does.
+///
+/// Adapted from ZigZagBoi1/ScarlettPort runtime/victory (fx-cand4, commit
+/// 549daebc; Belobug 18e57db), where it is on by default.
+fn screen_workers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCREEN_WORKERS").is_some_and(|v| v == "1"))
+}
+
+/// Waiting allowed per title frame for screen passes ([`screen_workers`]),
+/// below the title's 30 s GPU watchdog with the usual budget beside it
+/// (also how long the driver may be at one before no frame waits for it:
+/// [`given_up`]).
+const SCREEN_BUDGET: Duration = Duration::from_secs(12);
 
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
 fn workers() -> bool {
@@ -386,6 +478,28 @@ fn workers() -> bool {
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)));
         let normal = std::env::var_os("VICTORY_PIPELINE_NORMAL").is_some_and(|v| v == "1");
         tracing::info!(workers, normal, "host pipeline workers");
+        // Two of their own for screen passes ([`screen_workers`]), at
+        // normal priority: their pipelines are few, and a frame waits for
+        // them.
+        let screen = if screen_workers() { 2 } else { 0 };
+        if screen > 0 {
+            tracing::info!(screen, "host pipeline workers for screen passes (VICTORY_SCREEN_WORKERS=1)");
+        }
+        for i in 0..screen {
+            let spawned = std::thread::Builder::new()
+                .name(format!("victory-pipelines-screen-{i}"))
+                .spawn(|| {
+                    loop {
+                        next_screen().make();
+                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                            drained();
+                        }
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "no screen pass pipeline worker");
+            }
+        }
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -510,5 +624,54 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    /// A requested screen pass is made before the other requested
+    /// pipelines, by any worker, and is the screen workers' only work; one
+    /// queued early goes to them when a draw requests it.
+    #[test]
+    fn screen_passes_come_first_and_alone_to_their_workers() {
+        let screen = || {
+            let mut p = Pending::new(Vec::new(), None);
+            p.screen = true;
+            Arc::new(p)
+        };
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let (first, promoted) = (screen(), screen());
+        let mut queue = Queue::new();
+
+        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
+        assert_eq!(queue.push(&promoted, EARLY), Some(true));
+        assert_eq!(queue.push(&first, REQUESTED), Some(true));
+        // The other workers: the screen pass before what was asked first.
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &first));
+        // The screen workers: no other work, nor an unrequested screen pass.
+        assert!(queue.pop_screen().is_none());
+        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop_screen().unwrap(), &promoted));
+        assert_eq!(promoted.queue_state.load(Ordering::Relaxed), MAKING);
+        assert!(queue.pop_screen().is_none());
+        // Its early entry is not made again.
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
+        assert!(queue.pop().is_none());
+    }
+
+    /// Only a screen pass is given up on, and only once the driver has been
+    /// at it for longer than its budget.
+    #[test]
+    fn only_slow_screen_passes_are_given_up_on() {
+        let old = Instant::now().checked_sub(SCREEN_BUDGET + Duration::from_secs(1));
+        let Some(old) = old else { return };
+        let mut p = Pending::new(Vec::new(), None);
+        assert!(!given_up(&p));
+        p.begun.set(old).unwrap();
+        assert!(!given_up(&p));
+        p.screen = true;
+        assert!(given_up(&p));
+        let mut q = Pending::new(Vec::new(), None);
+        q.screen = true;
+        assert!(!given_up(&q));
+        q.begun.set(Instant::now()).unwrap();
+        assert!(!given_up(&q));
     }
 }
