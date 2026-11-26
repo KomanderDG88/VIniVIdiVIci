@@ -274,7 +274,23 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    let kept = card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed));
+    kept.min(card_room_kept_most())
+}
+
+/// The most bytes [`card_room_kept`] keeps: `VICTORY_CARD_ROOM_KEPT_MB`
+/// (not set, or 0: no cap, as before). From ZigZagBoi1/ScarlettPort's
+/// runtime (v0.4.2, default 512 there): with `VICTORY_CARD_BUFFERS_MB=4096`
+/// the queue kept 3,731 MB for copies never made, took the card for full,
+/// and 2,162 texture slots waited 1,588 frames. Here the limit is 1,024 MB
+/// by default, so the cap only bites below that: on an 8 GB card it gives
+/// the textures back the room kept for copies that do not come.
+fn card_room_kept_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| match std::env::var("VICTORY_CARD_ROOM_KEPT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(mb) if mb > 0 => mb << 20,
+        _ => u64::MAX,
+    })
 }
 
 /// The copies in the card's memory.
