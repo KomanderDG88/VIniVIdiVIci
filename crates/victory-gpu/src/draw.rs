@@ -1565,6 +1565,10 @@ impl State {
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
     fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+        // `VICTORY_BVH_NAMED_WRITES=1`: a builder stage declares written
+        // only the copies its root arguments name (`memory` module).
+        let named_only =
+            crate::memory::named_writes() && crate::pipeline::is_builder(self.pipeline as This);
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -1577,7 +1581,7 @@ impl State {
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        crate::memory::ready(list, heap, &addresses, &constants, writes, named_only)
     }
 
     /// The bound heap holding `handle`.
