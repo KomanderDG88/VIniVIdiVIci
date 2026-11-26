@@ -686,7 +686,7 @@ pub(crate) fn tables_line(frames: f64) {
         why[1],
         why[2],
         why[3],
-        crate::descriptor::host::DYNAMIC,
+        crate::descriptor::host::DYNAMIC_SLOTS.load(Ordering::Relaxed),
     );
 }
 

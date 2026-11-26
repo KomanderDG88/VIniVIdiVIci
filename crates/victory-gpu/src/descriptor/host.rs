@@ -94,9 +94,11 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
+    /// Dynamic slots past `count`: [`dynamic_slots`] in view heaps
+    /// ([`DYNAMIC`] unless `VICTORY_DYNAMIC_SLOTS` gives more), none in
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
-    /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
+    /// ours keeps 2^18 there at least: 2^16 and 2^17 both ran out in this
+    /// title.)
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -205,6 +207,12 @@ pub(crate) static DYNAMIC_WHY: [std::sync::atomic::AtomicU64; 4] = [const { std:
 /// since the last line (`u32::MAX`: it was not called).
 #[cfg(feature = "diagnostics")]
 pub(crate) static DYNAMIC_LOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Diagnostics: the most dynamic slots a view heap was made with
+/// ([`dynamic_slots`]; [`DYNAMIC`] unless `VICTORY_DYNAMIC_SLOTS` gives
+/// more).
+#[cfg(feature = "diagnostics")]
+pub(crate) static DYNAMIC_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(DYNAMIC);
 
 /// Takes `lock`. Diagnostics builds count a take that finds it held in
 /// [`LOCKS`]`[at]` and add the nanoseconds it then waits to `[at + 1]`.
@@ -1063,8 +1071,58 @@ pub(crate) fn probe_view_limit() {
 /// cutscene (a frame asks for up to 16,000 tables while the frame before
 /// still holds its own; a draw refused its table read slots never made
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
-/// table past them is made afresh in these slots like any other.
+/// table past them is made afresh in these slots like any other. The
+/// fewest a view heap has ([`dynamic_slots`]: `VICTORY_DYNAMIC_SLOTS` may
+/// give it more), and the longest table one makes.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
+
+/// The dynamic slots of a view heap of `count` title slots whose null slot
+/// is `null` (0: none), read once from `VICTORY_DYNAMIC_SLOTS`
+/// ([`dynamic_slots_for`]). Unset: [`DYNAMIC`] on every host, as before.
+fn dynamic_slots(count: u32, null: u32) -> u32 {
+    static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        std::env::var("VICTORY_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+    });
+    let slots = dynamic_slots_for(count, null, asked);
+    if slots != DYNAMIC {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                slots,
+                title_in_place = null.saturating_sub(slots),
+                "dynamic descriptor slots past the title's (VICTORY_DYNAMIC_SLOTS)"
+            )
+        });
+    }
+    slots
+}
+
+/// [`DYNAMIC`] or more for a view heap of `count` title slots whose null
+/// slot is `null`, `asked` being `VICTORY_DYNAMIC_SLOTS` (`None`: unset,
+/// [`DYNAMIC`] whatever the heap).
+///
+/// On a host heap capped at [`PORTABLE_VIEWS`] (NVIDIA; `null` below it)
+/// the dynamic slots come out of the title's slots kept in place (the
+/// title's heap has 1,245,184; tables reaching past those kept are made
+/// afresh in the dynamic ones anyway): `asked`, at least [`DYNAMIC`] and at
+/// most half the heap. 2^18 there ran out with the fast settings
+/// (trustno1-coder/VIctory-NVIDIA a9632bc: 1,100-4,800 of 12,000-16,600
+/// tables a frame refused, each a dropped draw; 524,288 asked, which is
+/// 499,999 here, left 0-33). Elsewhere (a heap that takes more, AMD) they
+/// come out of the room between the title's slots and the null slot:
+/// `asked` at most, never fewer than [`DYNAMIC`].
+fn dynamic_slots_for(count: u32, null: u32, asked: Option<u32>) -> u32 {
+    let Some(asked) = asked else { return DYNAMIC };
+    if null < PORTABLE_VIEWS {
+        // (`clamp` would panic on a heap too small for `DYNAMIC` twice;
+        // that keeps `DYNAMIC`, as before.)
+        return asked.min(null / 2).max(DYNAMIC);
+    }
+    null.saturating_sub(count).min(asked).max(DYNAMIC)
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -1086,7 +1144,6 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -1098,6 +1155,11 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        #[cfg(feature = "diagnostics")]
+        if !sampler {
+            DYNAMIC_SLOTS.fetch_max(extra, std::sync::atomic::Ordering::Relaxed);
+        }
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -1163,8 +1225,8 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -1336,7 +1398,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -4410,6 +4472,56 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// The title's view heap in the retail game.
+    const TITLE_VIEWS: u32 = 1_245_184;
+
+    /// `VICTORY_DYNAMIC_SLOTS` unset: 2^18 on every host and for every
+    /// heap, as before it was read.
+    #[test]
+    fn dynamic_slots_unset_are_as_before() {
+        for null in [0, PORTABLE_VIEWS - 1, UNCAPPED_VIEWS - 1] {
+            for count in [0, 4, 720_000, TITLE_VIEWS, 2_000_000] {
+                assert_eq!(dynamic_slots_for(count, null, None), DYNAMIC, "{count} title slots, null {null}");
+            }
+        }
+        assert_eq!(DYNAMIC, 1 << 18);
+    }
+
+    /// A host heap capped at 1,000,000 views (NVIDIA) with the title's
+    /// 1,245,184 slots: what is asked, at least 2^18 and at most half the
+    /// heap (524,288 asked, as trustno1-coder's launcher sets it: 499,999,
+    /// and 500,000 of the title's slots kept in place).
+    #[test]
+    fn dynamic_slots_on_a_capped_heap_are_at_most_half_of_it() {
+        let null = PORTABLE_VIEWS - 1;
+        let slots = |asked| dynamic_slots_for(TITLE_VIEWS, null, Some(asked));
+        assert_eq!(slots(524_288), 499_999);
+        assert_eq!(null - slots(524_288), 500_000);
+        assert_eq!(slots(300_000), 300_000);
+        assert_eq!(slots(u32::MAX), 499_999);
+        assert_eq!(slots(1 << 16), DYNAMIC);
+        assert_eq!(slots(0), DYNAMIC);
+        // A heap too small for 2^18 twice keeps 2^18 (no panic).
+        assert_eq!(dynamic_slots_for(4, 0, Some(524_288)), DYNAMIC);
+        assert_eq!(dynamic_slots_for(4, 300_000, Some(524_288)), DYNAMIC);
+    }
+
+    /// A host heap that takes more (AMD, 2^21 views): what is asked, at
+    /// most the room between the title's slots and the null slot, never
+    /// fewer than 2^18.
+    #[test]
+    fn dynamic_slots_on_an_uncapped_heap_take_the_room_past_the_title() {
+        let null = UNCAPPED_VIEWS - 1;
+        let room = null - TITLE_VIEWS;
+        assert_eq!(room, 851_967);
+        let slots = |asked| dynamic_slots_for(TITLE_VIEWS, null, Some(asked));
+        assert_eq!(slots(524_288), 524_288);
+        assert_eq!(slots(1 << 20), room);
+        assert_eq!(slots(1 << 16), DYNAMIC);
+        // No room past the title's slots: 2^18 still.
+        assert_eq!(dynamic_slots_for(2_000_000, null, Some(1 << 20)), DYNAMIC);
     }
 }
 
