@@ -3126,6 +3126,12 @@ pub(crate) fn late() -> bool {
     late_stage() > 0
 }
 
+/// Whether [`card_steps`] is on (`VICTORY_CARD_STEPS` 1 or 2), for the
+/// other modules: they do some of their work otherwise with it.
+pub(crate) fn card_steps_on() -> bool {
+    card_steps::stage() > 0
+}
+
 /// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
@@ -5715,7 +5721,16 @@ impl Host {
                                 w.ranges.iter().map(|&(a, b)| w.shadow.card_run(a, b)).collect()
                             };
                             // The same pieces in fewer passes (`rehash_runs`).
-                            let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            // Always so with [`card_steps`]: the title's ring
+                            // of constants, merged under flights' writes,
+                            // sends up hundreds of short ranges a frame,
+                            // several in one 64 KiB piece, and each had a
+                            // pass of its own over that piece.
+                            let runs = if rehash_runs() || card_steps::stage() > 0 {
+                                crate::shadow::joined_piece_runs(runs)
+                            } else {
+                                runs
+                            };
                             CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                             CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                             for run in runs {

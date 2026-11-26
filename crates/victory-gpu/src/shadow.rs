@@ -2252,6 +2252,107 @@ fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Notes the runs `(r, m)` of `runs`, at `at + r`, in a copy's changed
+/// ranges `dirty` as [`Shadow::card_changed`] notes one range: joined with
+/// the last range where they overlap or touch it, else after it. Whether
+/// `dirty` went from empty to holding a range.
+fn note_runs(dirty: &mut Vec<(usize, usize)>, at: usize, runs: &[(usize, usize)]) -> bool {
+    let mut first = false;
+    for &(r, m) in runs {
+        let (from, to) = (at + r, at + r + m);
+        if from >= to {
+            continue;
+        }
+        first |= dirty.is_empty();
+        match dirty.last_mut() {
+            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+            _ => dirty.push((from, to)),
+        }
+    }
+    first
+}
+
+/// Puts the bytes of `now` of each run `(r, m)` of `runs` into `held`, and
+/// nothing between them; the bytes put.
+fn put_runs(held: &mut [u8], now: &[u8], runs: &[(usize, usize)]) -> usize {
+    let mut bytes = 0;
+    for &(r, m) in runs {
+        held[r..r + m].copy_from_slice(&now[r..r + m]);
+        bytes += m;
+    }
+    bytes
+}
+
+#[cfg(test)]
+mod note_runs_tests {
+    use super::{changed_runs, note_runs, put_runs};
+
+    /// [`super::Shadow::card_changed`]'s noting, one range at a time.
+    fn one_by_one(dirty: &mut Vec<(usize, usize)>, at: usize, runs: &[(usize, usize)]) -> bool {
+        let mut went = false;
+        for &(r, m) in runs {
+            let (from, to) = (at + r, at + r + m);
+            if from >= to {
+                continue;
+            }
+            let first = dirty.is_empty();
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
+            }
+            went |= first;
+        }
+        went
+    }
+
+    /// The runs of a page noted at once leave the same changed ranges, and
+    /// the same answer to whether the list went from empty, as noted one
+    /// by one.
+    #[test]
+    fn runs_noted_at_once_are_noted_as_one_by_one() {
+        let starts: [Vec<(usize, usize)>; 4] = [vec![], vec![(0, 8)], vec![(100, 4096)], vec![(10, 20), (4096, 4100)]];
+        let pages: [Vec<(usize, usize)>; 5] = [
+            vec![],
+            vec![(0, 1)],
+            vec![(0, 4), (4, 2), (9, 1), (4000, 96)],
+            vec![(3, 5), (100, 0), (200, 7)],
+            vec![(0, 4096)],
+        ];
+        for start in &starts {
+            for page in &pages {
+                for at in [0usize, 4, 4096, 8192] {
+                    let (mut a, mut b) = (start.clone(), start.clone());
+                    assert_eq!(note_runs(&mut a, at, page), one_by_one(&mut b, at, page), "{start:?} {page:?} at {at}");
+                    assert_eq!(a, b, "{start:?} {page:?} at {at}");
+                }
+            }
+        }
+    }
+
+    /// Only the bytes of the runs are put; every byte between them keeps
+    /// what the copy held (the card may hold a shader's newer byte there).
+    #[test]
+    fn only_the_bytes_of_the_runs_are_put() {
+        let was: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
+        let mut now = was.clone();
+        for i in [0usize, 1, 2, 50, 52, 53, 299] {
+            now[i] = !now[i];
+        }
+        let runs = changed_runs(&now, &was);
+        let mut held = was.clone();
+        assert_eq!(put_runs(&mut held, &now, &runs), 7);
+        assert_eq!(held, now, "every changed byte put");
+        // Runs that leave out a changed byte leave it as the copy held it.
+        let some = [(0usize, 3usize), (299, 1)];
+        let mut held = was.clone();
+        assert_eq!(put_runs(&mut held, &now, &some), 4);
+        for (i, &byte) in held.iter().enumerate() {
+            let inside = some.iter().any(|&(r, m)| (r..r + m).contains(&i));
+            assert_eq!(byte, if inside { now[i] } else { was[i] }, "byte {i}");
+        }
+    }
+}
+
 /// The gap, in bytes, over which the title bytes put into a copy in the
 /// card's memory under flights' shader writes are joined into one run
 /// (`VICTORY_MERGE_GAP`, 0 to 64; 0 by default: only the bytes the title
@@ -4025,11 +4126,24 @@ impl Shadow {
                         return true;
                     }
                     *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    if crate::host::card_steps_on() {
+                        // With `VICTORY_CARD_STEPS` the pages of the title's
+                        // ring of constants come here too, hundreds of
+                        // short runs each: the same bytes into the CPU
+                        // side, and the same ranges noted for the card in
+                        // one lock of its list, not one a run
+                        // ([`Shadow::card_changed_runs`]).
+                        let bytes = put_runs(held, title, &runs);
+                        self.card_changed_runs(at, &runs);
+                        MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                        MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
+                    } else {
+                        for (r, m) in runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.card_changed(at + r, at + r + m);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -4587,6 +4701,26 @@ impl Shadow {
         // From none to some: [`card_dirty`] finds the copy in the list. (A
         // copy changed again before its ranges are taken is in it already;
         // one whose ranges the walk took may be in it with nothing to take.)
+        if first
+            && changed_kept()
+            && let Some(me) = card.me.get()
+        {
+            CHANGED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
+    }
+
+    /// [`Shadow::card_changed`] of `[at + r, at + r + m)` for each run
+    /// `(r, m)` of `runs` (in order), in one lock of the changed ranges
+    /// instead of one a run: the ranges noted, and whether the copy goes
+    /// into [`CHANGED`], come out the same ([`note_runs`]). For
+    /// [`Shadow::merge_under_writes`] with `VICTORY_CARD_STEPS`.
+    fn card_changed_runs(&self, at: usize, runs: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let first = note_runs(&mut dirty, at, runs);
+        drop(dirty);
         if first
             && changed_kept()
             && let Some(me) = card.me.get()
