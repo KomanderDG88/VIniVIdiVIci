@@ -3612,7 +3612,7 @@ impl State {
             return;
         }
         // A skinning pass only for structures nothing builds.
-        if crate::pipeline::skips_rt_skin(self.pipeline as This) {
+        if crate::pipeline::skips_rt_skin(self.pipeline as This, false) {
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
@@ -4682,7 +4682,7 @@ impl State {
             return false;
         }
         // A skinning pass only for structures nothing builds.
-        if crate::pipeline::skips_rt_skin(self.pipeline as This) {
+        if crate::pipeline::skips_rt_skin(self.pipeline as This, true) {
             return false;
         }
         // A program that walks ray-tracing structures nothing has built:

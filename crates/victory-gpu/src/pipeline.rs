@@ -479,19 +479,49 @@ fn rt_skin_skip_on() -> bool {
 /// it only feeds the ray-tracing structures nothing builds
 /// ([`rt_skin_skip_mode`]; with `alt` only in an ON turn).
 #[cfg(windows)]
-pub(crate) fn skips_rt_skin(this: This) -> bool {
+pub(crate) fn skips_rt_skin(this: This, indirect: bool) -> bool {
     if this.is_null() || !pipeline(this).rt_skin {
         return false;
     }
-    if rt_skin_skip_mode() != 2 {
-        return true;
+    let skip = if rt_skin_skip_mode() != 2 {
+        true
+    } else {
+        static TURN: crate::AltTurn = crate::AltTurn::new();
+        TURN.on(
+            "dispatches of bvh_skinning programs are left out",
+            "VICTORY_RT_SKIN_SKIP",
+            "off, run as usual",
+        )
+    };
+    #[cfg(feature = "diagnostics")]
+    RT_SKIN_DISPATCHES[usize::from(!skip) * 2 + usize::from(indirect)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = indirect;
+    skip
+}
+
+/// bvh_skinning pipelines known so far ([`skins_for_rays`]).
+#[cfg(feature = "diagnostics")]
+static RT_SKIN_PIPELINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dispatches of bvh_skinning pipelines since the last frame line: left
+/// out direct, left out indirect, run direct, run indirect (run: in the
+/// off turns of `=alt`).
+#[cfg(feature = "diagnostics")]
+static RT_SKIN_DISPATCHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The frame line's part of [`skips_rt_skin`]: per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn rt_skin_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [left_direct, left_indirect, ran_direct, ran_indirect] = RT_SKIN_DISPATCHES.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames.max(1.0));
+    if rt_skin_skip_mode() == 0 {
+        return;
     }
-    static TURN: crate::AltTurn = crate::AltTurn::new();
-    TURN.on(
-        "dispatches of bvh_skinning programs are left out",
-        "VICTORY_RT_SKIN_SKIP",
-        "off, run as usual",
-    )
+    tracing::info!(
+        "bvh_skinning dispatches per frame (VICTORY_RT_SKIN_SKIP): left out {left_direct:.1} direct, {left_indirect:.1} indirect; run {ran_direct:.1} direct, {ran_indirect:.1} indirect (the off turns of alt); {} such pipelines known",
+        RT_SKIN_PIPELINES.load(Relaxed)
+    );
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -831,10 +861,19 @@ fn hand_out(
         #[cfg(windows)]
         builder,
         #[cfg(windows)]
-        rt_skin: rt_skin_skip_on()
-            && shaders
-                .iter()
-                .any(|s| s.stage == "compute" && skins_for_rays(&s.container)),
+        rt_skin: {
+            let skin = rt_skin_skip_on()
+                && shaders
+                    .iter()
+                    .any(|s| s.stage == "compute" && skins_for_rays(&s.container));
+            #[cfg(feature = "diagnostics")]
+            if skin {
+                let n = RT_SKIN_PIPELINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let hash = shaders.iter().find(|s| s.stage == "compute").map_or("", |s| s.hash.as_str());
+                tracing::info!(shader = hash, so_far = n, "a bvh_skinning program known (VICTORY_RT_SKIN_SKIP): its dispatches can be left out");
+            }
+            skin
+        },
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
