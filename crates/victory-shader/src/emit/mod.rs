@@ -101,6 +101,7 @@ mod rect;
 mod sampler;
 mod shader;
 mod threading;
+mod ticket;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
