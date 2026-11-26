@@ -2740,6 +2740,16 @@ fn card_compare_groups_as(wide: bool, pieces: u32) -> u32 {
     if wide { pieces } else { pieces.div_ceil(64) }
 }
 
+/// Whether the compares of ranges of one copy in the card's memory whose
+/// pieces and result places follow each other go in one pass
+/// (`VICTORY_CARD_COMPARE_JOIN=0`: a pass each). Some 390 compare passes a
+/// frame walking in the prison there, each one dispatch. From
+/// edsuuu/VI-BR-PORT 2f59f1df (GPL-3.0).
+fn compare_join() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COMPARE_JOIN").is_none_or(|v| v != "0"))
+}
+
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
 /// only with [`relay`]).
@@ -5851,18 +5861,47 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&compare_pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    // Ranges of one copy whose pieces and result places follow
+                    // each other go in one pass, while its groups stay within
+                    // one dispatch (`VICTORY_CARD_COMPARE_JOIN=0`: a pass each).
+                    let join = compare_join();
+                    let mode = if flown { 2 } else { 1 };
+                    // (buffer, hashes, bytes hashed, span, first result place)
+                    let mut pending: Option<(u64, u64, u32, crate::shadow::CardSpan, u32)> = None;
+                    let flush = |p: Option<(u64, u64, u32, crate::shadow::CardSpan, u32)>| {
+                        if let Some((buffer, before, hashed, span, at)) = p {
+                            let constants = [span.first, span.skew, hashed, span.pieces, at * 4, mode];
+                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                            list.SetComputeRootShaderResourceView(1, buffer);
+                            list.SetComputeRootUnorderedAccessView(2, before);
+                            list.Dispatch(card_compare_groups_as(wide, span.pieces), 1, 1);
+                            CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                    };
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
                         let hashed = r.shadow.card_hashed().unwrap_or(size) as u32;
-                        let constants = [r.span.first, r.span.skew, hashed, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(card_compare_groups_as(wide, r.span.pieces), 1, 1);
-                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        let (buffer, before_at) = (r.shadow.buffer.GetGPUVirtualAddress(), before.GetGPUVirtualAddress());
+                        if join
+                            && let Some((b, h, s, span, at)) = pending.as_mut()
+                            && *b == buffer
+                            && *h == before_at
+                            && *s == hashed
+                            && span.skew == r.span.skew
+                            && span.first + span.pieces == r.span.first
+                            && *at + span.pieces == r.at
+                            && card_compare_groups_as(wide, span.pieces + r.span.pieces) <= 65535
+                        {
+                            span.pieces += r.span.pieces;
+                            span.to = r.span.to;
+                            continue;
+                        }
+                        flush(pending.take());
+                        pending = Some((buffer, before_at, hashed, r.span, r.at));
                     }
+                    flush(pending.take());
                     // The fetch inside the flight (`inflight_fetch`): behind
                     // every compare of the list, the pieces they flagged go
                     // to slots in the PC's memory.
