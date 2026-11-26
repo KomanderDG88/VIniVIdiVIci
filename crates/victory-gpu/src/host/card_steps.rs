@@ -1105,13 +1105,16 @@ mod tests {
     }
 
     /// The whole way, in a process of its own with the relay on:
-    /// `VICTORY_RELAY=2 VICTORY_CARD_STEPS=2 cargo test -p victory-gpu --lib
-    /// card_steps -- --ignored --test-threads=1`. A flight's list writes
-    /// part of what the next submission's copy reads, the title wrote the
-    /// rest; the copy is done on the card behind the flight, and a second
-    /// one reads what the first wrote. Title memory ends as on the CPU.
+    /// `VICTORY_RELAY=2 VICTORY_CARD_STEPS=2 VICTORY_FILL_WAIT=1 cargo test
+    /// -p victory-gpu --lib card_steps -- --ignored --test-threads=1`. A
+    /// flight's list writes part of what the next submission's copy reads,
+    /// the title wrote the rest; the copy is done on the card behind the
+    /// flight, and a second one reads what the first wrote. Title memory
+    /// ends as on the CPU. (`VICTORY_FILL_WAIT=1`: in this tree a copy that
+    /// only reads what flights may write is read ahead of them by default,
+    /// `fill_ahead`, and then neither waits nor is done on the card.)
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_CARD_STEPS=2 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_CARD_STEPS=2 VICTORY_FILL_WAIT=1 and a process of its own"]
     fn a_copy_behind_a_flight_reads_what_the_flight_wrote() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         const LEN: usize = 4 << 20;
@@ -1123,6 +1126,7 @@ mod tests {
             return;
         };
         assert!(relay_exact() && stage() == 2, "set VICTORY_RELAY=2 VICTORY_CARD_STEPS=2");
+        assert!(!fill_ahead::on(), "set VICTORY_FILL_WAIT=1");
         // Two title buffers: in the first a copy within it, from it into the
         // second, and back.
         let (title, start) = {
@@ -1224,5 +1228,36 @@ mod tests {
         eprintln!("{done} of 48 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
         eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));
         assert!(done >= 20, "only {done} copies were done on the card");
+    }
+
+    /// Without `VICTORY_CARD_STEPS` nothing of this is asked: no list of
+    /// ours, no copies in the air, and `blocked_by` is given no ranges of
+    /// them, so a submission waits for flights, or reads ahead of them
+    /// (`fill_ahead`), exactly as before the port.
+    #[test]
+    fn unset_changes_nothing() {
+        if std::env::var_os("VICTORY_CARD_STEPS").is_some() {
+            return; // (set for the test above)
+        }
+        assert_eq!(stage(), 0);
+        assert!(copies(&line()).is_empty());
+        assert!(copied_ranges(&line()).is_empty());
+        if let Some(host) = host() {
+            assert!(host.card_steps(&[]).is_none());
+        }
+        // With no copies in the air, what stops a fill or a copy is what
+        // stopped it before: `blocked_by`'s old tests, written out.
+        let written = [(100, 200), (300, 400)];
+        for (src, len) in [(0, 50), (90, 20), (150, 10), (199, 101), (250, 50), (400, 8), (0, 0)] {
+            let read = touches(&written, src, src + len) && !fill_ahead::on();
+            assert_eq!(read_blocked(&written, &[], src, len), read, "{src} {len}");
+            for dst in [0, 120, 260, 395, 500] {
+                let old = (touches(&written, src, src + len) && !fill_ahead::on()) || touches(&written, dst, dst + len);
+                assert_eq!(copy_blocked(&written, &[], dst, src, len).is_some(), old, "{dst} {src} {len}");
+            }
+        }
+        // And a copy done on the card is never read ahead where it writes.
+        assert!(read_blocked(&written, &[(150, 160)], 155, 2));
+        assert!(!read_blocked(&written, &[(150, 160)], 0, 50));
     }
 }
