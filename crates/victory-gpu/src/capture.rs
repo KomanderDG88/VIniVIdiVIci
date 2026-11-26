@@ -2,6 +2,14 @@
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size. Only in builds with diagnostics.
+//!
+//! At time intervals too, for image tests: `VICTORY_CAPTURE_EVERY_MS=<ms>`
+//! saves a presented frame whenever that many ms or more have passed since
+//! the last one so saved, as `frame-<n>-t<secs>.png` (`<secs>`, with three
+//! decimals, counted from the first of them: the first world frame's
+//! successor with `VICTORY_CAPTURE_WORLD`, else the first frame), at most
+//! `VICTORY_CAPTURE_MAX` of them a run (120 unless said).
+//! `VICTORY_CAPTURE_PO2=0` leaves out the powers of two.
 
 use std::path::PathBuf;
 
@@ -170,8 +178,101 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     }
 }
 
+/// Whether the powers of two are saved (`VICTORY_CAPTURE_PO2`, 1 unless
+/// said; 0 leaves them out).
+fn po2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CAPTURE_PO2").ok().is_none_or(|v| v.trim() != "0"))
+}
+
+/// `VICTORY_CAPTURE_EVERY_MS` and `VICTORY_CAPTURE_MAX`.
+struct Every {
+    gap: std::time::Duration,
+    max: u32,
+}
+
+fn every() -> Option<&'static Every> {
+    static EVERY: std::sync::OnceLock<Option<Every>> = std::sync::OnceLock::new();
+    EVERY
+        .get_or_init(|| {
+            let ms: u64 = std::env::var("VICTORY_CAPTURE_EVERY_MS").ok()?.trim().parse().ok().filter(|&ms| ms > 0)?;
+            let max = std::env::var("VICTORY_CAPTURE_MAX").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120);
+            Some(Every { gap: std::time::Duration::from_millis(ms), max })
+        })
+        .as_ref()
+}
+
+/// The interval captures so far: when the clock started and the last one
+/// was taken, how many were, and the last frame decided (with its seconds,
+/// if it is one: [`wanted`] asks several times a frame).
+struct Clock {
+    start: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    taken: u32,
+    frame: u64,
+    secs: Option<f64>,
+}
+
+static CLOCK: std::sync::Mutex<Clock> =
+    std::sync::Mutex::new(Clock { start: None, last: None, taken: 0, frame: 0, secs: None });
+
+/// With `VICTORY_CAPTURE_EVERY_MS`: whether frame `n` is an interval
+/// capture, as its seconds since the first one. Decided at the first call
+/// of a frame; later calls of the same frame give the same answer.
+fn interval(n: u64) -> Option<f64> {
+    let every = every()?;
+    let mut clock = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if n == clock.frame {
+        return clock.secs;
+    }
+    if n < clock.frame {
+        return None;
+    }
+    clock.frame = n;
+    clock.secs = None;
+    if clock.taken >= every.max {
+        return None;
+    }
+    if world_on() {
+        let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+        if first == u64::MAX || n <= first {
+            return None;
+        }
+    }
+    let now = std::time::Instant::now();
+    let start = *clock.start.get_or_insert(now);
+    if clock.last.is_some_and(|last| now.duration_since(last) < every.gap) {
+        return None;
+    }
+    clock.last = Some(now);
+    clock.taken += 1;
+    if clock.taken == every.max {
+        tracing::info!(frame = n, max = every.max, "the last interval capture (VICTORY_CAPTURE_MAX)");
+    }
+    clock.secs = Some(now.duration_since(start).as_secs_f64());
+    clock.secs
+}
+
+/// The seconds of frame `n` if [`interval`] made it an interval capture
+/// (without deciding anything).
+fn interval_secs(n: u64) -> Option<f64> {
+    every()?;
+    let clock = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if clock.frame == n { clock.secs } else { None }
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    if folder().is_none() {
+        return false;
+    }
+    // Decided first, so that every frame is looked at by the clock.
+    let timed = interval(n).is_some();
+    timed || wanted_untimed(n)
+}
+
+/// [`wanted`] but for the interval captures.
+fn wanted_untimed(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
@@ -180,17 +281,36 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && (po2_on() && n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
-/// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
+/// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`:
+/// `frame-<n>.png`, and `frame-<n>-t<secs>.png` if it is an interval
+/// capture (both if it is saved for both reasons).
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    if folder().is_none() {
+        return;
+    }
+    let png = half_png(width, height, pitch, bgra, rows);
+    let timed = interval_secs(n);
+    if let Some(secs) = timed {
+        write_png(&format!("frame-{n}-t{secs:.3}"), &png);
+    }
+    if timed.is_none() || wanted_untimed(n) {
+        write_png(&format!("frame-{n}"), &png);
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    let Some(folder) = folder() else { return };
+    if folder().is_none() {
+        return;
+    }
+    write_png(name, &half_png(width, height, pitch, bgra, rows));
+}
+
+/// 8-bit RGBA or BGRA rows as a PNG at half size.
+fn half_png(width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) -> Vec<u8> {
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -217,6 +337,12 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// Writes `png` to the capture folder as `<name>.png`.
+fn write_png(name: &str, png: &[u8]) {
+    let Some(folder) = folder() else { return };
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
