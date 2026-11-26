@@ -729,8 +729,15 @@ fn holds(bytes: &[u8], name: &[u8]) -> bool {
 ///   `VICTORY_BVH_NO_HIT=1`, under which every ray misses anyway;
 ///   `VICTORY_BVH_HOLD` already holds back the programs whose code walks
 ///   the structures.
+/// - `VICTORY_SKIP_RT_SHADOW`: the ray-traced sun and light shadows,
+///   `CS_GenerateShadowMasks_Raytraced*`, `CS_RTShadowTrace*` and
+///   `CS_RaytraceShadows*`, which trace the shadows of the screen tiles the
+///   title marks for rays (the edges of the cascades' shadows, hair). With
+///   every ray a miss those tiles come out lit: stair-stepped sun patches on
+///   walls and clothes, hair glowing in the sun. From edsuuu/VI-BR-PORT
+///   a04f6012 (GPL-3.0), opt-in there too.
 ///
-/// The last four adapted from edsuuu/VI-BR-PORT f1e5e454 / 24f8d2ed
+/// The four before adapted from edsuuu/VI-BR-PORT f1e5e454 / 24f8d2ed
 /// (GPL-3.0; from codec-d/cool_fox `make.rs`), where the tracing is left
 /// out by default with every ray a miss (`VICTORY_RT_TRACE=1` runs it);
 /// here, as every kind, only with its switch.
@@ -802,11 +809,16 @@ static RT_WORK: [RtWork; RT_KINDS] = [
                 || (holds(b, b"CS_RaytraceVBuffer") && !holds(b, b"Voxels"))
         },
     ),
+    RtWork::new(
+        "VICTORY_SKIP_RT_SHADOW",
+        "dispatches of programs that trace the shadows of the tiles marked for rays are left out",
+        |b| holds(b, b"CS_GenerateShadowMasks_Raytraced") || holds(b, b"CS_RTShadowTrace") || holds(b, b"CS_RaytraceShadows"),
+    ),
 ];
 
 /// How many kinds of [`RtWork`] there are (bits of a `u8`).
 #[cfg(windows)]
-const RT_KINDS: usize = 5;
+const RT_KINDS: usize = 6;
 
 /// Each kind's switch ([`RtWork`]): 0 off (or the builder may run), 1 on,
 /// 2 in turn.
@@ -1740,6 +1752,10 @@ mod tests {
         assert_eq!(kinds(b"..\0CS_ScreenProbes_TraceRays_Fallback\0.."), 0);
         assert_eq!(kinds(b"..\0CS_RaytraceVBuffer_ShaderBinning_WithFar\0.."), 0b1_0000);
         assert_eq!(kinds(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."), 0);
+        assert_eq!(kinds(b"..\0CS_GenerateShadowMasks_Raytraced_Hair\0.."), 0b10_0000);
+        assert_eq!(kinds(b"..\0CS_RTShadowTrace_0\0.."), 0b10_0000);
+        assert_eq!(kinds(b"..\0CS_RaytraceShadows_Local\0.."), 0b10_0000);
+        assert_eq!(kinds(b"..\0CS_GenerateShadowMasks_Cascades\0.."), 0);
         assert_eq!(kinds(b"CS_RaytracingResolve\0CS_ScreenProbes_TemporalResolve\0"), 0);
         assert_eq!(kinds(b"CS_RaytracingResolve\0CS_UpdateHistory\0"), 0);
         assert_eq!(kinds(b""), 0);
