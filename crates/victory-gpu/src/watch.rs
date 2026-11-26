@@ -1837,7 +1837,7 @@ fn guard_outside() -> bool {
                 .as_secs()
                 / 20)
                 % 2
-                == 1;
+                == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
                 use std::sync::atomic::Ordering::Relaxed;

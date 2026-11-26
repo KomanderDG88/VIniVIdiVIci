@@ -2618,7 +2618,7 @@ fn rehash_runs() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let joined = (now_us() / 20_000_000) % 2 == 1;
+            let joined = (now_us() / 20_000_000) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(joined), Ordering::Relaxed) != u8::from(joined) {
                 tracing::info!(
@@ -7369,7 +7369,7 @@ fn refresh_once() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = (now_us() / 20_000_000) % 2 == 1;
+            let on = (now_us() / 20_000_000) % 2 == crate::alt_on_phase();
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(

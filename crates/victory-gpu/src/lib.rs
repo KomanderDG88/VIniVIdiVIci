@@ -115,7 +115,8 @@ pub use watch::{
 /// The `alt` value of a switch: twenty seconds off, twenty on, in turn,
 /// from the first time it is asked, each change said in the log in the
 /// words of `VICTORY_DISPATCH_SPREAD=alt` ("... from now (SWITCH=alt):
-/// ON"). One per switch, in a `static`.
+/// ON"). One per switch, in a `static`. Which half is ON follows
+/// [`alt_on_phase`] (`VICTORY_ALT_FLIP=1`: the first).
 #[cfg(windows)]
 pub(crate) struct AltTurn {
     epoch: std::sync::OnceLock<std::time::Instant>,
@@ -132,7 +133,7 @@ impl AltTurn {
     /// Whether this is an ON turn. `what`: what the switch does, `switch`:
     /// its name, `off`: what an off turn is, as the log says them.
     pub(crate) fn on(&self, what: &str, switch: &str, off: &str) -> bool {
-        let on = (self.epoch.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+        let on = (self.epoch.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == alt_on_phase();
         if self.last.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
             tracing::info!("{what} from now ({switch}=alt): {}", if on { "ON" } else { off });
         }
