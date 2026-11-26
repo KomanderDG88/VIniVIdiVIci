@@ -1531,6 +1531,8 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
                 Some([tx, ty, tz]) if tx > 0 && ty > 0 && tz > 0 => {
                     (gx, gy, gz) = (x.div_ceil(tx), y.div_ceil(ty), z.div_ceil(tz));
                     limited = true;
+                    #[cfg(feature = "diagnostics")]
+                    dispatch_x_shape([x, y, z], [tx, ty, tz], flags);
                 }
                 _ => {
                     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1554,6 +1556,39 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     {
         let _ = (this, x, y, z, flags);
         count_dispatch();
+    }
+}
+
+/// Says once per shape (group size, flags, and whether y and z fill whole
+/// groups) the counts a dispatch by thread counts asked for and the
+/// program's group size, and warns when the group is more than one
+/// thread along y or z and the count there is not a whole number of
+/// groups: only x has a limit (`set_thread_limit`), so the last groups
+/// along y or z would run lanes past the count. Diagnostics builds only.
+#[cfg(feature = "diagnostics")]
+fn dispatch_x_shape(counts: [u32; 3], group: [u32; 3], flags: u32) {
+    let [x, y, z] = counts;
+    let [tx, ty, tz] = group;
+    let partial = (ty > 1 && !y.is_multiple_of(ty)) || (tz > 1 && !z.is_multiple_of(tz));
+    static SEEN: std::sync::Mutex<Vec<([u32; 3], u32, bool)>> = std::sync::Mutex::new(Vec::new());
+    let key = (group, flags, partial);
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&key) {
+            return;
+        }
+        seen.push(key);
+    }
+    if partial {
+        tracing::warn!(
+            x, y, z, tx, ty, tz, flags = format_args!("{flags:#x}"),
+            "a dispatch by thread counts whose group is more than one thread along y or z, with a count there that is not whole groups: the lanes past it run (only x is limited)"
+        );
+    } else {
+        tracing::info!(
+            x, y, z, tx, ty, tz, flags = format_args!("{flags:#x}"),
+            "a dispatch by thread counts: the counts asked for and the program's group size (first of this shape)"
+        );
     }
 }
 
