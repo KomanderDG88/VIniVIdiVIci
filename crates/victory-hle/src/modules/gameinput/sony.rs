@@ -15,6 +15,9 @@
 //! in another order (Windows hands it over padded to 78 bytes).
 //! shortcut: no rumble, adaptive triggers, touchpad or motion; the PS and
 //! mute buttons are not passed on. A second Sony pad is not looked for.
+//! shortcut: a read waits for the next report. A pad that goes to sleep
+//! without its read failing keeps its last state (a stick held, say) until
+//! a report comes again; a read with a time limit would let it go.
 
 use super::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER, RIGHT_STICK,
@@ -153,26 +156,61 @@ mod reader {
         *lock(&STATE)
     }
 
-    /// Looks for a pad, reads it until it goes, looks again.
+    /// What [`open`] found.
+    enum Found {
+        /// No Sony pad is connected.
+        Absent,
+        /// One, opened.
+        Opened(HANDLE),
+        /// One that could not be opened, and why.
+        Unopened(std::io::Error),
+    }
+
+    /// Looks for a pad, reads it until it goes, looks again. A pad that
+    /// cannot be opened, or gives no report, is looked at again every
+    /// [`LOOK_AGAIN`] but told of once while the cause stays the same.
     fn run() {
+        // The trouble last told of: which (1 not opened, 2 no report) and
+        // the system's error number.
+        let mut told: Option<(u8, Option<i32>)> = None;
+        let tell = |told: &mut Option<(u8, Option<i32>)>, which: u8, error: &std::io::Error, what: &str| {
+            let cause = Some((which, error.raw_os_error()));
+            if *told != cause {
+                *told = cause;
+                tracing::warn!(%error, "{what}: it is not read (told once while this lasts)");
+            }
+        };
         loop {
-            if let Some(pad) = open() {
-                tracing::info!("a Sony DualSense is read as the first gamepad (VICTORY_SONY_PAD=0: not)");
-                read(pad);
-                *lock(&STATE) = None;
-                // SAFETY: our handle, no longer used.
-                unsafe { CloseHandle(pad) };
-                tracing::info!("the Sony DualSense is gone");
+            match open() {
+                Found::Absent => told = None,
+                Found::Unopened(error) => {
+                    tell(&mut told, 1, &error, "a Sony pad is connected but could not be opened");
+                }
+                Found::Opened(pad) => {
+                    let (reports, error) = read(pad);
+                    *lock(&STATE) = None;
+                    // SAFETY: our handle, no longer used.
+                    unsafe { CloseHandle(pad) };
+                    if reports > 0 {
+                        tracing::info!(%error, reports, "the Sony DualSense is gone");
+                        told = None;
+                    } else {
+                        tell(&mut told, 2, &error, "a Sony pad was opened but no report could be read from it");
+                    }
+                }
             }
             std::thread::sleep(LOOK_AGAIN);
         }
     }
 
     /// Reads input reports until a read fails (the pad was unplugged or
-    /// went to sleep), keeping the state each one holds.
-    fn read(pad: HANDLE) {
+    /// went to sleep), keeping the state each one holds. Returns the
+    /// reports read and why the last read failed. The pad is told of as
+    /// read at its first report, not before.
+    fn read(pad: HANDLE) -> (u64, std::io::Error) {
         // Longer than the longest report (78 bytes over Bluetooth).
         let mut report = [0u8; 128];
+        let mut reports = 0u64;
         loop {
             let mut got = 0u32;
             // SAFETY: our handle; room for `report.len()` bytes; a read that
@@ -181,22 +219,26 @@ mod reader {
                 ReadFile(pad, report.as_mut_ptr(), report.len() as u32, &mut got, std::ptr::null_mut())
             };
             if read == 0 {
-                return;
+                return (reports, std::io::Error::last_os_error());
             }
             if let Some(state) = super::parse(&report[..(got as usize).min(report.len())]) {
                 *lock(&STATE) = Some(state);
+                if reports == 0 {
+                    tracing::info!("a Sony DualSense is read as the first gamepad (VICTORY_SONY_PAD=0: not)");
+                }
+                reports += 1;
             }
         }
     }
 
     /// The first Sony pad among the raw-input devices, opened for reading
     /// and shared with whoever else reads it.
-    fn open() -> Option<HANDLE> {
+    fn open() -> Found {
         let entry = size_of::<RAWINPUTDEVICELIST>() as u32;
         let mut count = 0u32;
         // SAFETY: a count is asked for, nothing is written but it.
         if unsafe { GetRawInputDeviceList(std::ptr::null_mut(), &mut count, entry) } != 0 || count == 0 {
-            return None;
+            return Found::Absent;
         }
         // (Room for a few more: devices come and go between the two calls.)
         let mut devices = vec![RAWINPUTDEVICELIST::default(); count as usize + 8];
@@ -204,8 +246,9 @@ mod reader {
         // SAFETY: room for `room` entries.
         let listed = unsafe { GetRawInputDeviceList(devices.as_mut_ptr(), &mut room, entry) };
         if listed == u32::MAX {
-            return None;
+            return Found::Absent;
         }
+        let mut unopened = None;
         devices.truncate(listed as usize);
         for device in devices.iter().filter(|d| d.dwType == RIM_TYPEHID) {
             let mut info = RID_DEVICE_INFO { cbSize: size_of::<RID_DEVICE_INFO>() as u32, ..Default::default() };
@@ -250,14 +293,11 @@ mod reader {
                 )
             };
             if pad != INVALID_HANDLE_VALUE && !pad.is_null() {
-                return Some(pad);
+                return Found::Opened(pad);
             }
-            tracing::warn!(
-                error = %std::io::Error::last_os_error(),
-                "a Sony pad is connected but could not be opened: it is not read"
-            );
+            unopened = Some(std::io::Error::last_os_error());
         }
-        None
+        unopened.map_or(Found::Absent, Found::Unopened)
     }
 }
 
