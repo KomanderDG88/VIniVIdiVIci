@@ -1,8 +1,10 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
-machinery translates and is unit-tested; it has not yet run end to end in the
-game. Everything here is off by default.
+Status, 2026-11-26: **nothing is lit by ray tracing yet.** Most of the
+machinery translates and is unit-tested. The structure builder has now run in
+the game for 13 minutes without bringing the title down, but at 6 to 12 s a
+frame and with no change seen in the picture (see Known gaps). Everything here
+is off by default.
 
 ## What the title does
 
@@ -66,7 +68,21 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder is not usable yet. Until the
+- With `VICTORY_BVH_BUILDER=1` the builder runs but is not usable yet
+  (2026-11-26, RTX 4060 Ti 8 GB, one session each). Without the fix to
+  DispatchX by thread counts (fxceless/victory-fork#1292) the title crashed
+  16.8 s after the builder began, reading a pointer of all ones, as below:
+  the builder's stages ran 64 times the threads asked for and wrote past
+  their structures. With the fix it ran 13 minutes with no fault. What is
+  left is cost and picture: a frame of 6 to 12 s with the card about 5 %
+  busy (every numbered copy of title memory snapshotted and compared for
+  each list that reads by address: 10 to 20 GB a frame, nothing found
+  changed; `VICTORY_ADDRESS_STORES=1`, fxceless/victory-fork#916, is the
+  fix to measure), 23 GB of private memory, and a room that looked no
+  different in the pictures saved. With a cold shader cache the builder's
+  53 pipelines, made in place at its first dispatch, made a frame of 30.2 s
+  and the title ended itself; they are now queued at creation.
+- Before that: Until the
   paired form, three of its programs did not translate on a 32-lane GPU,
   which kept it off; every builder pipeline is now created offline
   (`victory translate --pipelines` with `VICTORY_HOST_MAX_WAVE=32`). Switched
