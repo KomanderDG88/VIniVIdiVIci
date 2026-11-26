@@ -955,6 +955,14 @@ pub use super::ticket::thread_tickets;
 pub(super) use super::ticket::TEST_TICKET;
 use super::ticket::{count_ticket, ticket_on};
 
+/// `VICTORY_BPERMUTE_HALVES` (on unless `0`): a wave64 `ds_bpermute_b32` permutes within each
+/// 32-lane half, as RDNA 2 does; `0` brings back the whole-wave permute (and its refusal across
+/// two host waves). Read by the translator, so it joins the shader cache key (`build.rs`).
+fn bpermute_halves() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BPERMUTE_HALVES").is_none_or(|v| v != "0"))
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1284,6 +1292,7 @@ impl<'a> Lower<'a> {
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
+                        || !bpermute_halves() && n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -1345,6 +1354,8 @@ impl<'a> Lower<'a> {
                             "v_writelane"
                         } else if n.starts_with("ds_permute") {
                             "ds_permute"
+                        } else if !bpermute_halves() && n.starts_with("ds_bpermute") {
+                            "ds_bpermute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
                         } else {
@@ -5102,15 +5113,21 @@ impl<'a> Lower<'a> {
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
+            let halves = bpermute_halves();
+            if !halves && self.exchange.as_ref().is_some_and(|e| !e.1) {
+                // (`VICTORY_BPERMUTE_HALVES=0`: a console wave of 64 run as two host waves,
+                // the lane named may be in the other one)
+                return Err("a lane permute across two host waves");
+            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let lanes = self.s.m.i32(31);
+            let lanes = self.s.m.i32(if halves { 31 } else { self.wave() - 1 });
             let src = self.s.m.bin(c, Bin::And, src, lanes);
-            let src = if self.x.native.wave64 {
+            let src = if halves && self.x.native.wave64 {
                 // (0 in a host wave of 32, which holds one half.)
                 let me = self.lane_index();
                 let half = self.s.m.i32(!31);
@@ -5687,7 +5704,15 @@ impl<'a> Lower<'a> {
                     };
                     Ok((from, x, guard))
                 })?;
-                let read = [pick(self, x_lo, x_hi, from_lo), pick(self, x_lo, x_hi, from_hi)];
+                let read = if bpermute_halves() {
+                    // Within its own half (`VICTORY_BPERMUTE_HALVES`): a lower lane reads a
+                    // lower lane, an upper lane an upper one, of host lane `from & 31`.
+                    let lo = self.s.m.bin(c, Bin::And, from_lo, k31);
+                    let hi = self.s.m.bin(c, Bin::And, from_hi, k31);
+                    [self.read_lane(x_lo, lo), self.read_lane(x_hi, hi)]
+                } else {
+                    [pick(self, x_lo, x_hi, from_lo), pick(self, x_lo, x_hi, from_hi)]
+                };
                 let guards = [g_lo, g_hi];
                 let reg = *reg;
                 self.both(|l| {
