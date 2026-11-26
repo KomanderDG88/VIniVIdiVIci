@@ -44,15 +44,15 @@ const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
-    /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    /// The queue waits for the fence to reach the value.
+    Wait(crate::fence::FenceRef, u64),
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    Signal(crate::fence::FenceRef, u64),
     /// With [`behind`]: the submission at the head of the line is being
     /// prepared and sent by our thread, with the line unlocked, so the
     /// title can add to its end meanwhile; whatever is added stays behind
@@ -637,7 +637,7 @@ struct Joined {
     order: Vec<usize>,
     parts: usize,
     /// Signals met behind those parts: delivered when the parts are sent.
-    signals: Vec<(usize, u64)>,
+    signals: Vec<(crate::fence::FenceRef, u64)>,
     /// The queues with a part here: each has [`Held::Running`] at the
     /// head of its line.
     marked: Vec<usize>,
@@ -716,8 +716,8 @@ fn send_joined(joined: &mut Joined) {
     // Behind what was just sent, in the order they were met (and behind
     // title submissions held back to be merged, which go first or carry it).
     for (fence, value) in joined.signals.drain(..) {
-        if !crate::host::merge_signal(fence, value) && !crate::host::late_signal(fence, value) {
-            crate::fence::set(fence as This, value);
+        if !crate::host::merge_signal(fence.as_this() as usize, value) && !crate::host::late_signal(fence.as_this(), value) {
+            crate::fence::set(fence.as_this(), value);
         }
     }
     for q in joined.marked.drain(..) {
@@ -776,12 +776,12 @@ fn release_held_now(all: bool) {
                 let base = usize::from(joined.marked.contains(&q));
                 match held.get(base) {
                     None | Some(Held::Running) => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                    Some(Held::Wait(fence, value))
+                        if !all && crate::fence::completed(fence.as_this()) < *value =>
                     {
                         // A signal of the fence carried behind merged
                         // submissions goes to the card with them now.
-                        crate::host::merge_fence_asked(fence);
+                        crate::host::merge_fence_asked(fence.as_this() as usize);
                         break;
                     }
                     // With parts taken and not sent: only what is known
@@ -929,8 +929,10 @@ fn release_held_now(all: bool) {
                         if !joined.is_empty() {
                             // Behind parts not sent yet: with them.
                             joined.signals.push((fence, value));
-                        } else if !crate::host::merge_signal(fence, value) && !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                        } else if !crate::host::merge_signal(fence.as_this() as usize, value)
+                            && !crate::host::late_signal(fence.as_this(), value)
+                        {
+                            crate::fence::set(fence.as_this(), value);
                         }
                     }
                 }
@@ -1158,7 +1160,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     crate::fence::pace::signal_called(fence as usize, value);
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || Held::Signal(crate::fence::FenceRef::hold(fence), value)) {
         return S_OK;
     }
     // Behind the title submissions held back to be merged: they go to the
@@ -1170,7 +1172,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
-    if crate::host::late_signal(fence as usize, value) {
+    if crate::host::late_signal(fence, value) {
         return S_OK;
     }
     let _ = this;
@@ -1203,7 +1205,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push(Held::Wait(crate::fence::FenceRef::hold(fence), value));
             }
             behind
         };

@@ -3419,8 +3419,8 @@ enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
-    /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    /// A fence signalled behind the flights before it.
+    Signal(crate::fence::FenceRef, u64),
 }
 
 struct Line {
@@ -4277,7 +4277,7 @@ fn sync_batched() -> bool {
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
-pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+pub(crate) fn late_signal(fence: crate::object::This, value: u64) -> bool {
     if !late() {
         return false;
     }
@@ -4285,7 +4285,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if line.line.is_empty() && !line.settling {
         return false;
     }
-    line.line.push(Late::Signal(fence, value));
+    line.line.push(Late::Signal(crate::fence::FenceRef::hold(fence), value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
     // A signal alone (behind a settle under way) has no flight to wake
@@ -6306,7 +6306,7 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
             }
         }
         if last > 0 {
@@ -6788,7 +6788,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
                 }
             }
             if last > 0 {
