@@ -1307,8 +1307,66 @@ extern "system" fn present(
         crate::framelog::frame();
         #[cfg(feature = "diagnostics")]
         crate::fence::pace::frame();
+        long_frame::presented();
     }
     hr
+}
+
+/// A WARN when a frame (from one present to the next) has gone on for
+/// more than [`long_frame::LONG`]: the title seems to end itself at about
+/// 30 s (a 30.2 s frame, the builder's 53 pipelines made in place, and it
+/// was gone; its hang watchdog, a guess). Said while the frame still goes
+/// on, by a thread that looks once a second, since the title may not get
+/// to the next present; once per such frame. Always on; a present costs
+/// one atomic store.
+#[cfg(windows)]
+mod long_frame {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+
+    pub(super) const LONG: Duration = Duration::from_secs(20);
+
+    /// When the run's first present was made (the clock of [`LAST`]).
+    static START: OnceLock<Instant> = OnceLock::new();
+    /// The last present, in microseconds after [`START`] (0: none yet).
+    static LAST: AtomicU64 = AtomicU64::new(0);
+
+    /// A present was made: a new frame begins.
+    pub(super) fn presented() {
+        let mut first = false;
+        let start = START.get_or_init(|| {
+            first = true;
+            Instant::now()
+        });
+        LAST.store((start.elapsed().as_micros() as u64).max(1), Relaxed);
+        if first {
+            let spawned = std::thread::Builder::new()
+                .name("victory-long-frames".into())
+                .spawn(move || watch(*start));
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "no watch for long frames");
+            }
+        }
+    }
+
+    fn watch(start: Instant) {
+        // The present whose frame was last warned about.
+        let mut warned = 0;
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let last = LAST.load(Relaxed);
+            let now = start.elapsed().as_micros() as u64;
+            let took = Duration::from_micros(now.saturating_sub(last));
+            if last != warned && took > LONG {
+                warned = last;
+                tracing::warn!(
+                    "a frame took {} s; the title may end itself at about 30 s (its hang watchdog, a guess)",
+                    took.as_secs()
+                );
+            }
+        }
+    }
 }
 
 fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {

@@ -160,6 +160,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by address ([`stores_by_address`]):
+    /// only then are the host's copies of that memory compared after it.
+    pub(crate) address_stores: bool,
 }
 
 #[cfg(windows)]
@@ -218,6 +221,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let address_stores = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -228,7 +232,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        address_stores,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -305,6 +314,29 @@ impl Shader {
     fn walks(&self) -> bool {
         *self.walks.get_or_init(|| container_walks(&self.container))
     }
+}
+
+/// The thread-group size (`numthreads`) of the compute program of the
+/// title's pipeline `this`; none if it is no compute pipeline or its
+/// program does not parse.
+#[cfg(windows)]
+pub(crate) fn compute_threads(this: This) -> Option<[u32; 3]> {
+    use victory_shader::native::StageIo;
+    use victory_shader::{Container, FourCC};
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let [shader] = &p.shaders[..] else { return None };
+    if shader.stage != "compute" {
+        return None;
+    }
+    let c = Container::parse(&shader.container).ok()?;
+    let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+    programs.iter().find_map(|n| match &n.io {
+        StageIo::Cs(cs) => Some(cs.threads),
+        _ => None,
+    })
 }
 
 /// Whether a console container's code tests rays against the nodes of a
@@ -394,12 +426,18 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
+/// `VICTORY_BVH_BUILDER=1`: the builder may run (see [`Builder`]).
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -409,9 +447,25 @@ pub(crate) fn builder_runs() -> bool {
     if b.whole {
         return true;
     }
+    // How many were not made yet, and how long making them here took.
+    #[cfg(feature = "diagnostics")]
+    let (unmade, started) = (
+        b.pipelines.iter().filter(|p| !make::made(p)).count(),
+        std::time::Instant::now(),
+    );
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
+    #[cfg(feature = "diagnostics")]
+    tracing::info!(
+        unmade,
+        of = b.pipelines.len(),
+        ms = started.elapsed().as_millis() as u64,
+        "the ray-tracing structure builder's first dispatch: pipelines not made yet, made here"
+    );
     if missing > 0 {
         b.off = true;
+        for p in b.pipelines.iter().filter(|p| !make::now(p)) {
+            tracing::warn!(shaders = ?make::shaders(p), "a builder pipeline with no host pipeline");
+        }
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
@@ -448,6 +502,32 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Smem
             | Encoding::Flat
             | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store to title memory by address
+/// (`crate::memory`): a flat, global or scalar-memory store or atomic (the
+/// accesses that take a raw address), or code that is not all known, as in
+/// [`stores`]. The programs that walk the ray-tracing structures read them
+/// by address and store their results through views: before this, each of
+/// their dispatches declared every numbered copy of title memory written,
+/// which with the structure builder running was 12 GB snapshotted and
+/// compared on the CPU a frame (3030 ranges of 4 MiB).
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Smem | Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
@@ -646,6 +726,14 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        // Named once each (gfx41): which programs are the builder's, to
+        // match against the refused and untranslated ones.
+        tracing::info!(n = b.pipelines.len(), ?shaders, "a pipeline of the ray-tracing structure builder");
+        // Made ahead of the pipelines draws ask for, long before the
+        // first builder dispatch, which needs all of them at once.
+        if builder_allowed() {
+            make::ahead(&host);
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
@@ -888,6 +976,45 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// Which stores give title-memory copies as written: a vector store
+    /// through a buffer descriptor does not; flat, global and scalar-memory
+    /// stores do, the scalar buffer forms too (kept conservative: their
+    /// descriptor may alias title memory). Each case starts with an
+    /// `s_load_dword` by address, which stores nothing.
+    #[cfg(windows)]
+    #[test]
+    fn only_stores_that_can_take_an_address_count_as_address_stores() {
+        use victory_shader::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+        let program = |store: [u32; 2]| {
+            let words = [0xF400_0202, 0xFA00_0000, store[0], store[1], 0xBF81_0000];
+            NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            }
+        };
+        for (store, name, by_address) in [
+            ([0xE070_1000, 0x8001_0100], "buffer_store_dword", false),
+            ([0xF440_0202, 0xFA00_0000], "s_store_dword", true),
+            ([0xF460_0202, 0xFA00_0000], "s_buffer_store_dword", true),
+            ([0xDC70_8000, 0x007D_0200], "global_store_dword", true),
+            ([0xF400_0202, 0xFA00_0000], "s_load_dword", false),
+        ] {
+            let p = program(store);
+            let code = victory_shader::gfx10::decode(&p.code).unwrap();
+            assert_eq!(code[1].name(), Some(name));
+            assert!(stores(&p) || !by_address, "{name}");
+            assert_eq!(stores_by_address(&p), by_address, "{name}");
+        }
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

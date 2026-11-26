@@ -1477,7 +1477,9 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
-        list.defer(move || {
+        // Its place is known: `VICTORY_NEAR_WRITES` uses it (without the
+        // switch the step is the same as `defer`'s).
+        list.defer_at(dst as usize, len, move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
@@ -1495,15 +1497,98 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch whose flags are the console
+/// card's own dispatch bits (the ray-tracing structure builder dispatches
+/// its in-place stages this way). Bit 5 (0x20, "use thread dimensions")
+/// makes `x`, `y`, `z` counts of THREADS, not of thread groups: the card
+/// runs as many groups as hold them and, in the last one, only the threads
+/// below the count. Bit 15 (0x8000) says the program's waves have 32
+/// lanes, which its container says too.
+///
+/// The flags were passed over and the counts taken for groups: a stage
+/// asked to make one tree level's 1,606 nodes ran 1,606 groups of 64
+/// threads and made 102,784, from whatever lay behind the level's records,
+/// megabytes past the structure's end.
+///
+/// Here the counts become group counts by the program's group size, and
+/// the host is told the thread count along x, from which the translated
+/// program gives each lane its place in or outside EXEC on entry
+/// (`victory_shader::emit::USER_THREAD_LIMIT`). `VICTORY_DISPATCH_THREADS=0`:
+/// the counts as groups, as before.
+/// shortcut: counts along y and z are rounded up to groups, no more.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    {
+        const THREAD_DIMENSIONS: u32 = 1 << 5;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_THREADS").is_none_or(|v| v != "0"));
+        let (mut gx, mut gy, mut gz) = (x, y, z);
+        let mut limited = false;
+        if on && flags & THREAD_DIMENSIONS != 0 {
+            let mut threads = None;
+            with_state(this, |_, s| threads = crate::pipeline::compute_threads(s.pipeline_now() as This));
+            match threads {
+                Some([tx, ty, tz]) if tx > 0 && ty > 0 && tz > 0 => {
+                    (gx, gy, gz) = (x.div_ceil(tx), y.div_ceil(ty), z.div_ceil(tz));
+                    limited = true;
+                    #[cfg(feature = "diagnostics")]
+                    dispatch_x_shape([x, y, z], [tx, ty, tz], flags);
+                }
+                _ => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!("a dispatch by thread counts of a program whose group size is not known: taken as groups")
+                    });
+                }
+            }
+        }
+        // The lanes of the last group past the count start outside EXEC
+        // (one thread is one group of which one lane runs).
+        if limited {
+            with_state(this, |_, s| s.set_thread_limit(Some(x)));
+        }
+        state::dispatch(this, gx, gy, gz);
+        if limited {
+            with_state(this, |_, s| s.set_thread_limit(None));
+        }
+    }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
+    }
+}
+
+/// Says once per shape (group size, flags, and whether y and z fill whole
+/// groups) the counts a dispatch by thread counts asked for and the
+/// program's group size, and warns when the group is more than one
+/// thread along y or z and the count there is not a whole number of
+/// groups: only x has a limit (`set_thread_limit`), so the last groups
+/// along y or z would run lanes past the count. Diagnostics builds only.
+#[cfg(feature = "diagnostics")]
+fn dispatch_x_shape(counts: [u32; 3], group: [u32; 3], flags: u32) {
+    let [x, y, z] = counts;
+    let [tx, ty, tz] = group;
+    let partial = (ty > 1 && !y.is_multiple_of(ty)) || (tz > 1 && !z.is_multiple_of(tz));
+    static SEEN: std::sync::Mutex<Vec<([u32; 3], u32, bool)>> = std::sync::Mutex::new(Vec::new());
+    let key = (group, flags, partial);
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&key) {
+            return;
+        }
+        seen.push(key);
+    }
+    if partial {
+        tracing::warn!(
+            x, y, z, tx, ty, tz, flags = format_args!("{flags:#x}"),
+            "a dispatch by thread counts whose group is more than one thread along y or z, with a count there that is not whole groups: the lanes past it run (only x is limited)"
+        );
+    } else {
+        tracing::info!(
+            x, y, z, tx, ty, tz, flags = format_args!("{flags:#x}"),
+            "a dispatch by thread counts: the counts asked for and the program's group size (first of this shape)"
+        );
     }
 }
 

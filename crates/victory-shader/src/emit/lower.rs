@@ -611,6 +611,17 @@ fn lane_scalars(p: &Program, res: &Resources) -> HashSet<Value> {
     }
 }
 
+/// Whether a program's lanes start in EXEC only below the dispatch's thread count
+/// (`structure::set_entry_limited`; `VICTORY_THREAD_LIMIT=0`: every lane, as before): the
+/// compute programs with a spilled user-data table, the console's ray-tracing structure
+/// builder, whose in-place stages are dispatched by thread counts.
+pub(super) fn thread_limited(native: &NativeProgram) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_LIMIT").is_none_or(|v| v != "0"))
+        && native.stage == HwStage::Cs
+        && crate::spill::is_spilled(native)
+}
+
 /// The mode of a group barrier the translation adds (host waves meeting):
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
@@ -2225,6 +2236,55 @@ impl<'a> Lower<'a> {
             self.swap_lanes();
             r?;
         }
+        if crate::structure::entry_limited()
+            && let StageIo::Cs(cs) = &self.x.native.io
+            && let Some(&(_, lo)) = p.inputs.iter().find(|i| i.0 == Reg::S(EXEC))
+        {
+            // EXEC on entry, a lane's own bit: its thread along x is below the count the
+            // dispatch runs (`shader.rs` `USER_THREAD_LIMIT`).
+            use super::shader::USER_THREAD_LIMIT;
+            let width = cs.threads[0];
+            // (the paired form: the upper lanes' bits too, from their own thread ids)
+            for upper in [false, true] {
+                if upper {
+                    if self.twin.is_none() {
+                        break;
+                    }
+                    self.swap_lanes();
+                }
+                let e = self.s.entry;
+                let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let Val::I32(thread) = self.thread_id(0) else {
+                    if upper {
+                        self.swap_lanes();
+                    }
+                    return Err(unsupported(0, "a thread id for the dispatch's thread count"));
+                };
+                let size = self.s.m.i32(width);
+                let first = self.s.m.bin(e, Bin::Mul, group, size);
+                let at = self.s.m.bin(e, Bin::Add, first, thread);
+                let limit = self.host_word(RootType::Other(USER_THREAD_LIMIT), 0, 0);
+                let bit = self.s.m.cmp(e, pred::IULT, at, limit);
+                self.lane_bits.insert(lo, bit);
+                if upper {
+                    self.swap_lanes();
+                }
+            }
+        }
+        // A compute program that reads its group id x may run spread across
+        // z (`USER_DISPATCH_SPREAD`). Not a spilled one (the builder's
+        // stages, near the root signature's 64 dwords), nor one whose first
+        // block is a loop header (its counter sits in the entry block).
+        if self.x.native.stage == HwStage::Cs
+            && self.user_first() == 0
+            && !self.counters.contains_key(&order[0])
+            && self.x.io.inputs.iter().any(|&(_, i)| i == Input::GroupId(0))
+        {
+            self.cs_spread_prologue();
+            self.block[order[0]] = Some(self.cur);
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -2501,6 +2561,57 @@ impl<'a> Lower<'a> {
     }
 
     /// A component of a compute thread or group id, read in the entry block.
+    /// A dispatch the host spread across z (`USER_DISPATCH_SPREAD`): the
+    /// group id as the title asked it, `(x + z * row, y, 0)`, for every input
+    /// that reads it, and the groups past the asked count leave before the
+    /// body (whole groups: no barrier is split). `row` 0: as dispatched.
+    /// The entry block ends here; the first block's code goes to the next.
+    /// (After upstream VIctory pull request #2312.)
+    fn cs_spread_prologue(&mut self) {
+        use super::shader::USER_DISPATCH_SPREAD;
+        let row = self.host_word(RootType::Other(USER_DISPATCH_SPREAD), 0, 0);
+        let asked = self.host_word(RootType::Other(USER_DISPATCH_SPREAD), 0, 1);
+        let Val::I32(gx) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let Val::I32(gz) = self.compute_id("groupId.i32", 94, 2) else {
+            unreachable!()
+        };
+        let e = self.s.entry;
+        let zero = self.s.m.i32(0);
+        let unspread = self.s.m.cmp(e, pred::EQ, row, zero);
+        let mul = self.s.m.bin(e, Bin::Mul, gz, row);
+        let spread_x = self.s.m.bin(e, Bin::Add, gx, mul);
+        let eff_x = self.s.m.select(e, unspread, gx, spread_x);
+        let eff_z = self.s.m.select(e, unspread, gz, zero);
+        let in_x = self.s.m.cmp(e, pred::IULT, eff_x, asked);
+        let keep = self.s.m.bin(e, Bin::Or, unspread, in_x);
+        let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
+        for (&v, &inp) in &io_inputs {
+            match inp {
+                Input::GroupId(0) => {
+                    self.vals.insert(v, Val::I32(eff_x));
+                    // (the paired form: the upper lanes' group id is the same)
+                    if let Some(t) = self.twin.as_deref_mut() {
+                        t.vals.insert(v, Val::I32(eff_x));
+                    }
+                }
+                Input::GroupId(2) => {
+                    self.vals.insert(v, Val::I32(eff_z));
+                    if let Some(t) = self.twin.as_deref_mut() {
+                        t.vals.insert(v, Val::I32(eff_z));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = self.s.m.new_block();
+        let ret = self.s.m.new_block();
+        self.s.m.terminate(ret, Term::Ret);
+        self.s.m.terminate(e, Term::CondBr(keep, body, ret));
+        self.cur = body;
+    }
+
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
         Val::I32(

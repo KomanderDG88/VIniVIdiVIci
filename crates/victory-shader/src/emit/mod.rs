@@ -123,7 +123,7 @@ pub use lower::{set_host_max_wave, thread_tickets};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -293,6 +293,21 @@ impl HostShader {
     }
 }
 
+/// A dispatch of `(x, y, z)` groups as the host runs it: `(row, asked x, gx,
+/// gy, gz)`. Spread across z when `can_spread`, `x` > 65,535 and `z` == 1
+/// ([`USER_DISPATCH_SPREAD`]); else `row` 0 and the counts as asked (upstream
+/// VIctory pull request #2312's `spread_groups`).
+pub fn spread_groups(x: u32, y: u32, z: u32, can_spread: bool) -> (u32, u32, u32, u32, u32) {
+    if can_spread && x > 65_535 && z == 1 {
+        let rows = x.div_ceil(65_535);
+        if rows <= 65_535 {
+            let row = x.div_ceil(rows);
+            return (row, x, row, y, rows);
+        }
+    }
+    (0, x, x, y, z)
+}
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
@@ -339,6 +354,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    structure::set_entry_limited(lower::thread_limited(&native));
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
