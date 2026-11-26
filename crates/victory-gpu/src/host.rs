@@ -2348,6 +2348,83 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// The smallest size class of [`HostList::upload`]'s shared buffers with
+/// [`card_steps`]' stage 2 ([`shared_class`]).
+const SHARED_CLASS_LEAST: u64 = 64 << 10;
+/// The largest: an upload past it gets a buffer of its own size, made and
+/// let go as before (a class twice the size would cost too much memory).
+const SHARED_CLASS_MOST: u64 = 16 << 20;
+/// The most bytes of such buffers kept while no list holds them.
+const SHARED_SPARE_MOST: u64 = 64 << 20;
+
+/// The size class of a shared buffer for an upload of `size` bytes: the
+/// power of two at or above it, [`SHARED_CLASS_LEAST`] at least; `None`
+/// past [`SHARED_CLASS_MOST`] (not kept).
+fn shared_class(size: u64) -> Option<u64> {
+    let class = size.max(SHARED_CLASS_LEAST).checked_next_power_of_two()?;
+    (class <= SHARED_CLASS_MOST).then_some(class)
+}
+
+/// A mapped shared buffer of a size class: the buffer and its persistent
+/// mapping.
+struct SharedKept {
+    buffer: ID3D12Resource,
+    data: usize,
+}
+
+// SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
+// written only by the list that holds the buffer.
+unsafe impl Send for SharedKept {}
+
+/// Shared buffers of [`HostList::upload`] that no list holds, by size
+/// class.
+///
+/// Why: with [`card_steps`]' stage 2 every upload of a list (texture data
+/// copied from a buffer, a new level's zeros) made a buffer of its own in
+/// a custom heap and mapped it ("one buffer per copy"), since the card may
+/// be the one that fills it: 8,083 more shared buffers made in a session
+/// than without the stage, three or four a frame. A list holds the buffers
+/// it took until it is reset, which is after its last submission ran
+/// (`HostList::reset`, `crate::list::recycle`), or until it is dropped, as
+/// it held the buffers it made, and gives them back here then: as the
+/// scratch chunks ([`SPARE`]). A buffer taken again holds what its last
+/// list left, not zeros: every upload is filled whole by its caller (the
+/// bytes copied, or zeros written), on the CPU or by the card.
+static SHARED_SPARE: Mutex<Spare<SharedKept>> = Mutex::new(Spare::new());
+
+/// A shared buffer of a class, held by a list ([`Deferred::shared`]) and
+/// given back to [`SHARED_SPARE`] when the list lets it go.
+struct SharedHeld {
+    kept: Option<SharedKept>,
+    class: u64,
+}
+
+impl Drop for SharedHeld {
+    fn drop(&mut self) {
+        let Some(kept) = self.kept.take() else {
+            return;
+        };
+        // Past the limit it comes back, and is freed outside the lock.
+        let back =
+            SHARED_SPARE.lock().unwrap_or_else(|e| e.into_inner()).give(kept, self.class, SHARED_SPARE_MOST, now_ms());
+        drop(back);
+    }
+}
+
+/// A shared buffer of `class` bytes ([`shared_class`]): one kept
+/// ([`SHARED_SPARE`]) or a new one.
+fn take_shared(host: &Host, class: u64) -> Option<SharedHeld> {
+    let kept = SHARED_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(class);
+    let kept = match kept {
+        Some(kept) => kept,
+        None => {
+            let (buffer, data) = host.shared_buffer(class)?;
+            SharedKept { buffer, data: data as usize }
+        }
+    };
+    Some(SharedHeld { kept: Some(kept), class })
+}
+
 /// Collected D3D12 COM buffers removed from idle lists so they drop outside locks.
 #[derive(Default)]
 pub(crate) struct TrimmedListCaches(Vec<ID3D12Resource>);
@@ -2934,6 +3011,10 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
+    /// With [`card_steps`]' stage 2: the shared buffers of `uploads` that
+    /// go back to [`SHARED_SPARE`] when the list lets them go (a clone of
+    /// each is in `uploads` too). Empty otherwise.
+    shared: Vec<SharedHeld>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.

@@ -1086,8 +1086,23 @@ impl HostList {
     /// reset.
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// (With [`card_steps`]' stage 2 they are: a buffer of the upload's size
+    /// class, kept in [`SHARED_SPARE`] between lists; it may be larger than
+    /// `size`.)
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
+        if card_steps::stage() > 1
+            && let Some(class) = shared_class(size)
+        {
+            let held = take_shared(host, class)?;
+            let kept = held.kept.as_ref()?;
+            let (buffer, data) = (kept.buffer.clone(), kept.data as *mut u8);
+            name_frame(&buffer, || format!("list upload {size:#x} (shared, {class:#x})"));
+            let mut deferred = self.deferred();
+            deferred.hold_upload(buffer.clone(), class);
+            deferred.shared.push(held);
+            return Some((buffer, data));
+        }
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name_frame(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
