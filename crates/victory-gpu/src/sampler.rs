@@ -76,12 +76,15 @@ impl Fields {
     }
 }
 
-/// What a heap sampler goes by ([`console`]): [`aniso_point_mip`], unless
-/// `VICTORY_HEAP_ANISO_POINT_MIP=0`, which keeps every anisotropic heap
-/// sampler on linear mips (0x55), as before.
+/// What a heap sampler goes by ([`console`]): [`aniso_point_mip`] only with
+/// `VICTORY_HEAP_ANISO_POINT_MIP=1`; unset, every anisotropic heap sampler
+/// stays on linear mips (0x55), as before. Off by default: on the lab's
+/// NVIDIA card the runtime says it can filter so (`D3D12_OPTIONS19`), yet
+/// making one such sampler (0x54) in a heap of ours removed the device
+/// (`the_host_takes_its_anisotropic_samplers`, run alone, 26 November).
 pub(crate) fn heap_aniso_point_mip(device: &ID3D12Device) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_ANISO_POINT_MIP").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_ANISO_POINT_MIP").is_some_and(|v| v == "1"))
         && aniso_point_mip(device)
 }
 
@@ -198,6 +201,7 @@ mod tests {
     /// ours, leaves the device as it was. It says which it made (a run
     /// without a device says it was skipped).
     #[test]
+    #[ignore = "removes the device on the lab's NVIDIA card (point-mip anisotropic sampler, 0x54); run by hand"]
     fn the_host_takes_its_anisotropic_samplers() {
         let Some(host) = crate::host::host() else {
             eprintln!("skipped: no host GPU here");
