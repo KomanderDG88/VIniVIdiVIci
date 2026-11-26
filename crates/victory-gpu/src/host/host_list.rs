@@ -1298,6 +1298,16 @@ impl HostList {
         // submitting thread waits behind its own jobs there. Only with the
         // heap worker (`VICTORY_HEAP_WORKER=1`, off by default), whose lists
         // are the ones read ahead: without it nothing changes.
+        // Risks, not measured here: (1) these threads take the lock of
+        // `watch::writes` like any refresh, but `VICTORY_COPY_PLAIN` (the
+        // in-place copies of the lab's G1 profile) copies without it, so
+        // with both on a texture may be read while a plain copy rewrites
+        // the same title memory (the read stays whole or fails and is
+        // done again at the submission, but nothing orders the two);
+        // (2) each flush makes new threads, and each thread's read buffer
+        // (`READ`) grows to the largest texture it read: more short peaks
+        // of memory while the queue is behind. Do not turn the worker on
+        // for the long sessions until both have been looked at in a run.
         static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let threads = *THREADS.get_or_init(|| {
             std::env::var("VICTORY_REFRESH_WIDE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4usize).clamp(1, 8)
