@@ -5055,7 +5055,7 @@ impl Host {
                             ranges.iter().map(|&(a, b)| (b - a) as u64).sum(),
                             ranges.len() as u64,
                         );
-                                                synced.push(Synced { shadow, ranges, before, size });
+                        synced.push(Synced { shadow, ranges, before, size });
                         if !batched {
                             // As before: this copy's hash passes behind its copies.
                             hashes(list, &synced[synced.len() - 1..]);

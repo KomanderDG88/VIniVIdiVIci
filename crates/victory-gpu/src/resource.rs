@@ -3657,7 +3657,6 @@ mod tests {
         }
     }
 
-
     /// An earlier title-memory upload must not suppress a later alias copy
     /// from a GPU-written probe atlas into the same sampled texture.
     #[cfg(all(windows, feature = "diagnostics"))]
