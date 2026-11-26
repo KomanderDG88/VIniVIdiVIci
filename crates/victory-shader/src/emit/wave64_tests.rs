@@ -995,7 +995,8 @@ fn paired_lanes_loop_apart_and_meet_the_other_wave_at_the_barrier() {
     eprintln!("ran on the hardware device: two console waves, their loops and LDS as on the console");
 }
 
-/// One console wave: `ds_bpermute_b32` from the mirror lane; a DPP row shift whose row mask
+/// One console wave: `ds_bpermute_b32` from the mirror lane (within its own 32-lane half, as
+/// RDNA 2 permutes; across the wave with `VICTORY_BPERMUTE_HALVES=0`); a DPP row shift whose row mask
 /// leaves rows 0 and 3 alone (rows 2 and 3 are lanes 32-63: rows are counted in console lanes); a
 /// `ds_swizzle_b32` swapping the two 16-lane rows of each 32 lanes; `v_writelane_b32` of s0
 /// into lane 45.
@@ -1025,7 +1026,12 @@ fn paired_lanes_permute_shift_and_write_lanes_of_both_halves() {
         .flat_map(|n| {
             let shifted = if matches!(n >> 4, 1 | 2) && n & 15 != 0 { x(n - 1) } else { 1000 };
             let swizzled = x(n & 32 | (n & 31) ^ 16);
-            [x(63 - n), shifted, swizzled, if n == 45 { s0 } else { n }]
+            let mirror = if std::env::var_os("VICTORY_BPERMUTE_HALVES").is_some_and(|v| v == "0") {
+                63 - n
+            } else {
+                n & 32 | (63 - n) & 31
+            };
+            [x(mirror), shifted, swizzled, if n == 45 { s0 } else { n }]
         })
         .collect();
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
