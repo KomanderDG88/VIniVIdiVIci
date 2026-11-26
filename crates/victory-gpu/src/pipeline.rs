@@ -410,6 +410,43 @@ pub(crate) fn walk_held(this: This) -> bool {
     true
 }
 
+/// Whether a compute container is one of the title's `bvh_skinning`
+/// programs, by the name it carries: they pose every animated mesh (and
+/// its motion) once more, only for the ray-tracing structures, which the
+/// structure builder makes from what they write.
+#[cfg(windows)]
+fn skins_for_rays(bytes: &[u8]) -> bool {
+    const NAME: &[u8] = b"bvh_skinningCS";
+    bytes.windows(NAME.len()).any(|w| w == NAME)
+}
+
+/// `VICTORY_RT_SKIN_SKIP=1` (off by default): dispatches of the title's
+/// `bvh_skinning` programs ([`skins_for_rays`]) are left out, direct and
+/// indirect. Only while the structure builder is off (without
+/// `VICTORY_BVH_BUILDER=1`): then nothing reads what they write. Meant
+/// with `VICTORY_BVH_NO_HIT=1` or `VICTORY_BVH_HOLD=1`, under which no
+/// ray reads the structures either. Read once, when pipelines are made:
+/// off, no container is looked at.
+///
+/// From edsuuu/VI-BR-PORT ab4571df (GPL-3.0), where it rides on their
+/// `VICTORY_RT_MISS=1`: the largest share of the card's time in a cutscene
+/// there (~6 ms a dispatch, hundreds a frame).
+#[cfg(windows)]
+fn rt_skin_skip_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_RT_SKIN_SKIP").is_some_and(|v| v == "1") && !builder_allowed()
+    })
+}
+
+/// Whether a dispatch with the title's pipeline `this` is left out because
+/// it only feeds the ray-tracing structures nothing builds
+/// ([`rt_skin_skip_on`]).
+#[cfg(windows)]
+pub(crate) fn skips_rt_skin(this: This) -> bool {
+    !this.is_null() && pipeline(this).rt_skin
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -551,6 +588,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// One of the title's skinning passes for the ray-tracing structures,
+    /// left out ([`skips_rt_skin`]).
+    #[cfg(windows)]
+    rt_skin: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -742,6 +783,11 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        rt_skin: rt_skin_skip_on()
+            && shaders
+                .iter()
+                .any(|s| s.stage == "compute" && skins_for_rays(&s.container)),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -976,6 +1022,20 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// The title's skinning passes for the ray-tracing structures are known
+    /// by the name in their container; other skinning programs are not.
+    #[cfg(windows)]
+    #[test]
+    fn ray_skinning_programs_are_known_by_name() {
+        assert!(skins_for_rays(
+            b"..\0bvh_skinningCSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."
+        ));
+        assert!(skins_for_rays(b"bvh_skinningCS"));
+        assert!(!skins_for_rays(b"PS_PedSkin_0001"));
+        assert!(!skins_for_rays(b"bvh_skinningPS"));
+        assert!(!skins_for_rays(b""));
+    }
 
     /// Which stores give title-memory copies as written: a vector store
     /// through a buffer descriptor does not; flat, global and scalar-memory
