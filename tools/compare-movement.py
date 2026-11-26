@@ -76,6 +76,7 @@ def measure(path):
             'other_cpu_logical_max': round(max(other_cpu), 2) if other_cpu else None,
             'other_cpu_samples': len(other_cpu),
             'other_cpu_warning': 'median above 2 logical processors; repeat under similar load' if other_cpu and statistics.median(other_cpu) > 2 else ('no load samples' if not other_cpu else None),
+            'other_cpu_caveat': 'System-wide busy minus this process, from approximately one-second samples; includes kernel/interrupt work and is not proof of load from other applications.',
             'inputs': {key: {'events': len(v), 'missed': sum(x == 0 for x in v), 'minimum_reads': min(v) if v else None} for key,v in key_reads.items()}}
 
 if __name__ == '__main__':

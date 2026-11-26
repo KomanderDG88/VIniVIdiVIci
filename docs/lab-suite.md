@@ -146,6 +146,21 @@ nothing of the title.
   and warns when the median is above two: such a run was not measured on a
   quiet machine and is not to be compared.
 
+- `tools/movement-elapsed-window.py <run-dir>` gives that window in the runner's
+  own clock (seconds since `launch.json` says the run started): the first
+  scripted key comes some seconds after its scheduled time, and the files
+  the runner writes beside the log are in that clock.
+- `tools/summarize-cpu-processes.py <cpu-processes.jsonl> <start> <end>` adds
+  up, over the samples that lie wholly inside those seconds, the processes a
+  runner sampled as taking the most processor time (each line: `seconds`,
+  `interval_seconds` and a `top` list of `name` and `logical_cores`). A
+  process outside a sample's list is not counted, so the figures are lower
+  bounds.
+- `tools/summarize-window-sample.py <run-dir> <start> <end>` gives the medians,
+  by logged batch, of what `VICTORY_WINDOW_SKIP_SAME=sample` counted: megabytes
+  copied and how many of them held bytes already there. One page in sixteen is
+  compared and the rest estimated from it.
+
 Only batches that lie wholly inside the window count, and the layer rounds a
 batch's length, so two runs can be compared with each other but the figures are
 not exact. The same keys at the same times do not make the same scene: the

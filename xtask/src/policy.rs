@@ -42,6 +42,14 @@ const AUTHORED_TEST_TOOLS: &[&str] = &[
     "tools/movement-frame-summary.py",
     "tools/compare-movement.py",
     "tests/test_compare_movement.py",
+    // A measured window in the runner's own clock, the processes that
+    // took the most processor time in it, and the window-copy sample.
+    "tools/movement-elapsed-window.py",
+    "tests/test_movement_elapsed_window.py",
+    "tools/summarize-cpu-processes.py",
+    "tests/test_summarize_cpu_processes.py",
+    "tools/summarize-window-sample.py",
+    "tests/test_summarize_window_sample.py",
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
