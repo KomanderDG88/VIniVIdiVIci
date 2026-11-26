@@ -14,8 +14,15 @@
 //!   no longer hands its core to another ready thread: fine with free cores,
 //!   worse if the title runs more busy threads than the host has.
 //! - `VICTORY_PATCH_CLZERO=1`: `clzero` (zero the 64-byte line at `rax`)
-//!   does not fit in three bytes, and a jump needs five, so only the two
-//!   loops the emulation already recognises are rewritten, where the
+//!   does not fit in three bytes, and a jump needs five, so only loops the
+//!   emulation already recognises are rewritten: with `=1` the first form
+//!   alone (`clzero; add rax, 0x40; cmp; jb`: the `add` is moved and the
+//!   loop's condition stays where it was); with `=2` also the second (`mov
+//!   rax, a; add a, 0x40; clzero; cmp a, b; jb`), whose moved instruction
+//!   is the loop's CONDITION: if any code jumps straight to that `cmp` (a
+//!   `while` loop entered at its test), after the rewrite it lands in the
+//!   middle of the `jmp rel32` and runs garbage. Nothing here checks jump
+//!   targets, so `=2` is a risk taken knowingly. In both, where the
 //!   instruction after `clzero` is a known register-only one (`add rax,
 //!   0x40` or `cmp r64, r64`): those `clzero` + next instruction bytes
 //!   become `jmp` to a trampoline that zeroes the line with plain stores,
@@ -69,13 +76,15 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// Turns the `monitorx`/`mwaitx` rewrite on.
 pub(crate) const WAITS_ENV: &str = "VICTORY_PATCH_WAITS";
-/// Turns the `clzero` loop rewrite on.
+/// Turns the `clzero` loop rewrite on: `1` the first loop form only, `2`
+/// both (see the module's notes on the second form's risk).
 pub(crate) const CLZERO_ENV: &str = "VICTORY_PATCH_CLZERO";
 /// Turns the `clwb` rewrite on.
 pub(crate) const CLWB_ENV: &str = "VICTORY_PATCH_CLWB";
 
 static WAITS: AtomicBool = AtomicBool::new(false);
-static CLZERO: AtomicBool = AtomicBool::new(false);
+/// 0 off; 1 the first `clzero` loop form; 2 both forms.
+static CLZERO: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static CLWB: AtomicBool = AtomicBool::new(false);
 /// Sites rewritten so far.
 static PATCHED: AtomicUsize = AtomicUsize::new(0);
@@ -96,13 +105,18 @@ const ADD_RAX_40: [u8; 4] = [0x48, 0x83, 0xc0, 0x40];
 pub(crate) fn read_switches() {
     let on = |name| std::env::var_os(name).is_some_and(|value| value == "1");
     WAITS.store(on(WAITS_ENV), Ordering::Relaxed);
-    CLZERO.store(on(CLZERO_ENV), Ordering::Relaxed);
+    let clzero = match std::env::var(CLZERO_ENV).as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    };
+    CLZERO.store(clzero, Ordering::Relaxed);
     CLWB.store(on(CLWB_ENV), Ordering::Relaxed);
 }
 
 /// Some rewrite is on: sites may change under a fault.
 fn any_switch() -> bool {
-    WAITS.load(Ordering::Relaxed) || CLZERO.load(Ordering::Relaxed) || CLWB.load(Ordering::Relaxed)
+    WAITS.load(Ordering::Relaxed) || CLZERO.load(Ordering::Relaxed) != 0 || CLWB.load(Ordering::Relaxed)
 }
 
 /// The multi-byte NOPs the Intel SDM recommends (`NOP` instruction), by
@@ -312,10 +326,19 @@ pub(crate) fn after_wait(site: usize, code: [u8; 3]) {
 
 /// A `clzero` at `site` was just emulated, moving `rip` by `skipped`.
 pub(crate) fn after_clzero(site: usize, skipped: u64) {
-    if !CLZERO.load(Ordering::Relaxed) {
+    let level = CLZERO.load(Ordering::Relaxed);
+    if level == 0 {
         return;
     }
-    decide(site, "clzero", |state| {
+    let what = match skipped {
+        12 => "clzero, first loop form (clzero; add rax, 0x40; cmp; jb)",
+        8 => "clzero, second loop form (mov rax, a; add a, 0x40; clzero; cmp a, b; jb)",
+        _ => "clzero",
+    };
+    decide(site, what, |state| {
+        if skipped == 8 && level < 2 {
+            return Err("second loop form (its moved instruction is the loop's condition): only with VICTORY_PATCH_CLZERO=2");
+        }
         // Both loops were matched with their bytes inside the page (8 and
         // 12 bytes from `site`), so 8 are readable.
         let code = if matches!(skipped, 8 | 12) {
