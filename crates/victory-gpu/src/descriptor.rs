@@ -574,6 +574,13 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        // Its run of title-memory views goes with it: a heap made later at
+        // the same address must not find this one's run (fork pull request
+        // #589, AscilCH).
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::forget_heap(host);
+        }
     }
 }
 
@@ -1691,6 +1698,36 @@ mod tests {
             ),
             5..5
         );
+    }
+
+    /// A released view heap takes its run of title-memory views with it
+    /// (`memory::forget_heap`): a heap made later at the same address starts
+    /// its own run. (Fork pull request #589's test, on our helpers.)
+    #[cfg(windows)]
+    #[test]
+    fn a_released_view_heap_forgets_its_title_memory_run() {
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = device.new_list().expect("a host list");
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let host_heap = heap(h).host().expect("a host view heap");
+        let key = std::ptr::from_ref(host_heap) as usize;
+        assert!(crate::memory::ready(&list, host_heap, &[], &[], false).is_some());
+        assert!(crate::memory::has_run(key), "the heap's run is kept while it lives");
+        assert_eq!(object::release_boxed::<Heap>(h), 0);
+        assert!(!crate::memory::has_run(key), "a released heap's run is forgotten");
     }
 
     /// A table made afresh for a draw holds the descriptors its shader
