@@ -241,6 +241,18 @@ fn bake_sources_mode() -> (BakeMode, u64) {
     })
 }
 
+/// Whether the title slot at `handle` holds a texture the title placed in
+/// memory that is there (some of it mapped).
+fn placed_there(handle: u64) -> bool {
+    matches!(
+        crate::descriptor::view(handle),
+        Some(View::Placed(false, resource, desc)) if crate::texture::mapped_bytes(
+            (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
+            crate::resource::placed_bytes(&resource).unwrap_or(1) as usize,
+        ) > 0
+    )
+}
+
 /// What a bake draw samples ([`State::bake_sources`]).
 #[derive(Default, Debug)]
 struct BakeSources {
@@ -2721,6 +2733,81 @@ impl State {
         if bake_sources_mode().0 != BakeMode::Off {
             self.bake_sources_pass(list, p);
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::null_samples::on() {
+            self.null_samples(p);
+        }
+    }
+
+    /// `VICTORY_NULL_SAMPLES=count` ([`crate::null_samples`]): after the
+    /// runs above, the slots this draw's pixel shader picks by index, by
+    /// what their host slot shows: a skin bake's [`State::bake_sources`],
+    /// and views selected from root constants as [`State::tables`] finds
+    /// them, but in tables it makes afresh (from the title's records).
+    /// Indices a shader reads from other memory are not known here.
+    #[cfg(feature = "diagnostics")]
+    fn null_samples(&self, p: &HostPipeline) {
+        use crate::descriptor::host::SlotShows;
+        let Some(stage) = p.stages.iter().find(|s| s.shader.stage == "pixel") else {
+            return;
+        };
+        let t = stage.translated();
+        let tables = bake_tables(p);
+        if tables.is_none() && t.host.root_indexed_views.is_empty() {
+            return;
+        }
+        let mut slots: Vec<(&'static crate::descriptor::Heap, u32, u64)> = Vec::new();
+        if let Some(tables) = tables
+            && let Some(heap) = self
+                .heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .map(|&h| crate::descriptor::heap(h as This))
+                .find(|h| !h.samplers())
+            && let Some(host) = heap.host()
+            && let Some(sources) = self.bake_sources(tables, heap, host)
+        {
+            slots.extend(sources.textures.iter().map(|&(index, handle)| (heap, index, handle)));
+        }
+        for index in &t.host.root_indexed_views {
+            let slot = index.table_slot;
+            let fresh = t.used.iter().any(|u| u.root == RootType::Table && u.slot == slot && u.kind == ResourceType::Cbv)
+                || t.host.half_views.iter().any(|h| h.0 == slot);
+            let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(slot)).filter(|_| !fresh) else {
+                continue;
+            };
+            let constant = self.user_value(false, index.constant_slot, RootType::Constants, index.constant_dword);
+            let handle = table + u64::from(index.byte_offset.wrapping_add(constant << index.shift) / 32) * 32;
+            if let Some(heap) = self.heap_of(table)
+                && let Some(at) = heap.index(handle)
+            {
+                slots.push((heap, at, handle));
+            }
+        }
+        let mut c = crate::null_samples::Counts::default();
+        for (heap, index, handle) in slots {
+            let (Some(view), Some(host)) = (crate::descriptor::view(handle), heap.host()) else {
+                continue;
+            };
+            let texture = crate::descriptor::host::is_texture_view(&view);
+            *if texture { &mut c.textures } else { &mut c.buffers } += 1;
+            let Some((shows, queued)) = host.texture_slot_shows(index, handle) else {
+                c.clamped += 1;
+                continue;
+            };
+            if !texture {
+                continue;
+            }
+            match shows {
+                SlotShows::Null => c.null += 1,
+                SlotShows::MadeButNull => c.made_but_null += 1,
+                SlotShows::Other => c.other_copy += 1,
+                SlotShows::This => {}
+            }
+            let shown = matches!(shows, SlotShows::This | SlotShows::Other);
+            c.stale += u32::from(if shown { queued } else { !queued && placed_there(handle) });
+        }
+        crate::null_samples::record(&stage.shader.hash, c);
     }
 
     /// [`State::early_textures`]' runs within budgets of their own.
@@ -2890,12 +2977,7 @@ impl State {
             }
             if host.texture_slot_made_from(index, handle) {
                 sources.ready += 1;
-            } else if let Some(View::Placed(false, resource, desc)) = crate::descriptor::view(handle)
-                && crate::texture::mapped_bytes(
-                    (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
-                    crate::resource::placed_bytes(&resource).unwrap_or(1) as usize,
-                ) > 0
-            {
+            } else if placed_there(handle) {
                 sources.unmade.push(index);
             } else {
                 sources.other += 1;
@@ -2908,16 +2990,8 @@ impl State {
     /// by the title in memory that is there, with a host slot that shows
     /// nothing of them. Counted when the runs before the draw are done.
     fn bake_missing(sources: &BakeSources, host: &crate::descriptor::host::HostHeap) -> u64 {
-        let missing = |&&(index, handle): &&(u32, u64)| {
-            !host.texture_slot_made_from(index, handle)
-                && matches!(
-                    crate::descriptor::view(handle),
-                    Some(View::Placed(false, resource, desc)) if crate::texture::mapped_bytes(
-                        (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
-                        crate::resource::placed_bytes(&resource).unwrap_or(1) as usize,
-                    ) > 0
-                )
-        };
+        let missing =
+            |&&(index, handle): &&(u32, u64)| !host.texture_slot_made_from(index, handle) && placed_there(handle);
         sources.textures.iter().filter(missing).count() as u64
     }
 

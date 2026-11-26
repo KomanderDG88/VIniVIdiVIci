@@ -89,6 +89,8 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod merge;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod null_samples;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
