@@ -1287,7 +1287,36 @@ impl HostList {
                 _ => None,
             })
             .collect();
-        textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64
+        // While the queue is behind (the last pass left slots due), on
+        // threads of their own (`VICTORY_REFRESH_WIDE=<n>`, 4 unless said;
+        // `0` or `1`: one after the other on this thread, as before). Each
+        // texture's staging locks itself; reading a texture whose pages are
+        // out of memory waits on the disk, and one thread a texture at a
+        // time left thousands of slots due at a change of shot. Only while
+        // behind: otherwise these reads compete with the submitting thread's
+        // copies for the same memory. Not the kept wide threads: the
+        // submitting thread waits behind its own jobs there. Only with the
+        // heap worker (`VICTORY_HEAP_WORKER=1`, off by default), whose lists
+        // are the ones read ahead: without it nothing changes.
+        static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let threads = *THREADS.get_or_init(|| {
+            std::env::var("VICTORY_REFRESH_WIDE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4usize).clamp(1, 8)
+        });
+        if threads < 2
+            || textures.len() < 4
+            || !crate::heap_worker::on()
+            || !crate::draw::BACKLOG_LEFT.load(Ordering::Relaxed)
+        {
+            return textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64;
+        }
+        let per = textures.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let parts: Vec<_> = textures
+                .chunks(per)
+                .map(|chunk| scope.spawn(move || chunk.iter().filter(|staging| !staging.refresh_ahead()).count() as u64))
+                .collect();
+            parts.into_iter().map(|p| p.join().unwrap_or(0)).sum()
+        })
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
