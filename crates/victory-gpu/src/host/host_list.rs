@@ -140,14 +140,32 @@ impl HostList {
         self._alive.used();
         *self.clamp_window.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Oversized per-list tables shrunk on reset only with
+        // `VICTORY_RAM_TRIM=1`.
+        let trim = crate::ram_trim::aggressive();
+        {
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            states.clear();
+            if trim && states.capacity() > 1024 {
+                states.shrink_to(256);
+            }
+        }
+        {
+            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            twins.clear();
+            if trim && twins.capacity() > 256 {
+                twins.shrink_to(64);
+            }
+        }
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
             let Gather { closed, written, sets, spare, .. } = &mut *gather;
             *closed = false;
             written.clear();
+            if trim && written.capacity() > 256 {
+                written.shrink_to(64);
+            }
             for set in sets.drain(..) {
                 if spare.len() < GATHER_SETS {
                     spare.push(set.into_scratch());
@@ -155,7 +173,13 @@ impl HostList {
             }
         }
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            notes.clear();
+            if trim && notes.capacity() > 512 {
+                notes.shrink_to(128);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         {
             *self.shot_block.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, 0);
@@ -192,6 +216,34 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Collects spare gather/indirect COM buffers held on an idle list into `out`
+    /// so callers can drop D3D12 COM references outside `gather`, `indirect_args`,
+    /// and `list::IDLE` mutexes.
+    pub(crate) fn take_idle_caches(&self, out: &mut TrimmedListCaches) -> u64 {
+        let mut freed_bytes = 0u64;
+        {
+            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            if !gather.spare.is_empty() {
+                let each = u64::from(crate::indirect::GATHER_MOST)
+                    * u64::from(crate::indirect::GATHER_STRIDE);
+                freed_bytes += (gather.spare.len() as u64) * each;
+                out.0.append(&mut gather.spare);
+                gather.spare.shrink_to_fit();
+            }
+        }
+        {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            let cap = slot.as_ref().map_or(0, |(_, cap)| *cap);
+            if cap >= (1 << 20)
+                && let Some((res, _)) = slot.take()
+            {
+                freed_bytes += cap;
+                out.0.push(res);
+            }
+        }
+        freed_bytes
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
