@@ -70,6 +70,14 @@ impl SlotSet {
         slots
     }
 
+    /// Puts every slot of `slots` in (the pass hands its changed slots
+    /// over in one batch: `HostHeap::mirror_copied_page`).
+    fn extend(&mut self, slots: impl IntoIterator<Item = u32>) {
+        for slot in slots {
+            self.insert(slot);
+        }
+    }
+
     fn take(&mut self) -> Vec<u32> {
         let slots = self.slots();
         if self.len != 0 {
