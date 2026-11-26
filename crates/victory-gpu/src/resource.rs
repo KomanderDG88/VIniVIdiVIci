@@ -1525,23 +1525,49 @@ pub(crate) fn room() -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
-        return filled < limit;
-    }
-    if filled < FLOOR {
+    if limit.is_none() && filled < FLOOR {
         return true;
     }
-    match crate::host::host().and_then(|h| h.video_memory()) {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
+    // What is kept for card copies of title buffers not made yet
+    // (`crate::shadow::card_room_kept`) and for the render targets a world
+    // makes in its first frame ([`targets_room_kept`]) counts as used.
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    let kept = crate::shadow::card_room_kept() + targets_room_kept();
+    room_by(Room { filled, limit, floor: FLOOR, without_budget: WITHOUT_BUDGET }, memory, kept, room_percent(), spill())
+}
+
+/// What [`room_by`] goes by besides the card: the bytes of host copies of
+/// title textures made, an explicit limit on them, the bytes always
+/// allowed, and the limit when the card says no budget.
+#[derive(Clone, Copy)]
+struct Room {
+    filled: u64,
+    limit: Option<u64>,
+    floor: u64,
+    without_budget: u64,
+}
+
+/// [`room`]'s answer from its figures (a function of them alone, for the
+/// tests). `memory`: the card's budget and use, then the shared memory's
+/// (`crate::host::Host::video_memory`: two segment groups the system counts
+/// apart, so nothing is counted twice); `kept`: bytes kept for others and
+/// counted as used; `percent`: the share of the budget copies may reach;
+/// `spill`: past it, on into the shared memory up to half its budget. An
+/// explicit limit decides alone; sums saturate.
+fn room_by(r: Room, memory: Option<[u64; 4]>, kept: u64, percent: u64, spill: bool) -> bool {
+    if let Some(limit) = r.limit {
+        return r.filled < limit;
+    }
+    if r.filled < r.floor {
+        return true;
+    }
+    match memory {
         Some([budget, used, shared_budget, shared_used]) => {
-            let kept = crate::shadow::card_room_kept() + targets_room_kept();
-            let own = budget / 100 * room_percent();
-            used + kept < own || (spill() && used + kept + shared_used < own + shared_budget / 2)
+            let own = budget / 100 * percent;
+            let card = used.saturating_add(kept);
+            card < own || (spill && card.saturating_add(shared_used) < own.saturating_add(shared_budget / 2))
         }
-        None => filled < WITHOUT_BUDGET,
+        None => r.filled < r.without_budget,
     }
 }
 
@@ -2944,6 +2970,56 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod room_by {
+        use super::super::{Room, room_by};
+        const MB: u64 = 1 << 20;
+        const R: Room = Room { filled: 3000 * MB, limit: None, floor: 2048 * MB, without_budget: 4096 * MB };
+        /// An 8 GB card: 7,000 MB of budget, 3,500 shared.
+        fn card(used: u64, shared_used: u64) -> Option<[u64; 4]> {
+            Some([7000 * MB, used * MB, 3500 * MB, shared_used * MB])
+        }
+
+        #[test]
+        fn without_spill_the_card_alone_decides_as_before() {
+            // 90 % of 7,000 MB is 6,300 MB, less what is kept (300 MB).
+            assert!(room_by(R, card(5999, 0), 300 * MB, 90, false));
+            assert!(!room_by(R, card(6000, 0), 300 * MB, 90, false), "equal is no room");
+            assert!(!room_by(R, card(6500, 0), 0, 90, false));
+        }
+
+        #[test]
+        fn with_spill_copies_go_on_to_half_the_shared_budget() {
+            // Own 6,300 MB + half of 3,500 = 8,050 MB, card use + kept + shared use.
+            assert!(room_by(R, card(6500, 1000), 300 * MB, 90, true));
+            assert!(!room_by(R, card(6500, 1250), 300 * MB, 90, true), "equal is no room");
+            assert!(!room_by(R, card(6500, 3000), 300 * MB, 90, true));
+            // No shared budget: the same as without.
+            assert!(!room_by(R, Some([7000 * MB, 6500 * MB, 0, 0]), 0, 90, true));
+        }
+
+        #[test]
+        fn a_limit_decides_alone_and_the_floor_always_has_room() {
+            let limited = Room { limit: Some(3500 * MB), ..R };
+            assert!(room_by(limited, card(6999, 3499), 0, 90, true));
+            assert!(!room_by(Room { limit: Some(2000 * MB), ..R }, card(0, 0), 0, 90, true));
+            let small = Room { filled: 1000 * MB, ..R };
+            assert!(room_by(small, card(7000, 3500), 0, 90, false));
+        }
+
+        #[test]
+        fn without_a_budget_the_bytes_made_decide() {
+            assert!(room_by(R, None, 0, 90, true));
+            assert!(!room_by(Room { filled: 4096 * MB, ..R }, None, 0, 90, true));
+        }
+
+        #[test]
+        fn sums_near_the_top_do_not_wrap() {
+            let huge = Some([u64::MAX, u64::MAX - 1, u64::MAX, u64::MAX]);
+            assert!(!room_by(R, huge, u64::MAX, 100, true));
+            assert!(!room_by(R, huge, u64::MAX, 100, false));
+        }
+    }
     use crate::object::slot;
 
     /// Views of a host copy without its largest level keep their texels:
