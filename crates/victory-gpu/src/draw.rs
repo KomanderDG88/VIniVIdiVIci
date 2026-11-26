@@ -1031,7 +1031,20 @@ pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
-pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Then (`TextureQueue::census`, for `VICTORY_FAIR_DUE`'s line): due slots
+/// never looked at and the frames the longest of them has waited; due
+/// slots whose host copy shows less than the title holds and the frames
+/// the longest has waited; the frames since the first upload in part of
+/// the slot longest in that state.
+pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// Frames at most between two looks at a slot uploaded in part
+/// (`VICTORY_FAIR_DUE=2`): there are few of them, a look is a query, and
+/// a shader reads what they show. (They waited up to the frames of four
+/// seconds, as slots without memory do, for a mapping the runtime did not
+/// tell of.)
+const PART_LOOK_FRAMES: u64 = 8;
+
 /// Since the start: looks at a slot uploaded in part that found no more of
 /// its memory mapped; uploads of textures not all mapped; and of those,
 /// the ones whose first page was not there (asked by the first page alone,
@@ -2940,6 +2953,10 @@ impl State {
             }
             None => (span, per_frame),
         };
+        // `VICTORY_FAIR_DUE=2` (`descriptor::host::fair_due`): the queue
+        // knows which slots show an upload, and slots uploaded in part are
+        // looked at again sooner. Unset: as before.
+        let fair = crate::descriptor::host::fair_due() >= 2;
         let began = std::time::Instant::now();
         for (index, write) in due {
             // A run for a bake draw's own ends at its own bytes, not at the
@@ -3027,6 +3044,9 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
+                    if fair {
+                        host.texture_slot_away(index);
+                    }
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
@@ -3042,6 +3062,7 @@ impl State {
                             PASS_SOURCED.set([uploaded, bytes, unmapped, as_before + 1]);
                         }
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
+                        let most = if fair { most.min(PART_LOOK_FRAMES) } else { most };
                         host.texture_slot_later(index, write, frame, most);
                         continue;
                     }
@@ -3181,9 +3202,14 @@ impl State {
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the
             // title mapped: again in 120 frames, as before).
+            // (`VICTORY_FAIR_DUE=2`: a texture object, of whose memory the
+            // runtime's mappings tell nothing here, again after the frames
+            // of about four seconds if those are fewer than 120: at a
+            // loading frame every two seconds, 120 frames were four
+            // minutes with its last mips missing.)
             let again = match partly {
                 Some(mapped) => Some((frame + 1, mapped)),
-                None => (!whole).then_some((frame + 120, 0)),
+                None => (!whole).then_some((frame + if fair { most.min(120) } else { 120 }, 0)),
             };
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
@@ -3232,6 +3258,10 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            if fair {
+                // What a shader reads at the slot from now on is this upload.
+                host.texture_slot_uploaded(index);
+            }
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {

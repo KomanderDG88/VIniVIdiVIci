@@ -9695,6 +9695,20 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
             }
+            // The queue's fairness (`VICTORY_FAIR_DUE`; only when set).
+            {
+                let mode = crate::descriptor::host::fair_due();
+                if mode != 0 {
+                    let [due, partly] = [1, 3].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
+                    let [fresh, fresh_waited, short, short_waited, part_frames] =
+                        [5, 6, 7, 8, 9].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "texture queue: {due} textures due ({fresh} never looked at, the oldest waiting {fresh_waited} frames; \
+                         {short} showing less than the title holds, the oldest waiting {short_waited} frames), \
+                         {partly} uploaded in part (the longest for {part_frames} frames) (VICTORY_FAIR_DUE={mode})"
+                    );
+                }
+            }
             {
                 let mode = crate::watch::page_writes();
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
