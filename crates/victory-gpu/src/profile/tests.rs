@@ -310,12 +310,35 @@ fn deep_stacks_are_cut_not_lost() {
 /// Registers and stack bytes that mean nothing, at addresses inside real
 /// code: the walk stops, and reads nothing outside its copy (a read
 /// elsewhere would end the test with an access violation).
+///
+/// Only modules that stay loaded for the whole run are used: the test
+/// executable, ntdll.dll, kernel32.dll and kernelbase.dll. The module list
+/// is taken once, while other tests run alongside and create and drop
+/// D3D12/WARP devices, which loads and unloads DLLs (d3d12core, WARP,
+/// dxcompiler, dxil...). An address picked in one of those could be freed
+/// before its bytes are read here or its unwind data is read by the walk,
+/// and that access violation would be the test's, not the walk's.
 #[test]
 fn stacks_that_mean_nothing_are_walked_without_a_fault() {
     let mut symbols = Symbols::new(false);
     symbols.refresh();
-    let modules: Vec<(u64, u64)> = symbols.modules.iter().map(|m| (m.base, m.end)).collect();
-    assert!(modules.len() > 3);
+    // SAFETY: a plain query.
+    let mut lasting = vec![unsafe { GetModuleHandleW(null()) } as u64];
+    for name in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
+        let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: a plain query, the name ends in a zero.
+        let handle = unsafe { GetModuleHandleW(name.as_ptr()) };
+        if !handle.is_null() {
+            lasting.push(handle as u64);
+        }
+    }
+    let modules: Vec<(u64, u64)> = symbols
+        .modules
+        .iter()
+        .filter(|m| lasting.contains(&m.base))
+        .map(|m| (m.base, m.end))
+        .collect();
+    assert!(modules.len() >= 2, "{} lasting modules", modules.len());
     let mut sampler = Sampler::new(config(1000));
     // SAFETY: a plain query.
     let me = unsafe { GetCurrentThreadId() };
