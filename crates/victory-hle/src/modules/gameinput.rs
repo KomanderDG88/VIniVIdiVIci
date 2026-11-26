@@ -1,6 +1,8 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
+//! (host slots 0-3), and a Sony DualSense, which XInput does not list, is
+//! read by itself as the first one when XInput has none there (`sony`);
+//! while none is connected, the keyboard drives one stand-in gamepad
+//! (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -1079,8 +1081,11 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 mod script;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod sony;
 
-/// Host input: XInput pads, the keyboard while our process has focus.
+/// Host input: XInput pads, a Sony pad, the keyboard while our process has
+/// focus.
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1145,8 +1150,9 @@ mod host {
         empty_until: [Option<Instant>; PADS],
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        /// The XInput pad in `slot`, if there is one.
+        fn xinput(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1157,8 +1163,20 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            Some(convert(&state.Gamepad))
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
             #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
+            let mut pad = match self.xinput(slot) {
+                Some(pad) => pad,
+                // A Sony pad, which XInput does not list, is the first pad
+                // when XInput has none there.
+                None if slot == 0 => super::sony::connected()?,
+                None => return None,
+            };
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
