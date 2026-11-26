@@ -189,8 +189,21 @@ fn virtual_alloc(
     }
     // A 32-bit graphics reservation, for renderer port 1's [`arrange`]
     // (`VICTORY_PORT_CONSTANTS=1`; nothing without it).
-    if port_on() && !at.is_null() && placeholder && constrained && flags & ADDRESS_32BIT != 0 {
-        LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
+    if port_on() {
+        if size >= 64 << 20 && flags & ADDRESS_32BIT != 0 {
+            tracing::info!(
+                size,
+                at = format_args!("{at:p}"),
+                placeholder,
+                constrained,
+                kind = format_args!("{kind:#x}"),
+                flags = format_args!("{flags:#x}"),
+                "renderer port 1: a large 32-bit reservation"
+            );
+        }
+        if !at.is_null() && low_reservation(placeholder, kind, constrained, flags) {
+            LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
+        }
     }
     if base.is_null() {
         // The census keeps what the title asked for (`VICTORY_CENSUS`).
@@ -1277,6 +1290,15 @@ fn port_on() -> bool {
     *ON
 }
 
+/// Whether a reservation is one [`arrange`] looks into: of 32-bit graphics
+/// memory at an address of ours, a placeholder of 64 KiB pages or any
+/// reservation without commit. (This build of the title reserves its
+/// 185 MB graphics heap with kind 0x42000, without the 64 KiB page flag,
+/// so not as a placeholder: a reservation without commit counts too.)
+fn low_reservation(placeholder: bool, kind: u32, constrained: bool, flags: u64) -> bool {
+    (placeholder || kind & MEM_COMMIT == 0) && constrained && flags & ADDRESS_32BIT != 0
+}
+
 /// The title's reservations of 64 KiB pages for 32-bit graphics memory:
 /// base and bytes (one, of 185 MB, in Grand Theft Auto VI).
 static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
@@ -1305,14 +1327,25 @@ fn arrange(physical: &mut Physical, base: usize, pages: &[usize]) {
         .copied()
         .find(|&(at, len)| at <= base && base + pages.len() * PAGE <= at + len)
     else {
+        arrange_note(base, pages.len(), "not in a 32-bit reservation");
         return;
     };
     let Some(section) = pages.first().and_then(|p| physical.pages.get(p)).map(|s| s.section.clone()) else {
+        arrange_note(base, pages.len(), "no section");
         return;
     };
     if section.size != bytes
         || !pages.iter().all(|p| physical.pages.get(p).is_some_and(|s| Arc::ptr_eq(&s.section, &section)))
     {
+        let sizes = (section.size, bytes);
+        arrange_note(
+            base,
+            pages.len(),
+            if sizes.0 != sizes.1 { "section size differs from the reservation" } else { "pages from more than one section" },
+        );
+        if port_on() && pages.len() >= 16 {
+            tracing::info!(section_bytes = sizes.0, reservation = sizes.1, "renderer port 1: sizes");
+        }
         return;
     }
     // Which number has which slice of the section.
@@ -1357,6 +1390,14 @@ fn arrange(physical: &mut Physical, base: usize, pages: &[usize]) {
             not_fresh = ARRANGED[1].load(Ordering::Relaxed),
             "renderer port 1: the title's 32-bit graphics pages given their section's slices in address order"
         );
+    }
+}
+
+/// Why [`arrange`] left large mappings as they were (the first few times).
+fn arrange_note(base: usize, pages: usize, why: &str) {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if port_on() && pages >= 16 && SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+        tracing::info!(at = format_args!("{base:#x}"), pages, why, "renderer port 1: pages not arranged");
     }
 }
 
