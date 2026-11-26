@@ -585,6 +585,23 @@ impl Drop for State {
     }
 }
 
+/// Whether only a shader that can store to title memory by address gives
+/// that memory's copies as written (`VICTORY_ADDRESS_STORES=1`; fork pull
+/// request #916, SpaghettiMaster545). Off by default here until a game run
+/// of ours has carried it. Why: with the ray-tracing structure builder
+/// running (VICTORY_BVH_BUILDER=1), the programs that walk the structures
+/// read them by address and store through views, and each of their
+/// submissions declared every numbered copy written: 2,689 windows of
+/// 4 MiB snapshotted and compared on the CPU a frame (10,756 MB, with no
+/// piece found changed), 8 to 11 s a frame. Risk: a program whose stores
+/// by address are not recognised (`pipeline::stores_by_address`) would
+/// have its writes to title memory left on the card (code not all known
+/// counts as storing).
+fn address_stores_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ADDRESS_STORES").is_some_and(|v| v == "1"))
+}
+
 impl State {
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
@@ -1760,7 +1777,10 @@ impl State {
             // Title memory by address: what the shader finds it by. Its copies
             // are given as written only to a shader that can store by address.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let memory_writes = writes && (t.address_stores || !write_skip());
+                // (`VICTORY_ADDRESS_STORES=1`; off by default here until a game
+                // run of ours has carried it: every shader that can store
+                // anything gives them as written, as before.)
+                let memory_writes = writes && (!address_stores_only() || t.address_stores || !write_skip());
                 let Some(ready) = self.memory_ready(list, compute, memory_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
