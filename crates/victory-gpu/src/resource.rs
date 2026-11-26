@@ -1509,7 +1509,9 @@ pub(crate) fn host_made<'a>(
 /// by this process is under nine tenths of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// the card's memory into the PC's, which ended runs 20 and 24; so past it
+/// only up to half the shared budget, and only if asked for
+/// (`VICTORY_TEXTURE_SPILL=1`).
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1534,11 +1536,27 @@ pub(crate) fn room() -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+        Some([budget, used, shared_budget, shared_used]) => {
+            let kept = crate::shadow::card_room_kept() + targets_room_kept();
+            let own = budget / 100 * room_percent();
+            used + kept < own || (spill() && used + kept + shared_used < own + shared_budget / 2)
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// Whether host copies of textures picked by index may go on past the
+/// card's own memory into the PC memory the system shares with it, up to
+/// half of its budget (`VICTORY_TEXTURE_SPILL=1`; off by default here). On
+/// an 8 GB card the card's share is reached before the opening cutscene,
+/// and the textures still waiting (skin, clothes) are sampled empty: black
+/// faces. A texture there is read over the bus: slower, but not missing.
+/// From edsuuu/VI-BR-PORT d354d1c, a port of the room() part of
+/// fxceless/victory-fork #601 (DiogoPCastelos).
+#[cfg(windows)]
+fn spill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SPILL").is_some_and(|v| v == "1"))
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
