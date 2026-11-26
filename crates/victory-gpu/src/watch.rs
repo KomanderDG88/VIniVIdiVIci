@@ -34,6 +34,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+use crate::cold_skip::Written;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -65,8 +67,9 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    /// Page number → the asking that last found it written, and with
+    /// `VICTORY_COLD_SKIP` the marks of its chunks (`crate::cold_skip`).
+    written: Written,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -82,7 +85,7 @@ struct Journal {
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
+    written: Written::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -405,6 +408,26 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_lit(start, end, guarded, None)
+}
+
+/// [`writes`], with the marks of the range's chunks put into `marks`, read
+/// under the same lock as the pages (`VICTORY_COLD_SKIP`, `crate::cold_skip`).
+pub(crate) fn writes_marked(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    marks: &mut Vec<(usize, u64)>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_lit(start, end, guarded, Some(marks))
+}
+
+fn writes_lit(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    marks: Option<&mut Vec<(usize, u64)>>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     // The light refresh: its bits kept, and asked or not, as the switch
     // says now.
     let light = if light_kept() { 1 + u8::from(light()) } else { 0 };
@@ -420,7 +443,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             );
         }
     }
-    writes_in(start, end, guarded, light, guard_runs())
+    writes_in(start, end, guarded, light, guard_runs(), marks)
 }
 
 /// [`writes`] with the light refresh as `light` says ([`light`]): 0, as
@@ -430,13 +453,22 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// the journal.
 #[cfg(test)]
 fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
-    writes_in(start, end, guarded, light, false)
+    writes_in(start, end, guarded, light, false, None)
 }
 
 /// [`writes_as`], and with `runs` ([`guard_runs`]; only with `light` 2) a
 /// range of view memory of which only some blocks have their bit sends the
-/// guards only the blocks without.
-fn writes_in(start: usize, end: usize, guarded: bool, light: u8, runs: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+/// guards only the blocks without; with `marks`, the marks of the range's
+/// chunks put there, read under the same lock as the pages
+/// (`VICTORY_COLD_SKIP`, `crate::cold_skip`).
+fn writes_in(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    light: u8,
+    runs: bool,
+    marks: Option<&mut Vec<(usize, u64)>>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -444,13 +476,7 @@ fn writes_in(start: usize, end: usize, guarded: bool, light: u8, runs: bool) -> 
     let j = &mut *held;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((j.ahead_asked, j.written.noted(first, last, marks)));
     }
     // The light refresh: every block of the range is read-only by our hand
     // and unwritten since an asking noted it, or a hole noted for good
@@ -463,13 +489,7 @@ fn writes_in(start: usize, end: usize, guarded: bool, light: u8, runs: bool) -> 
             RUN_ASKS[1].fetch_add((last - first) as u64, std::sync::atomic::Ordering::Relaxed);
         }
         j.asked += 1;
-        return Some((
-            j.asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((j.asked, j.written.noted(first, last, marks)));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -572,13 +592,7 @@ fn writes_in(start: usize, end: usize, guarded: bool, light: u8, runs: bool) -> 
         LIGHT_ASKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         publish(j, &pages, first * PAGE, last * PAGE, told());
     }
-    let answer = (
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    );
+    let answer = (now, j.written.noted(first, last, marks));
     drop(held);
     // Read-only before the caller reads the blocks.
     arming.finish(failed && light != 0);
@@ -3341,7 +3355,7 @@ pub(crate) mod tests {
         let runs = || RUN_ASKS.each_ref().map(|n| n.load(std::sync::atomic::Ordering::Relaxed));
         // No bit yet: the whole range goes to the guards, as without.
         let before = runs();
-        let (first, all) = writes_in(one, one + SIZE, true, 2, true).expect("a view");
+        let (first, all) = writes_in(one, one + SIZE, true, 2, true, None).expect("a view");
         assert_eq!(all, [(pages(0), first), (pages(1), first), (pages(2), first), (pages(3), first)]);
         assert_eq!(runs(), [before[0], before[1], before[2] + 4], "not split: four blocks to the guards");
         assert!(known(one, one + SIZE));
@@ -3355,7 +3369,7 @@ pub(crate) mod tests {
             [(b0, b0 + 1, true), (b0 + 1, b0 + 2, false), (b0 + 2, b0 + 3, true), (b0 + 3, b0 + 4, false)]
         );
         let (before, counted) = (light_counts(), runs());
-        let (second, written) = writes_in(one, one + SIZE, true, 2, true).expect("a view");
+        let (second, written) = writes_in(one, one + SIZE, true, 2, true, None).expect("a view");
         assert!(second > first);
         assert_eq!(written, [(pages(0), first), (pages(1), second), (pages(2), first), (pages(3), second)]);
         assert_eq!(light_counts(), [before[0], before[1] + 1], "one asking, the guards asked once");
@@ -3363,13 +3377,13 @@ pub(crate) mod tests {
         assert!(known(one, one + SIZE), "guarded again and noted");
         // Known whole by its bits now.
         let before = light_counts();
-        let (third, written) = writes_in(one, one + SIZE, true, 2, true).expect("a view");
+        let (third, written) = writes_in(one, one + SIZE, true, 2, true, None).expect("a view");
         assert!(since(second, written).is_empty());
         assert_eq!(light_counts(), [before[0] + 1, before[1]]);
         // The range's first block written (told of, `writing`): the run
         // without its bit starts the range, which is still taken for a view.
         writing(one + 8, 8);
-        let (fourth, written) = writes_in(one, one + SIZE, true, 2, true).expect("a view");
+        let (fourth, written) = writes_in(one, one + SIZE, true, 2, true, None).expect("a view");
         assert!(fourth > third);
         assert_eq!(since(third, written), [pages(0)]);
         assert!(known(one, one + SIZE));
