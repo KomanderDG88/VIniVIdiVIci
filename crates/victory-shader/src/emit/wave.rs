@@ -258,6 +258,14 @@ pub(crate) struct Section {
     pub shapes: HashMap<Value, Shape>,
 }
 
+/// `VICTORY_SAVEEXEC_SCAN` (on unless `0`): a saveexec whose restore is not in the block
+/// leaves the scan going, so the sections after it are found; `0` stops there, as before.
+/// Read by the translator, so it joins the shader cache key (`build.rs`).
+fn saveexec_scan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAVEEXEC_SCAN").is_none_or(|v| v != "0"))
+}
+
 /// Every whole-wave section of `block`, by start index.
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
@@ -291,6 +299,9 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
+            if !saveexec_scan() {
+                break;
+            }
             i += 1;
             continue;
         };
