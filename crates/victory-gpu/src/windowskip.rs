@@ -46,16 +46,49 @@ pub(crate) enum SkipSame {
     Skip,
 }
 
-/// `VICTORY_WINDOW_SKIP_SAME` ([`SkipSame`]; read once). (AnyXboxX samples
-/// when unset; here unset is off, so a run without the switch does no work
-/// of it at all.)
-pub(crate) fn mode() -> SkipSame {
-    static MODE: std::sync::OnceLock<SkipSame> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_WINDOW_SKIP_SAME").ok().as_deref().map(str::trim) {
-        Some("1") => SkipSame::Skip,
-        Some("sample") => SkipSame::Sample,
-        _ => SkipSame::Off,
+/// `VICTORY_WINDOW_SKIP_SAME` as set (read once): 0 unset or `0`, 1 `1`,
+/// 2 `sample`, 3 `alt`.
+fn set() -> u8 {
+    static SET: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| match std::env::var("VICTORY_WINDOW_SKIP_SAME").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("sample") => 2,
+        Some("alt") => 3,
+        _ => 0,
     })
+}
+
+/// Whether the switch is `alt` ([`mode`]).
+pub(crate) fn alternates() -> bool {
+    set() == 3
+}
+
+/// `VICTORY_WINDOW_SKIP_SAME` ([`SkipSame`]). (AnyXboxX samples when
+/// unset; here unset is off, so a run without the switch does no work of
+/// it at all.) `alt`: [`SkipSame::Skip`] in an ON turn, [`SkipSame::Off`]
+/// in an off one ([`crate::AltTurn`]: twenty seconds each, in turn, each
+/// change said in the log). A window copied whole in an off turn forgets
+/// its prints (`Shadow::window_skip`): its buffer then holds bytes no
+/// print was taken of, and the next ON turn compares its pages with
+/// nothing, so a page the title changed meanwhile is not left out.
+pub(crate) fn mode() -> SkipSame {
+    match set() {
+        1 => SkipSame::Skip,
+        2 => SkipSame::Sample,
+        3 => {
+            static TURN: crate::AltTurn = crate::AltTurn::new();
+            if TURN.on(
+                "title memory windows with no card side leave out the 4 KiB pages that hold what they last copied",
+                "VICTORY_WINDOW_SKIP_SAME",
+                "off, copied whole as usual",
+            ) {
+                SkipSame::Skip
+            } else {
+                SkipSame::Off
+            }
+        }
+        _ => SkipSame::Off,
+    }
 }
 
 /// The pages windows keep a print of.
@@ -79,10 +112,11 @@ static PRINT_BYTES: AtomicU64 = AtomicU64::new(0);
 /// took of title memory per frame over `frames`, copied and left out, and
 /// against what they last copied ([`SAME`]). Taken and reset.
 pub(crate) fn line(frames: f64) {
-    let skip = match mode() {
-        SkipSame::Off => return,
-        SkipSame::Skip => "1: left out",
-        SkipSame::Sample => "sample: copied again, one 4 KiB page in 16 compared",
+    let skip = match set() {
+        1 => "1: left out",
+        2 => "sample: copied again, one 4 KiB page in 16 compared",
+        3 => "alt: left out in ON turns; off turns copy whole and are not counted",
+        _ => return,
     };
     let mb = |n: &AtomicU64| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
     let [sent, left] = TAKEN.each_ref().map(mb);

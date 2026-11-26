@@ -382,12 +382,19 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// programs that shade those rays' hits (`CS_RaytracingResolve`).
 ///
 /// With the switch such a dispatch is dropped until the builder has run
-/// whole. What the passes would have written stays as the title left it
+/// whole (`alt`: only in an ON turn, [`crate::AltTurn`]: twenty seconds
+/// without, twenty with, in turn, each change said in the log). What the passes would have written stays as the title left it
 /// (their targets are not cleared by us): the picture has to be looked at.
 #[cfg(windows)]
 pub(crate) fn walk_held(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_BVH_HOLD").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    });
+    if this.is_null() || mode == 0 {
         return false;
     }
     let p = pipeline(this);
@@ -397,6 +404,16 @@ pub(crate) fn walk_held(this: This) -> bool {
     // (Asked only for the few programs that walk: the lock is the builder's.)
     if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
         return false;
+    }
+    if mode == 2 {
+        static TURN: crate::AltTurn = crate::AltTurn::new();
+        if !TURN.on(
+            "dispatches of programs that walk ray-tracing structures nothing has built are held back",
+            "VICTORY_BVH_HOLD",
+            "off, run as usual",
+        ) {
+            return false;
+        }
     }
     if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -426,25 +443,55 @@ fn skins_for_rays(bytes: &[u8]) -> bool {
 /// `VICTORY_BVH_BUILDER=1`): then nothing reads what they write. Meant
 /// with `VICTORY_BVH_NO_HIT=1` or `VICTORY_BVH_HOLD=1`, under which no
 /// ray reads the structures either. Read once, when pipelines are made:
-/// off, no container is looked at.
+/// off, no container is looked at. `alt`: the pipelines are marked as
+/// with `1`, and a dispatch is left out only in an ON turn
+/// ([`crate::AltTurn`]: twenty seconds without, twenty with, in turn,
+/// each change said in the log).
+///
+/// 0 off (or the builder may run), 1 on, 2 in turn.
 ///
 /// From edsuuu/VI-BR-PORT ab4571df (GPL-3.0), where it rides on their
 /// `VICTORY_RT_MISS=1`: the largest share of the card's time in a cutscene
 /// there (~6 ms a dispatch, hundreds a frame).
 #[cfg(windows)]
-fn rt_skin_skip_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_RT_SKIN_SKIP").is_some_and(|v| v == "1") && !builder_allowed()
+fn rt_skin_skip_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if builder_allowed() {
+            return 0;
+        }
+        match std::env::var("VICTORY_RT_SKIN_SKIP").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        }
     })
+}
+
+/// At pipeline creation: whether `bvh_skinning` programs are looked for
+/// and marked ([`rt_skin_skip_mode`]: `1` or `alt`).
+#[cfg(windows)]
+fn rt_skin_skip_on() -> bool {
+    rt_skin_skip_mode() != 0
 }
 
 /// Whether a dispatch with the title's pipeline `this` is left out because
 /// it only feeds the ray-tracing structures nothing builds
-/// ([`rt_skin_skip_on`]).
+/// ([`rt_skin_skip_mode`]; with `alt` only in an ON turn).
 #[cfg(windows)]
 pub(crate) fn skips_rt_skin(this: This) -> bool {
-    !this.is_null() && pipeline(this).rt_skin
+    if this.is_null() || !pipeline(this).rt_skin {
+        return false;
+    }
+    if rt_skin_skip_mode() != 2 {
+        return true;
+    }
+    static TURN: crate::AltTurn = crate::AltTurn::new();
+    TURN.on(
+        "dispatches of bvh_skinning programs are left out",
+        "VICTORY_RT_SKIN_SKIP",
+        "off, run as usual",
+    )
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.

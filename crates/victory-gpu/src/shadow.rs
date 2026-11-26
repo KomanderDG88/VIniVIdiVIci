@@ -3938,12 +3938,30 @@ impl Shadow {
             return SkipSame::Off;
         }
         let mode = crate::windowskip::mode();
+        if mode == SkipSame::Off && crate::windowskip::alternates() {
+            // An off turn of `alt`: the copy as without the switch writes
+            // the buffer past the prints, so they all go (made again, zero,
+            // at the next ON turn's first copy: nothing to compare with).
+            self.window_prints_forget();
+            return SkipSame::Off;
+        }
         if mode != SkipSame::Off && self.written_said.load(Ordering::Relaxed) {
             crate::windowskip::unknown(to - from);
             crate::windowskip::taken(to - from, 0);
             return SkipSame::Off;
         }
         mode
+    }
+
+    /// `VICTORY_WINDOW_SKIP_SAME=alt` in an off turn: the window's prints, if
+    /// it has any, are let go before its copy, so none outlives the bytes
+    /// it was taken of.
+    fn window_prints_forget(&self) {
+        let mut prints = self.prints.lock().unwrap_or_else(|e| e.into_inner());
+        if !prints.is_empty() {
+            crate::windowskip::prints_gone(prints.len());
+            *prints = Vec::new();
+        }
     }
 
     /// A window's prints (`Shadow::prints`), made at the first ask.

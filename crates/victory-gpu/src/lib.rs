@@ -111,3 +111,31 @@ pub use watch::{
     title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// The `alt` value of a switch: twenty seconds off, twenty on, in turn,
+/// from the first time it is asked, each change said in the log in the
+/// words of `VICTORY_DISPATCH_SPREAD=alt` ("... from now (SWITCH=alt):
+/// ON"). One per switch, in a `static`.
+#[cfg(windows)]
+pub(crate) struct AltTurn {
+    epoch: std::sync::OnceLock<std::time::Instant>,
+    /// The last turn asked: 0 off, 1 on, 2 none yet.
+    last: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(windows)]
+impl AltTurn {
+    pub(crate) const fn new() -> Self {
+        Self { epoch: std::sync::OnceLock::new(), last: std::sync::atomic::AtomicU8::new(2) }
+    }
+
+    /// Whether this is an ON turn. `what`: what the switch does, `switch`:
+    /// its name, `off`: what an off turn is, as the log says them.
+    pub(crate) fn on(&self, what: &str, switch: &str, off: &str) -> bool {
+        let on = (self.epoch.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+        if self.last.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+            tracing::info!("{what} from now ({switch}=alt): {}", if on { "ON" } else { off });
+        }
+        on
+    }
+}

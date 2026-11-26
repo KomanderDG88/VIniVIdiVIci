@@ -105,9 +105,34 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// `VICTORY_HEAP_IDENTITY=0` gives it back to whatever heap is at that
 /// address, as before, for an A/B of the faces that turn black and back
 /// (two live lists sharing slots, one rewriting the other's descriptors).
+///
+/// `alt`: twenty seconds without, twenty with, in turn ([`crate::AltTurn`],
+/// each change said in the log; asked only when a release names another
+/// heap, so a change is said at the first such release). Asked at each
+/// release, so switching is safe as code: an off turn is the old behaviour
+/// (a release may free slots of the heap now at that address, another
+/// list's, the fault this fixes comes back); an ON turn after it frees
+/// nothing that is not the heap's own, but slots freed wrongly before stay
+/// freed.
 fn heap_identity() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_IDENTITY").is_none_or(|v| v != "0"))
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_IDENTITY").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static TURN: crate::AltTurn = crate::AltTurn::new();
+            TURN.on(
+                "a range of dynamic slots is given back only to the heap that took it",
+                "VICTORY_HEAP_IDENTITY",
+                "off, to whatever heap is at that address, as before",
+            )
+        }
+    }
 }
 
 /// Whether the recording threads are spared the heap's two busiest locks
