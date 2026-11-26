@@ -144,6 +144,16 @@ pub fn with_shared_slots<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Whether the forms that let the tiled cascade shadow programs translate exactly on 32-lane
+/// hosts are on (upstream #1002; `VICTORY_SHADER_CASCADE_EXACT=0`: off, as before): the pairs
+/// of parked lanes by site ([`site_pairs`]), an `s_cbranch_execnz` over a far jump to the end
+/// as an early-out ([`far_jump_to_end`]) and, in the deep form of [`without_skips`], a scalar
+/// phi of one value as a copy of it. On by default; the switch joins the shader cache key.
+fn cascade_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CASCADE_EXACT").is_none_or(|v| v != "0"))
+}
+
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
@@ -463,7 +473,7 @@ fn unspill(
         .copied()
         .filter(|&(reg, lane)| {
             let near = [lane.wrapping_sub(1), lane, lane + 1].map(|l| pairs.contains(&(reg, l)));
-            wave64 && !near.contains(&true) && slots.contains(&(reg, lane + 1))
+            wave64 && cascade_exact() && !near.contains(&true) && slots.contains(&(reg, lane + 1))
         })
         .collect();
     let mut webs = site_webs(&candidates, &parks, &partner, &graph);
@@ -1191,7 +1201,7 @@ fn early_out_continuation(p: &Program, b: usize) -> Option<usize> {
     };
     match p.blocks[b].insts.last()?.name() {
         "s_cbranch_execz" if ends_program(p, taken) => Some(not_taken),
-        "s_cbranch_execnz" if far_jump_to_end(p, not_taken) => Some(taken),
+        "s_cbranch_execnz" if cascade_exact() && far_jump_to_end(p, not_taken) => Some(taken),
         _ => None,
     }
 }
@@ -1267,7 +1277,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             }
         }
     }
-    if deep {
+    if deep && cascade_exact() {
         copy_through_phis(p, &mut copy);
     }
     let root = |v: Value| if deep { follow(&copy, v) } else { v };
@@ -2504,7 +2514,9 @@ mod tests {
             i.name()
         };
         let alone = build(&code, true, 64).unwrap();
-        assert_eq!(at(&alone), "s_mov_b64");
+        // (`VICTORY_SHADER_CASCADE_EXACT=0`: no pairs by site, two scalars)
+        let by_site = cascade_exact();
+        assert_eq!(at(&alone), if by_site { "s_mov_b64" } else { "s_mov_b32" });
         let shared = with_shared_slots(|| build(&code, true, 64)).unwrap();
         assert_eq!(at(&shared), "s_mov_b64");
         let opaque = |p: &Program| {
@@ -2514,7 +2526,7 @@ mod tests {
             let guard = st.guards[b][i].expect("a guard");
             st.bools.support(guard).iter().any(|a| matches!(a, crate::structure::Atom::Opaque(_)))
         };
-        assert!(!opaque(&alone), "the pair by site is the compare's mask");
+        assert_eq!(opaque(&alone), !by_site, "a pair by site is the compare's mask, two scalars an opaque one");
         assert!(!opaque(&shared), "the pair is the compare's mask");
     }
 }
