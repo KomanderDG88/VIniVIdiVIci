@@ -178,6 +178,7 @@ pub fn report_crashes() {
             && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
         Ordering::Relaxed,
     );
+    crate::cpu_patches::read_switches();
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -249,7 +250,8 @@ fn note_amd(kind: AmdKind) {
 /// around them works with mwaitx as a yield; `rdpru` (`0f 01 fd`) reads
 /// MPERF (`ecx` 0) or APERF (1), cycles at the nominal and the actual
 /// frequency, and gets the time-stamp counter for both: a core that never
-/// changes frequency.
+/// changes frequency. With `VICTORY_PATCH_WAITS=1` or `VICTORY_PATCH_CLZERO=1`,
+/// [`crate::cpu_patches`] rewrites a site once emulated, so it stops faulting.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
@@ -260,15 +262,31 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             return false;
         }
         let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
+        let site = context.Rip as usize;
+        let bytes = crate::cpu_patches::site_bytes(site);
+        match bytes {
             [0x0f, 0x01, 0xfc] => {
                 note_amd(AmdKind::Clzero);
-                return clzero(context);
+                let resumed = clzero(context);
+                let skipped = context.Rip - site as u64;
+                let now = crate::cpu_patches::site_bytes(site);
+                if skipped == 3 && crate::cpu_patches::rewritten_under_fault(now) {
+                    // A recognised loop rewritten while its bytes were read:
+                    // its trampoline zeroes the line again and goes on.
+                    context.Rip = site as u64;
+                } else {
+                    crate::cpu_patches::after_clzero(site, skipped);
+                }
+                return resumed;
             }
-            [0x0f, 0x01, 0xfa] => note_amd(AmdKind::Monitorx),
+            [0x0f, 0x01, 0xfa] => {
+                note_amd(AmdKind::Monitorx);
+                crate::cpu_patches::after_wait(site, bytes);
+            }
             [0x0f, 0x01, 0xfb] => {
                 note_amd(AmdKind::Mwaitx);
                 std::thread::yield_now();
+                crate::cpu_patches::after_wait(site, bytes);
             }
             [0x0f, 0x01, 0xfd] => {
                 note_amd(AmdKind::Rdpru);
@@ -278,6 +296,11 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 let cycles = if known { std::arch::x86_64::_rdtsc() } else { 0 };
                 context.Rax = cycles & 0xffff_ffff;
                 context.Rdx = cycles >> 32;
+            }
+            _ if crate::cpu_patches::rewritten_under_fault(bytes) => {
+                // Rewritten (`VICTORY_PATCH_*`) after the CPU fetched the old
+                // instruction: run the new one, from the same address.
+                return true;
             }
             _ => {
                 // Only bytes inside the faulting instruction's page are read: the next page may
