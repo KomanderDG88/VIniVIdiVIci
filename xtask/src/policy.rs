@@ -33,7 +33,16 @@ const AUTHORED_SVG: &[&str] = &["docs/brand/banner.svg", "docs/brand/mark.svg"];
 
 // Our original test orchestration and its synthetic tests. Only these Python
 // paths are accepted; size, text, magic and encoded-data checks still apply.
-const AUTHORED_TEST_TOOLS: &[&str] = &["tools/lab_suite.py", "tests/test_lab_suite.py"];
+const AUTHORED_TEST_TOOLS: &[&str] = &[
+    "tools/lab_suite.py",
+    "tests/test_lab_suite.py",
+    // Reading a run's own log: frame batches after a known moment, after a
+    // scripted key, and two runs side by side over the same window.
+    "tools/world-frame-summary.py",
+    "tools/movement-frame-summary.py",
+    "tools/compare-movement.py",
+    "tests/test_compare_movement.py",
+];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(

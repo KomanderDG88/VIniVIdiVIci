@@ -124,6 +124,34 @@ The suite verifies the binary hash before running anything and owns the lease
 across the entire subprocess tree. The outer timeout is the case limit plus
 120 seconds. It never imports game paths or bytes into this repository.
 
+## Comparing two runs
+
+Three small scripts read the layer's own log of a run (`stderr.log`) and, where
+they are beside it, the runner's `memory.jsonl` and `result.json`. They read
+nothing of the title.
+
+- `tools/world-frame-summary.py <log> <start> [--minutes N]` adds up the frame
+  batches the layer logs after a moment given with its time zone, in windows of
+  N minutes.
+- `tools/movement-frame-summary.py <log> [--key 76 --at 540]` does the same
+  from one scripted key going down.
+- `tools/compare-movement.py <baseline-log> <candidate-log>` sets two runs side
+  by side over the 280 seconds after the first scripted `L` (key 76 at 540 s):
+  frames, logged seconds and how much of the window they cover, frames a
+  second, median and 95th percentile frame, how many scripted keys the title
+  read, the least free memory, the peak of the process's private memory and why
+  the run ended.
+
+Only batches that lie wholly inside the window count, and the layer rounds a
+batch's length, so two runs can be compared with each other but the figures are
+not exact. The same keys at the same times do not make the same scene: the
+picture, the shader cache and what else the machine was doing have to be
+checked apart. The comparison has its own synthetic test:
+
+```powershell
+python -B -m unittest discover -s tests -p test_compare_movement.py -v
+```
+
 ## Meaning of results
 
 Exit 0 means all **code checks** passed. Exit 1 means failure, timeout, invalid
