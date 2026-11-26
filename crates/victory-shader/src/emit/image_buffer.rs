@@ -230,6 +230,13 @@ impl Lower<'_> {
                     self.float_of(v)?
                 });
             }
+            // `VICTORY_NAN_SCRUB=1` ([`Self::scrub_nan`]): NaN and infinities stored as 0. The
+            // store goes out as floats whatever the view's format, so integer data whose
+            // exponent bits are all set (0x7F80_0000..=0x7FFF_FFFF and the same with bit 31)
+            // is changed too while the switch is on.
+            for v in vals.iter_mut().flatten() {
+                *v = self.scrub_nan(*v);
+            }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let vals: Vec<V> = if let Some(vals) = vals.iter().copied().collect::<Option<Vec<_>>>()

@@ -853,6 +853,25 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_NAN_SCRUB=1` (off by default): a NaN or an infinity in a colour a pixel program
+/// writes, or in an image store, becomes 0 ([`Lower::scrub_nan`]). Unset, the translation is
+/// as before; the switch joins the shader cache key as every `VICTORY_*` literal here does
+/// (`build.rs`, [`super::translation_fingerprint`]).
+fn nan_scrub() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NAN_SCRUB.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`nan_scrub`], for its thread only.
+    pub(super) static TEST_NAN_SCRUB: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -3764,6 +3783,26 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, tie, odd);
         let up = self.s.m.bin(c, Bin::Or, nearer, tie);
         self.s.m.select(c, up, hi, lo)
+    }
+
+    /// With `VICTORY_NAN_SCRUB=1` ([`nan_scrub`], off by default), `f`, or 0 where it is NaN
+    /// or either infinity; `f` itself otherwise. Used on the colours a pixel program writes
+    /// and on image stores: one NaN that reaches the title's bloom, blur or temporal
+    /// upscaler spreads into black patches that stay in its history (seen on NVIDIA as black
+    /// blotches on faces and in the air), and an infinity through the same passes whitens
+    /// the picture. Not what the console does, hence the switch. Three instructions per
+    /// value: an absolute value, an unordered compare and a select.
+    fn scrub_nan(&mut self, f: V) -> V {
+        if !nan_scrub() {
+            return f;
+        }
+        // |f| >= inf, unordered: true for NaN and for either infinity.
+        let c = self.cur;
+        let a = self.unary(6, f);
+        let inf = self.s.m.f32(0x7F80_0000);
+        let bad = self.s.m.cmp(c, pred::UGE, a, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
@@ -9808,6 +9847,8 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // A colour a pixel program writes (`VICTORY_NAN_SCRUB`: [`Self::scrub_nan`]).
+        let colour = self.s.pixel && matches!(e.target, Target::Color(_));
         for (id, col, value, half) in stores {
             // (an output a linked pixel program does not read: neither stored nor declared)
             if !primitive && self.drop_out.get(id).copied().unwrap_or(false) {
@@ -9830,13 +9871,16 @@ impl<'a> Lower<'a> {
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let f = self.as_float(x);
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
+                }
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
-                    (".f32", f)
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
                 }
                 _ => (".i32", x),
             };
@@ -10769,6 +10813,50 @@ mod tests {
             assert_ne!(features & 0x800, 0, "dmask {dmask:#x}: SFI0 {features:#x}");
         }
         assert_eq!(store(0xF) & 0x800, 0);
+    }
+
+    /// An image store of four channels (v0, the thread id, as a float, and 1.0) is
+    /// translated as before unless `VICTORY_NAN_SCRUB` is on, and with it the scrub
+    /// (absolute value, compare, select per channel) is in the program.
+    #[test]
+    fn an_image_store_is_scrubbed_of_nan_only_with_the_switch() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_0300, // v_mov_b32 v4, v0
+            0x7E0A_02F2, // v_mov_b32 v5, 1.0
+            0x7E0C_02F2, // v_mov_b32 v6, 1.0
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0xF020_0F08,
+            0x0002_0402, // image_store v[4:7], v[2:3], s[8:15] dmask:0xf dim:2D
+            S_ENDPGM,
+        ];
+        let lowered = |scrub: Option<bool>| {
+            let used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }];
+            let was = super::TEST_NAN_SCRUB.replace(scrub);
+            let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used);
+            super::TEST_NAN_SCRUB.set(was);
+            l.unwrap().dxil
+        };
+        let (off, on) = (lowered(Some(false)), lowered(Some(true)));
+        if std::env::var_os("VICTORY_NAN_SCRUB").is_none() {
+            assert_eq!(lowered(None), off, "the switch unset changed the translation");
+        }
+        assert_ne!(on, off);
+        assert!(on.len() > off.len(), "{} bytes scrubbed, {} not", on.len(), off.len());
     }
 
     #[test]

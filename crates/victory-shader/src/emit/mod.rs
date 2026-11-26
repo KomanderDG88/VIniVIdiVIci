@@ -2280,6 +2280,30 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    /// A colour written from an interpolated value (`v_add_f32` of I and J) is translated
+    /// as before unless `VICTORY_NAN_SCRUB` is on; with it, NaN and infinities in the
+    /// colour become 0 (absolute value, compare, select per channel) and the program still
+    /// validates.
+    #[test]
+    fn a_colour_is_scrubbed_of_nan_only_with_the_switch() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [v_add_f32(2, 0, 1), e0, e1, 0xBF81_0000];
+        let translated = |scrub: Option<bool>| {
+            let was = lower::TEST_NAN_SCRUB.replace(scrub);
+            let shader = pixel(&words, PERSP_CENTER);
+            lower::TEST_NAN_SCRUB.set(was);
+            shader.unwrap()
+        };
+        let (off, on) = (translated(Some(false)), translated(Some(true)));
+        if std::env::var_os("VICTORY_NAN_SCRUB").is_none() {
+            assert_eq!(translated(None).dxil, off.dxil, "the switch unset changed the translation");
+        }
+        assert_ne!(on.dxil, off.dxil);
+        validate(&on);
+        let (on, off) = (on.dxil.len(), off.dxil.len());
+        assert!(on > off, "{on} bytes scrubbed, {off} not");
+    }
+
     /// A 16-bit result written over a first interpolation half's register
     /// (`v_fma_mixlo_f16` keeps the other half): the second half evaluates the pair, and
     /// what the first half leaves in the half kept is no number the code reads.
