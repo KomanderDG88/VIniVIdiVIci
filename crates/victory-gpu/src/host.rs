@@ -8345,6 +8345,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::draw::heap_pass_parts_line(frames);
         crate::shadow::exact_line(frames);
+        crate::windowskip::line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
