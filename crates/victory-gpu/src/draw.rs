@@ -4511,7 +4511,7 @@ impl State {
         // A dispatch of a program that takes the spread words: the clamp
         // writes [row, asked x, x, y, z] records, run through a signature
         // that sets the two words, then dispatches.
-        let spread = (kind == DISPATCH && p.compute)
+        let spread = (kind == DISPATCH && p.compute && indirect_spread())
             .then(|| spreads(p))
             .flatten()
             .and_then(|(param, index)| host_spread_signature(&p.root, param, index));
@@ -4808,6 +4808,36 @@ fn spreads(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
         .iter()
         .any(|u| u.root == kind && u.dword == 1 && u.index == first + 1)
         .then_some((param, first))
+}
+
+/// An indirect record asked for more than 65,535 groups (the clamp's note
+/// of a list's largest count, read when the list has run: `host.rs`).
+pub(crate) static SPREAD_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether indirect dispatches go through the spread signature (two root
+/// constants set per record, 20-byte records). The choice is per pipeline,
+/// so with the spread on every indirect dispatch of a program that takes
+/// the words went that way, none of them past 65,535 groups here (942 a
+/// frame, the largest 17,048), and the card's time a frame rose from 107
+/// to 122 ms with the merge that brought it [an inference to measure:
+/// `VICTORY_DISPATCH_SPREAD=alt`]. So the old signature (and the clamp to
+/// 65,535) is kept until some record has asked for more
+/// ([`SPREAD_SEEN`], for the rest of the run): that record and the ones in
+/// the frames until its list's note is read run clamped, as before the
+/// spread. `VICTORY_DISPATCH_SPREAD=always`: the spread signature from the
+/// start, as before this. Direct dispatches are spread only past 65,535
+/// groups anyway.
+/// Whether a list's largest indirect group count (the clamp's note) turns
+/// the spread signature on ([`SPREAD_SEEN`]): past what one dispatch runs
+/// in a dimension.
+pub(crate) fn asks_spread(largest: u32) -> bool {
+    largest > 65_535
+}
+
+fn indirect_spread() -> bool {
+    static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALWAYS.get_or_init(|| std::env::var("VICTORY_DISPATCH_SPREAD").as_deref() == Ok("always"))
+        || SPREAD_SEEN.load(Ordering::Relaxed)
 }
 
 /// Whether dispatches past 65,535 groups in x are spread across z
@@ -5330,5 +5360,19 @@ mod tests {
         // No records at all: the constants' own.
         put(&mut constants, 0x7c, 2);
         assert_eq!(bake_named(&constants, 0, record), ((100..105).collect(), (0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod spread_seen_tests {
+    /// Only a count past 65,535 turns the spread signature on; the largest
+    /// asked here (17,048) and the limit itself do not.
+    #[test]
+    fn only_a_count_past_one_dispatch_turns_the_spread_on() {
+        assert!(!super::asks_spread(0));
+        assert!(!super::asks_spread(17_048));
+        assert!(!super::asks_spread(65_535));
+        assert!(super::asks_spread(65_536));
+        assert!(super::asks_spread(115_200));
     }
 }

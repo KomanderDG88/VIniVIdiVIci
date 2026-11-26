@@ -8350,6 +8350,12 @@ impl HostList {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                // A record past what one dispatch runs: indirect dispatches
+                // go through the spread signature from now on
+                // (`draw::indirect_spread`).
+                if crate::draw::asks_spread(largest) && !crate::draw::SPREAD_SEEN.swap(true, Ordering::Relaxed) {
+                    tracing::info!(largest, "an indirect record asked for more than 65,535 groups: indirect dispatches are spread across z from now on");
+                }
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
                 for k in 0..3 {
                     words.add(k).write_volatile(0);
