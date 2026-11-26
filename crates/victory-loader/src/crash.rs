@@ -1175,7 +1175,7 @@ mod tests {
         let rates = [14180.0, 6536.0, 6535.0, 0.0, 12.0, 3.4, 1.0, 0.0];
         assert_eq!(
             amd_rate_line(&rates),
-            "clzero 14180, monitorx 6536, mwaitx 6535, rdpru 0, clwb 12, clwb loops 3,              extrq 1, insertq 0; 27267 in all"
+            "clzero 14180, monitorx 6536, mwaitx 6535, rdpru 0, clwb 12, clwb loops 3, extrq 1, insertq 0; 27267 in all"
         );
         assert_eq!(AmdKind::NAMES[AmdKind::Clwb as usize], "clwb");
         assert_eq!(AmdKind::NAMES[AmdKind::ClwbLoop as usize], "clwb loops");

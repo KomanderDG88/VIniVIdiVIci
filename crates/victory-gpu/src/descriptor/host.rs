@@ -2405,7 +2405,7 @@ impl HostHeap {
             return self.buffer_slots();
         };
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().filter(|&slot| u64::from(slot) % n == k).collect()
+        buffers.slots().into_iter().filter(|&slot| u64::from(slot) % n == k).collect()
     }
 
     /// The title slots whose buffer view was written, or went, since the
