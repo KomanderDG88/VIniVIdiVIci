@@ -4155,6 +4155,8 @@ pub(crate) fn settle_now(why: usize) {
     let Some(host) = host() else {
         return;
     };
+    // Title submissions held back to be merged are settled too: first.
+    merge_send(if why == WHY_VALUE { crate::merge::Why::Value } else { crate::merge::Why::Settle });
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
     host.settle(&mut submitted, why);
 }
@@ -4572,6 +4574,8 @@ fn late_line(frames: f64) {
 
 pub(crate) mod awake;
 mod card_steps;
+mod merging;
+pub(crate) use merging::{merge_fence_asked, merge_send, merge_signal, merge_wait};
 
 #[cfg(test)]
 mod late_tests;
@@ -6246,7 +6250,9 @@ impl Host {
         // Behind what the queues were given before it and have not run
         // yet (`crate::queue::behind`).
         crate::queue::before_sync();
-        let _ = self.submit(runs, false);
+        // And behind the title submissions held back to be merged.
+        merge_send(crate::merge::Why::Sync);
+        let _ = self.submit(runs, false, &[]);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -6255,7 +6261,19 @@ impl Host {
     /// the air, at the next point where what they do can be observed
     /// ([`late`] lists those points); their host lists are reset and kept
     /// for reuse then, as a queue does for the lists it ran.
-    pub(crate) fn execute_late(&self, mut lists: Vec<crate::list::Detached>, mut order: Vec<usize>) {
+    /// With [`crate::merge::level`] they are held back and go to the card
+    /// with the next ones ([`Host::merge_offer`]).
+    pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+        if crate::merge::level() > 0 {
+            self.merge_offer(lists, order);
+        } else {
+            self.send_late(lists, order, &[]);
+        }
+    }
+
+    /// [`Host::execute_late`] at once: `joins` says where in `order` each
+    /// title submission merged behind others begins.
+    fn send_late(&self, mut lists: Vec<crate::list::Detached>, mut order: Vec<usize>, joins: &[usize]) {
         if order.is_empty() {
             crate::list::recycle(lists, &order);
             return;
@@ -6263,6 +6281,8 @@ impl Host {
         // Textures uploaded ahead (`crate::heap_worker`): their lists run
         // before the title's.
         let ahead = crate::heap_worker::take_ready();
+        // (Merged title submissions begin that much further on.)
+        let joins: Vec<usize> = joins.iter().map(|&j| j + ahead.len()).collect();
         if !ahead.is_empty() {
             let first = lists.len();
             order.splice(0..0, first..first + ahead.len());
@@ -6271,7 +6291,7 @@ impl Host {
         late_threads();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, true)
+            self.submit(&runs, true, &joins)
         };
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
@@ -6326,8 +6346,9 @@ impl Host {
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
+        merge_send(crate::merge::Why::Sync);
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], true) else {
+        let Some((submitted, sent)) = self.submit(&[list], true, &[]) else {
             return 0;
         };
         let number = sent.number;
@@ -6548,8 +6569,10 @@ impl Host {
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
-    /// still held.
-    fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+    /// still held. `joins`: where in `runs` each title submission merged
+    /// behind others begins ([`crate::merge::level`]); its first list waits
+    /// for everything before it (`merging::join_barriers`).
+    fn submit<'a>(&'a self, runs: &[&HostList], late: bool, joins: &[usize]) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -6685,7 +6708,8 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            let join = joins.iter().any(|&j| runs.get(j).is_some_and(|first| std::ptr::eq(*first, *list)));
+            if let Some(prelude) = list.prelude(join) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -8348,6 +8372,7 @@ impl Meter {
         crate::windowskip::line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        crate::merge::line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
@@ -8616,6 +8641,7 @@ impl Host {
         frame: u64,
         over: Option<(&ID3D12Resource, u32)>,
     ) -> Option<bool> {
+        merge_send(crate::merge::Why::Present);
         let showing = std::time::Instant::now();
         let shown = self.present_now(texture, state, frame, over);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
@@ -9768,13 +9794,13 @@ void main() {
         const LEFT: u32 = 0x600D_0002;
         // Flight A, and the card has run it.
         let a = record(20, HALF_WAY, LEFT, 16);
-        let (submitted, mut sent_a) = host.submit(&[&a], true).expect("flight A sent ahead");
+        let (submitted, mut sent_a) = host.submit(&[&a], true, &[]).expect("flight A sent ahead");
         let fence_a = *submitted;
         drop(submitted);
         wait_for(fence_a);
         // Flight B: the same piece, through the half-way value, for seconds.
         let b = record(20, HALF_WAY, LEFT, spin);
-        let (submitted, mut sent_b) = host.submit(&[&b], true).expect("flight B sent ahead");
+        let (submitted, mut sent_b) = host.submit(&[&b], true, &[]).expect("flight B sent ahead");
         let fence_b = *submitted;
         drop(submitted);
         std::thread::sleep(std::time::Duration::from_millis(300));

@@ -470,7 +470,10 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    pub(super) fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// With `join` the list is the first of a title submission merged
+    /// behind others: the prelude is made in any case, and first waits for
+    /// everything before it (`merging::join_barriers`).
+    pub(super) fn prelude(&self, join: bool) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -548,7 +551,7 @@ impl HostList {
         // The records the list's draws read from slots (`crate::indirect::gather`).
         let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         let gathered = gather.sets.iter().any(|s| s.records() > 0);
-        if barriers.is_empty() && syncs.is_empty() && !gathered {
+        if !join && barriers.is_empty() && syncs.is_empty() && !gathered {
             return None;
         }
         let Some((allocator, list)) = self
@@ -563,6 +566,9 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                if join {
+                    list.ResourceBarrier(&merging::join_barriers());
+                }
                 #[cfg(feature = "diagnostics")]
                 let shot_span = if shot_begins.is_some() { crate::shot::span_begin(list) } else { u32::MAX };
                 if !to_copy.is_empty() {
