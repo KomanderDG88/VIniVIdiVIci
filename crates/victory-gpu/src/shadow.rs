@@ -499,18 +499,20 @@ impl Drop for WindowReservation<'_> {
     }
 }
 
+/// Successful allocations and requests refused for adapter headroom or the configured limit.
+static WINDOW_PLACEMENTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 fn report_window_placement(size: u64, which: usize, what: &str) {
-    static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-    let n = COUNTS[which].fetch_add(1, Ordering::Relaxed) + 1;
+    let n = WINDOW_PLACEMENTS[which].fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 || n.is_multiple_of(64) {
         tracing::info!(
             "windows outside buffers and the card's memory (VICTORY_CARD_WINDOWS_MB={}): {what} one of {} KiB; so far {} on the card ({} MB), {} turned down for the card's room, {} for the most asked",
             window_card_most() >> 20,
             size >> 10,
-            COUNTS[0].load(Ordering::Relaxed),
+            WINDOW_PLACEMENTS[0].load(Ordering::Relaxed),
             WINDOW_CARD_BYTES.load(Ordering::Relaxed) >> 20,
-            COUNTS[1].load(Ordering::Relaxed),
-            COUNTS[2].load(Ordering::Relaxed)
+            WINDOW_PLACEMENTS[1].load(Ordering::Relaxed),
+            WINDOW_PLACEMENTS[2].load(Ordering::Relaxed)
         );
     }
 }
@@ -551,6 +553,51 @@ mod window_reservation_tests {
         assert_eq!(used.load(Ordering::Relaxed), 12);
         assert!(WindowReservation::reserve(&used, u64::MAX, u64::MAX).is_none());
     }
+
+    /// Run alone in a fresh process with VICTORY_CARD_WINDOWS_MB=4, once
+    /// with VICTORY_WINDOW_UPLOAD=0 and once with it set to 1.
+    #[test]
+    #[ignore = "requires a physical D3D12 card and a 4 MiB window budget"]
+    fn a_card_window_falls_back_at_the_limit_and_releases_its_room() {
+        use super::{LOOSE, WINDOW, WINDOW_CARD_BYTES, WINDOW_PLACEMENTS, loose, window, window_card_most, window_upload};
+
+        assert_eq!(window(), WINDOW);
+        assert_eq!(window_card_most(), WINDOW);
+        assert_eq!(WINDOW_CARD_BYTES.load(Ordering::Relaxed), 0);
+        let memory = vec![0u8; 4 * WINDOW as usize];
+        let base = (memory.as_ptr() as u64).next_multiple_of(WINDOW);
+        let open = |at| loose(at, at + 64, false, false).expect("host window");
+        let check = |shadow: &super::Shadow| {
+            if window_upload() {
+                assert_eq!(shadow.uploaded, WINDOW, "expected a directly mapped GPU upload heap");
+                assert!(shadow.card.is_none());
+            } else {
+                assert!(shadow.card.is_some(), "expected a staged GPU buffer");
+                assert_eq!(shadow.uploaded, 0);
+            }
+        };
+        let first = open(base);
+        check(&first);
+        let refused = WINDOW_PLACEMENTS[2].load(Ordering::Relaxed);
+        let shared = open(base + WINDOW);
+        assert_eq!(WINDOW_PLACEMENTS[2].load(Ordering::Relaxed) - refused, 1);
+        assert_eq!(shared.uploaded, 0);
+        assert!(shared.card.is_none());
+        assert_eq!(WINDOW_CARD_BYTES.load(Ordering::Relaxed), WINDOW);
+
+        LOOSE.lock().unwrap().remove(&(first.start, first.len));
+        drop(first);
+        assert_eq!(WINDOW_CARD_BYTES.load(Ordering::Relaxed), 0);
+        let next = open(base + 2 * WINDOW);
+        check(&next);
+        let mut map = LOOSE.lock().unwrap();
+        map.remove(&(shared.start, shared.len));
+        map.remove(&(next.start, next.len));
+        drop(map);
+        drop((shared, next));
+        assert_eq!(WINDOW_CARD_BYTES.load(Ordering::Relaxed), 0);
+    }
+
 }
 
 /// The copies in the card's memory whose CPU side changed since they were
