@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -279,6 +280,8 @@ pub(crate) struct HostHeap {
     placed: std::sync::Arc<Mutex<Spans>>,
     /// [`NEXT_ID`]'s number for this heap ([`HostHeap::release`]).
     id: u64,
+    /// Last remap processed by this heap. The lock also serializes its passes.
+    remap_cursor: Mutex<u64>,
 }
 
 /// Diagnostics, since the last line (`crate::draw::tables_line`): the host
@@ -783,12 +786,56 @@ pub(crate) fn page_written(at: usize, len: usize) {
     ranges.push((start, end));
 }
 
-/// Title memory the runtime mapped, unmapped or is about to write since a
-/// texture pass last took the ranges ([`remapped`]).
-// Adapted from PastiiJay/klbf-lab 74315e7 (GPL-3.0). Keep the overflow
-// marker and ranges under one lock so taking a batch cannot consume a
-// later producer's overflow marker. Retain the existing memory bound.
-static REMAPPED: Mutex<(Vec<(u64, u64)>, bool)> = Mutex::new((Vec::new(), false));
+/// Recent title memory mappings, unmaps and writes, shared by all view heaps.
+static REMAPPED: Mutex<RemapQueue> = Mutex::new(RemapQueue::new());
+const REMAP_LIMIT: usize = 1 << 15;
+
+struct RemapQueue {
+    ranges: VecDeque<(u64, (u64, u64))>,
+    latest: u64,
+    evicted: u64,
+    published: u64,
+}
+
+impl RemapQueue {
+    const fn new() -> Self {
+        Self {
+            ranges: VecDeque::new(),
+            latest: 0,
+            evicted: 0,
+            published: 0,
+        }
+    }
+
+    /// Coalesce consecutive pages until a heap takes a snapshot of the range.
+    fn record(&mut self, start: u64, end: u64, limit: usize) -> bool {
+        self.latest += 1;
+        if let Some((sequence, (_, last_end))) = self.ranges.back_mut()
+            && *sequence > self.published
+            && *last_end == start
+        {
+            *sequence = self.latest;
+            *last_end = end;
+            return false;
+        }
+        let overflow = self.ranges.len() == limit;
+        if overflow {
+            self.evicted = self.ranges.pop_front().unwrap().0;
+        }
+        self.ranges.push_back((self.latest, (start, end)));
+        overflow
+    }
+
+    /// `None` means the heap missed an evicted range and must rescan.
+    fn snapshot(&mut self, cursor: u64) -> Option<Vec<(u64, u64)>> {
+        self.published = self.latest;
+        if cursor < self.evicted {
+            return None;
+        }
+        let first = self.ranges.partition_point(|(sequence, _)| *sequence <= cursor);
+        Some(self.ranges.iter().skip(first).map(|&(_, range)| range).collect())
+    }
+}
 
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
@@ -827,31 +874,15 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
-    let mut batch = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
-    let (ranges, overflowed) = &mut *batch;
+    let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    if ranges.record(start, end, REMAP_LIMIT) {
+        STALE[2].fetch_add(1, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // Revisit all placed slots on the next pass: discarded ranges
-        // must not leave an uploaded texture stale indefinitely.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        *overflowed = true;
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
@@ -1629,6 +1660,7 @@ impl HostHeap {
                 }
                 spans
             },
+            remap_cursor: Mutex::new(REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).latest),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1914,22 +1946,30 @@ impl HostHeap {
     /// went makes the slot null ([`HostHeap::texture_slot_gone`]), and a
     /// texture streamed into the place of another of the same description
     /// is uploaded although no descriptor says so. Slots tables read are
-    /// left to their draws. Returns how many slots it made due.
-    /// shortcut: the ranges are kept in one place for all heaps; the heap
-    /// whose pass runs first takes them (a title has one view heap).
+    /// left to their draws. A heap that lags behind the retained ranges
+    /// rescans its placed slots once. Returns how many slots it made due.
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let (ranges, all) = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
-        if ranges.is_empty() && !all {
-            return 0;
-        }
+        self.refresh_remapped(&REMAPPED, frame)
+    }
+
+    fn refresh_remapped(&self, history: &Mutex<RemapQueue>, frame: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut cursor = self.remap_cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let (latest, ranges) = {
+            let mut remapped = history.lock().unwrap_or_else(|e| e.into_inner());
+            if remapped.latest == *cursor {
+                return 0;
+            }
+            (remapped.latest, remapped.snapshot(*cursor))
+        };
+        let all = ranges.is_none();
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            if all {
-                placed.by_slot.keys().copied().collect()
+            if let Some(ranges) = ranges {
+                ranges.into_iter().flat_map(|(start, end)| placed.slots_in(start, end)).collect()
             } else {
-                ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+                placed.by_slot.keys().copied().collect()
             }
         };
         if all {
@@ -1943,6 +1983,7 @@ impl HostHeap {
             textures.changed(slot, frame, frame + 1);
             self.note_slot(slot, SLOT_IN_TEXTURES, true);
         }
+        *cursor = latest;
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
     }
@@ -5835,6 +5876,22 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
     }
 
+    #[test]
+    fn remap_history_delivers_extended_ranges_and_detects_eviction() {
+        let mut history = RemapQueue::new();
+        assert!(!history.record(10, 20, 2));
+        assert!(!history.record(20, 30, 2));
+        let captured = history.latest;
+        assert_eq!(history.snapshot(0), Some(vec![(10, 30)]));
+        assert!(!history.record(30, 40, 2));
+        assert_eq!(history.snapshot(captured), Some(vec![(30, 40)]));
+        assert!(history.record(60, 70, 2));
+        assert_eq!(history.snapshot(0), None);
+        assert_eq!(history.snapshot(captured), Some(vec![(30, 40), (60, 70)]));
+        assert_eq!(history.snapshot(history.latest), Some(Vec::new()));
+        assert_eq!(history.ranges.len(), 2);
+    }
+
     /// Memory the runtime maps under a slot's texture makes the slot due
     /// again from the next frame; a stale slot leaves the queue.
     #[test]
@@ -5843,6 +5900,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
+        let other = HostHeap::new(false, 8).expect("second view heap");
         let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
         // 64x64 BC7, one mip, at an address no test and no title uses.
         let at = 0x7fee_0000_0000u64;
@@ -5857,12 +5915,42 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
+        assert!(other.note_buffer(3, Some(&view(at, 64)), false, true).is_empty());
+        let (queued, write) = other.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(queued, 3);
+        other.texture_slot_done(3, write, None);
         // Memory elsewhere: nothing. Under the texture: due from the next frame.
         remapped((at + 2 * len) as usize, 0x1000);
         remapped(at as usize, 0x1000);
         assert_eq!(heap.texture_slots_remapped(50), 1);
+        assert_eq!(other.texture_slots_remapped(50), 1);
+        assert!(other.texture_slots_due(50, 8).0.is_empty());
+        assert_eq!(other.texture_slots_due(51, 8).0[0].0, 3);
+        assert_eq!(other.texture_slots_remapped(51), 0);
         assert_eq!(slots(50), []);
         assert_eq!(slots(51), [1]);
+        heap.texture_slot_done(1, heap.texture_slots_due(51, 8).0[0].1, None);
+        other.tabled_in(3, true, 51);
+        assert!(other.note_buffer(4, Some(&view(at - 4 * len, 64)), false, true).is_empty());
+        other.texture_slot_done(4, other.texture_slots_due(u64::MAX, 8).0[0].1, None);
+        // Lose the relevant range behind a burst in a small, isolated history.
+        let history = Mutex::new(RemapQueue::new());
+        *heap.remap_cursor.lock().unwrap() = 0;
+        *other.remap_cursor.lock().unwrap() = 0;
+        {
+            let mut ranges = history.lock().unwrap();
+            ranges.record(at, at + 0x1000, 2);
+            ranges.record(at + 4 * len, at + 4 * len + 0x1000, 2);
+            ranges.record(at + 8 * len, at + 8 * len + 0x1000, 2);
+        }
+        // Both heaps catch up once. A draw-table-owned slot still waits for
+        // its draw, even when its heap has to rescan all placed slots.
+        assert_eq!(other.refresh_remapped(&history, 52), 1);
+        assert_eq!(heap.refresh_remapped(&history, 52), 1);
+        assert_eq!(other.refresh_remapped(&history, 53), 0);
+        assert_eq!(other.texture_slots_due(53, 8).0[0].0, 4);
+        assert_eq!(heap.refresh_remapped(&history, 53), 0);
+        assert_eq!(slots(53), [1]);
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false, true), [1]);
         assert_eq!(slots(u64::MAX), [2]);
@@ -5889,7 +5977,8 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         }
         assert!(heap.texture_slots_due(u64::MAX, 8).0.is_empty());
         heap.tabled_in(2, true, 50);
-        *REMAPPED.lock().unwrap() = (Vec::new(), false);
+        *REMAPPED.lock().unwrap() = RemapQueue::new();
+        *heap.remap_cursor.lock().unwrap() = 0;
         remapped(at as usize, 4);
         for _ in 0..(1 << 15) {
             // A gap between the two textures, inside SPANNED. Repeated
