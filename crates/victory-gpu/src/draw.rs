@@ -530,6 +530,9 @@ pub(crate) struct State {
     topology_set: bool,
     target_views: Vec<Option<crate::descriptor::RtvSnapshot>>,
     depth_view: Option<crate::descriptor::RtvSnapshot>,
+    /// The handles themselves, for `VICTORY_RT_SNAPSHOT=0` ([`rt_snapshot`]).
+    target_handles: Vec<u64>,
+    depth_handle: u64,
     targets_set: bool,
     /// The formats of the views [`State::set_targets`] bound on the host
     /// list: a draw's pipeline is one for them
@@ -1095,6 +1098,15 @@ fn full_card_pass() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FULL_CARD_PASS").is_none_or(|v| v != "0"))
 }
 
+/// Whether the host list that continues a cut one makes its render target
+/// and depth views from the descriptor values the title's SetRenderTargets
+/// saw (`VICTORY_RT_SNAPSHOT=0`: no, from the handles' descriptors as they
+/// are at the cut, which may since have been rewritten to name another view).
+fn rt_snapshot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_SNAPSHOT").is_none_or(|v| v != "0"))
+}
+
 /// Whether a texture that has its host copy is still brought up to date
 /// while the card has no room for new ones (`VICTORY_REUPLOAD_WHEN_FULL=0`:
 /// no).
@@ -1445,6 +1457,16 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.target_handles.clear();
+        self.target_handles.extend_from_slice(handles);
+        self.depth_handle = depth;
+        self.snapshot_targets(handles, depth);
+        self.targets_set = true;
+        self.record_targets(list);
+    }
+
+    /// The descriptor values behind `handles` and `depth`, as they are now.
+    fn snapshot_targets(&mut self, handles: &[u64], depth: u64) {
         self.target_views.clear();
         self.target_views.extend(handles.iter().map(|&h| {
             let record = crate::descriptor::rtv_record(h);
@@ -1457,8 +1479,6 @@ impl State {
             record.map(|r| r.snapshot())
         }));
         self.depth_view = crate::descriptor::dsv_record(depth).map(|r| r.snapshot());
-        self.targets_set = true;
-        self.record_targets(list);
     }
 
     /// Recreate host views from the values captured at SetRenderTargets,
@@ -1588,6 +1608,13 @@ impl State {
             self.set_topology(list, self.topology);
         }
         if self.targets_set {
+            if !rt_snapshot() {
+                // As before: the views are made again from the handles'
+                // descriptors as they are now.
+                let handles = std::mem::take(&mut self.target_handles);
+                self.snapshot_targets(&handles, self.depth_handle);
+                self.target_handles = handles;
+            }
             self.record_targets(list);
         }
         if !self.viewports.is_empty() {
