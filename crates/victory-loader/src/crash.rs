@@ -244,8 +244,9 @@ fn amd_rate_line(rates: &[f64; AmdKind::COUNT]) -> String {
 
 /// Counts one emulation and, at most every five seconds, says the counts
 /// per second since the last line, in every build: the measure that tells
-/// whether rewriting the sites (`VICTORY_PATCH_WAITS`, `VICTORY_PATCH_CLZERO`)
-/// can pay here (another project counted some 25,000 a second on Intel).
+/// whether rewriting the sites (`VICTORY_PATCH_WAITS`, `VICTORY_PATCH_CLZERO`,
+/// `VICTORY_PATCH_CLWB`) can pay here (another project counted some 25,000
+/// a second on Intel).
 /// One faulting thread wins the line (a compare-exchange on the time), so
 /// the others only count.
 fn note_amd(kind: AmdKind) {
@@ -274,8 +275,9 @@ fn note_amd(kind: AmdKind) {
 /// around them works with mwaitx as a yield; `rdpru` (`0f 01 fd`) reads
 /// MPERF (`ecx` 0) or APERF (1), cycles at the nominal and the actual
 /// frequency, and gets the time-stamp counter for both: a core that never
-/// changes frequency. With `VICTORY_PATCH_WAITS=1` or `VICTORY_PATCH_CLZERO=1`,
-/// [`crate::cpu_patches`] rewrites a site once emulated, so it stops faulting.
+/// changes frequency. With `VICTORY_PATCH_WAITS=1`, `VICTORY_PATCH_CLZERO=1`
+/// or `VICTORY_PATCH_CLWB=1`, [`crate::cpu_patches`] rewrites a site once
+/// emulated, so it stops faulting.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
@@ -333,6 +335,13 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 let mut bytes = [0u8; 32];
                 let n = room.min(bytes.len());
                 std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
+                // A `clwb` rewrite (`VICTORY_PATCH_CLWB`) may land during the
+                // copy: its word is read again whole, and if the NOP is
+                // there now, the thread runs it.
+                crate::cpu_patches::reread_site_word(site, &mut bytes[..n]);
+                if crate::cpu_patches::rewritten_under_fault([bytes[0], bytes[1], bytes[2]]) {
+                    return true;
+                }
                 if let Some(pass) = clwb_loop(&bytes[..n])
                     && let Some(end) =
                         clwb_loop_end(*gpr(context, pass.base), *gpr(context, pass.limit))
@@ -344,12 +353,16 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.EFlags = context.EFlags & !CMP_FLAGS | flags;
                     context.Rip += pass.len as u64;
                     note_amd(AmdKind::ClwbLoop);
+                    if let Some(len) = clwb_len(&bytes[..n]) {
+                        crate::cpu_patches::after_clwb(site, &bytes[..len], true);
+                    }
                     return true;
                 }
                 if let Some(len) = clwb_len(&bytes[..n]) {
                     note_amd(AmdKind::Clwb);
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
+                    crate::cpu_patches::after_clwb(site, &bytes[..len], false);
                     return true;
                 }
                 let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {

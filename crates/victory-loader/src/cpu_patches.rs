@@ -21,8 +21,16 @@
 //!   become `jmp` to a trampoline that zeroes the line with plain stores,
 //!   runs the moved instruction and jumps back. Every other `clzero` stays
 //!   emulated (no instruction-length decoder here, on purpose).
+//! - `VICTORY_PATCH_CLWB=1`: `clwb m8` (`66 [rex] 0f ae /6`), a write-back
+//!   hint whose emulation does nothing on the PC, becomes the multi-byte NOP
+//!   Intel recommends for its exact length ([`multi_byte_nop`]), the length
+//!   the emulation already decodes. That includes the `clwb` of the
+//!   write-back loop the emulation does whole (`clwb [base]; add base, 0x40;
+//!   cmp base, limit; jbe`): with a NOP there, the loop runs natively, `add`,
+//!   `cmp` and `jbe` a line, ending with the registers and flags the
+//!   emulation would leave. SSE4a stays emulated.
 //!
-//! Both switches are off by default: unset, nothing here runs.
+//! All switches are off by default: unset, nothing here runs.
 //!
 //! Safety of the rewrite, which other threads may be executing meanwhile:
 //! the bytes replaced must lie in one aligned 8-byte word, written with a
@@ -63,9 +71,12 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 pub(crate) const WAITS_ENV: &str = "VICTORY_PATCH_WAITS";
 /// Turns the `clzero` loop rewrite on.
 pub(crate) const CLZERO_ENV: &str = "VICTORY_PATCH_CLZERO";
+/// Turns the `clwb` rewrite on.
+pub(crate) const CLWB_ENV: &str = "VICTORY_PATCH_CLWB";
 
 static WAITS: AtomicBool = AtomicBool::new(false);
 static CLZERO: AtomicBool = AtomicBool::new(false);
+static CLWB: AtomicBool = AtomicBool::new(false);
 /// Sites rewritten so far.
 static PATCHED: AtomicUsize = AtomicUsize::new(0);
 
@@ -86,6 +97,41 @@ pub(crate) fn read_switches() {
     let on = |name| std::env::var_os(name).is_some_and(|value| value == "1");
     WAITS.store(on(WAITS_ENV), Ordering::Relaxed);
     CLZERO.store(on(CLZERO_ENV), Ordering::Relaxed);
+    CLWB.store(on(CLWB_ENV), Ordering::Relaxed);
+}
+
+/// Some rewrite is on: sites may change under a fault.
+fn any_switch() -> bool {
+    WAITS.load(Ordering::Relaxed) || CLZERO.load(Ordering::Relaxed) || CLWB.load(Ordering::Relaxed)
+}
+
+/// The multi-byte NOPs the Intel SDM recommends (`NOP` instruction), by
+/// length: `nop`, `66 nop`, then `nop dword/word` with a memory operand
+/// (`0f 1f /0`) whose ModRM, SIB and zero displacement set the length.
+const NOPS: [&[u8]; 9] = [
+    &[0x90],
+    &[0x66, 0x90],
+    &[0x0f, 0x1f, 0x00],
+    &[0x0f, 0x1f, 0x40, 0x00],
+    &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+    &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+    &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+    &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+];
+
+/// One NOP instruction of exactly `len` bytes (1 to 9), or `None`.
+fn multi_byte_nop(len: usize) -> Option<&'static [u8]> {
+    NOPS.get(len.checked_sub(1)?).copied()
+}
+
+/// What replaces a `clwb` of `len` bytes at `site`: a NOP of that length,
+/// if the bytes lie in one aligned word (the only atomic write there is).
+fn clwb_replacement(site: usize, len: usize) -> Result<&'static [u8], &'static str> {
+    if !fits_one_word(site, len) {
+        return Err("crosses an 8-byte boundary, cannot be written atomically");
+    }
+    multi_byte_nop(len).ok_or("no NOP of that length")
 }
 
 /// What replaces a `monitorx`/`mwaitx`, or `None` for other bytes.
@@ -165,9 +211,15 @@ fn clzero_trampoline(at: usize, moved: &[u8], back: usize) -> Option<Vec<u8>> {
 }
 
 /// The site's bytes are an instruction that cannot raise #UD and that a
-/// rewrite here writes: one that changed under a fault.
+/// rewrite here writes: one that changed under a fault. `0f 1f` covers
+/// [`NOP3`] and the `clwb` NOPs of 3 to 8 bytes, `66 90` and `66 0f 1f` the
+/// others.
 fn is_rewritten(code: [u8; 3]) -> bool {
-    code == NOP3 || code == PAUSE_NOP || code[0] == JMP
+    code == PAUSE_NOP
+        || code[0] == JMP
+        || code[..2] == [0x0f, 0x1f]
+        || code[..2] == [0x66, 0x90]
+        || code == [0x66, 0x0f, 0x1f]
 }
 
 /// `[site, site + len)` lies inside one of `ranges` (`[start, end)`).
@@ -293,13 +345,31 @@ pub(crate) fn after_clzero(site: usize, skipped: u64) {
     });
 }
 
+/// A `clwb` of bytes `code` (its whole length, from [`crate::crash`]'s
+/// decoder) was just emulated at `site`, alone or as the head of the
+/// write-back loop the emulation did whole (`in_loop`).
+pub(crate) fn after_clwb(site: usize, code: &[u8], in_loop: bool) {
+    if !CLWB.load(Ordering::Relaxed) {
+        return;
+    }
+    let what = if in_loop { "clwb in a write-back loop" } else { "clwb" };
+    decide(site, what, |state| {
+        if !inside(&state.code, site, code.len()) {
+            return Err("outside the title's code");
+        }
+        let nop = clwb_replacement(site, code.len())?;
+        // SAFETY: title code, the bytes checked as they are written.
+        unsafe { write_code(site, code, nop) }
+    });
+}
+
 /// An illegal-instruction fault at a site whose bytes are now `code`: true
 /// if a rewrite there replaced the instruction after the CPU fetched it, so
 /// the thread is to run the new one, at the same `rip`. Bytes that cannot
 /// raise #UD can only be there for that reason; this does not wait for the
 /// rewrite to be counted, as the faulting thread may see it first.
 pub(crate) fn rewritten_under_fault(code: [u8; 3]) -> bool {
-    (WAITS.load(Ordering::Relaxed) || CLZERO.load(Ordering::Relaxed)) && is_rewritten(code)
+    any_switch() && is_rewritten(code)
 }
 
 /// The three bytes at a faulting `rip`. With a switch on, read with one
@@ -310,8 +380,7 @@ pub(crate) fn rewritten_under_fault(code: [u8; 3]) -> bool {
 /// # Safety
 /// `site` is a faulting instruction's address: its bytes are readable.
 pub(crate) unsafe fn site_bytes(site: usize) -> [u8; 3] {
-    let on = WAITS.load(Ordering::Relaxed) || CLZERO.load(Ordering::Relaxed);
-    if on && fits_one_word(site, 3) {
+    if any_switch() && fits_one_word(site, 3) {
         // SAFETY: an aligned word never leaves its page, the site's.
         let word = unsafe { AtomicU64::from_ptr((site & !7) as *mut u64) }.load(Ordering::Acquire);
         let (bytes, at) = (word.to_le_bytes(), site & 7);
@@ -319,6 +388,24 @@ pub(crate) unsafe fn site_bytes(site: usize) -> [u8; 3] {
     }
     // SAFETY: forwarded from the caller.
     unsafe { (site as *const [u8; 3]).read_unaligned() }
+}
+
+/// `code`, bytes copied one by one from a faulting `site`, with those that
+/// lie in the site's aligned word read again with one load of it, when a
+/// switch is on: a rewrite (always inside that word) in progress during the
+/// copy is then seen whole or not at all, never as a mix to decode.
+///
+/// # Safety
+/// `site` is a faulting instruction's address: its bytes are readable.
+pub(crate) unsafe fn reread_site_word(site: usize, code: &mut [u8]) {
+    if !any_switch() {
+        return;
+    }
+    // SAFETY: an aligned word never leaves its page, the site's.
+    let word = unsafe { AtomicU64::from_ptr((site & !7) as *mut u64) }.load(Ordering::Acquire);
+    let at = site & 7;
+    let n = code.len().min(8 - at);
+    code[..n].copy_from_slice(&word.to_le_bytes()[at..at + n]);
 }
 
 /// Runs `patch` for `site` once, logging the outcome once. Skipped (to be
@@ -586,10 +673,94 @@ mod tests {
         assert!(is_rewritten(NOP3));
         assert!(is_rewritten(PAUSE_NOP));
         assert!(is_rewritten([JMP, 0x12, 0x34]));
+        for len in 2..=9 {
+            let nop = multi_byte_nop(len).unwrap();
+            assert!(is_rewritten([nop[0], nop[1], nop.get(2).copied().unwrap_or(0xcc)]));
+        }
         assert!(!is_rewritten(MONITORX));
         assert!(!is_rewritten(MWAITX));
         assert!(!is_rewritten(CLZERO_OP));
         assert!(!is_rewritten([0x0f, 0x0b, 0x90]));
+        // clwb, with and without REX.
+        assert!(!is_rewritten([0x66, 0x0f, 0xae]));
+        assert!(!is_rewritten([0x66, 0x41, 0x0f]));
+        // SSE4a extrq/insertq.
+        assert!(!is_rewritten([0x66, 0x0f, 0x78]));
+        assert!(!is_rewritten([0xf2, 0x0f, 0x79]));
+    }
+
+    /// The length of a NOP as the CPU decodes it, checking it is one:
+    /// `90`, `66 90`, or `[66] 0f 1f /0` with a memory operand whose SIB
+    /// and displacement bytes are zero.
+    fn decoded_nop_len(code: &[u8]) -> usize {
+        match code {
+            [0x90, ..] => return 1,
+            [0x66, 0x90, ..] => return 2,
+            _ => {}
+        }
+        let at = usize::from(code[0] == 0x66);
+        assert_eq!(code[at..at + 2], [0x0f, 0x1f], "{code:02x?}");
+        let modrm = code[at + 2];
+        let (mode, reg, rm) = (modrm >> 6, (modrm >> 3) & 7, modrm & 7);
+        assert_eq!(reg, 0, "0f 1f /0 is the NOP");
+        assert_ne!(mode, 3, "a memory operand, as Intel's forms have");
+        assert!(mode != 0 || rm != 5, "no rip-relative form");
+        let mut len = at + 3;
+        if rm == 4 {
+            len += 1; // SIB
+        }
+        len += match mode {
+            1 => 1,
+            2 => 4,
+            _ => 0,
+        };
+        assert!(code[at + 3..len].iter().all(|&b| b == 0), "{code:02x?}");
+        len
+    }
+
+    #[test]
+    fn every_nop_has_its_length_and_is_one_instruction() {
+        assert_eq!(multi_byte_nop(0), None);
+        assert_eq!(multi_byte_nop(10), None);
+        assert_eq!(multi_byte_nop(3), Some(&NOP3[..]));
+        for len in 1..=9 {
+            let nop = multi_byte_nop(len).unwrap();
+            assert_eq!(nop.len(), len);
+            assert_eq!(decoded_nop_len(nop), len);
+        }
+        assert_eq!(multi_byte_nop(2), Some(&[0x66, 0x90][..]));
+        assert_eq!(multi_byte_nop(4), Some(&[0x0f, 0x1f, 0x40, 0x00][..]));
+        assert_eq!(multi_byte_nop(5), Some(&[0x0f, 0x1f, 0x44, 0x00, 0x00][..]));
+        assert_eq!(multi_byte_nop(6), Some(&[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00][..]));
+        assert_eq!(multi_byte_nop(7), Some(&[0x0f, 0x1f, 0x80, 0, 0, 0, 0][..]));
+        assert_eq!(multi_byte_nop(8), Some(&[0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0][..]));
+        assert_eq!(multi_byte_nop(9), Some(&[0x66, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0][..]));
+    }
+
+    #[test]
+    fn a_clwb_is_replaced_only_when_it_fits_one_aligned_word() {
+        // clwb [rax] (4 bytes), [r9] (5), [rax+0x40] (5), [rax+disp32] (8).
+        assert_eq!(clwb_replacement(0x1000, 4), Ok(multi_byte_nop(4).unwrap()));
+        assert_eq!(clwb_replacement(0x1004, 4), Ok(multi_byte_nop(4).unwrap()));
+        assert!(clwb_replacement(0x1005, 4).is_err());
+        assert_eq!(clwb_replacement(0x1003, 5), Ok(multi_byte_nop(5).unwrap()));
+        assert!(clwb_replacement(0x1004, 5).is_err());
+        assert_eq!(clwb_replacement(0x1000, 8), Ok(multi_byte_nop(8).unwrap()));
+        assert!(clwb_replacement(0x1001, 8).is_err());
+        // A 10-byte clwb (REX, SIB, disp32) never fits.
+        assert!(clwb_replacement(0x1000, 10).is_err());
+    }
+
+    #[test]
+    fn a_clwb_in_a_buffer_of_ours_becomes_a_nop_of_its_length() {
+        // clwb [rcx]; add rcx, 0x40 (a write-back loop's head), at offset 1.
+        let code = [0x66, 0x0f, 0xae, 0x31];
+        let word = u64::from_le_bytes([0x90, 0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1]);
+        let nop = clwb_replacement(0x1001, code.len()).unwrap();
+        let next = splice(word, 1, &code, nop).unwrap();
+        assert_eq!(next.to_le_bytes(), [0x90, 0x0f, 0x1f, 0x40, 0x00, 0x48, 0x83, 0xc1]);
+        // Done once: the clwb is gone.
+        assert_eq!(splice(next, 1, &code, nop), None);
     }
 
     #[test]
