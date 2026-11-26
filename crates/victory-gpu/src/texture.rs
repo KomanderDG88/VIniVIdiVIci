@@ -1739,7 +1739,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let title_bytes = layout.size as usize;
-    let (layout, first_mip) = staging_layout(layout, crate::resource::drop_levels(&desc));
+    // The levels its host copy leaves out: that copy's own count, which for
+    // a copy made short of room (`crate::resource::ShortOfRoom`) is not the
+    // description's alone. (Takes no lock.)
+    let (layout, first_mip) = staging_layout(layout, crate::resource::dropped(resource));
     let s = Arc::new(Staging {
         mem: Mutex::new(Some((buffer, data as usize, pooled))),
         #[cfg(feature = "diagnostics")]

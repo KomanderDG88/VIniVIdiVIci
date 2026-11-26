@@ -817,6 +817,10 @@ pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), 
 /// new ones, since the start.
 pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// Slots made with short host copies while the card had no room for new
+/// textures (`VICTORY_TEXTURE_SHORT=1`), since the start.
+static HEAP_TEXTURES_SHORT: AtomicU64 = AtomicU64::new(0);
+
 /// Whether a pass over the textures picked by index on a full card holds
 /// back the slots that need a new host copy (`VICTORY_FULL_CARD_PASS=0`:
 /// no, as before: they stay due, each pass looks at the same ones again
@@ -2356,6 +2360,11 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        // Whether short host copies may still be made (`VICTORY_TEXTURE_SHORT`,
+        // `crate::resource::room_for_short`): asked when first wanted in a
+        // pass, and again after every 32 MiB they upload.
+        let mut short_room: Option<bool> = None;
+        let mut since_short = 0u64;
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
@@ -2521,10 +2530,30 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
+            // Short of room (`VICTORY_TEXTURE_SHORT=1`; off by default here):
+            // a slot that would be held back is made instead with a host
+            // copy of its levels of up to 256 texels (about 87 KB),
+            // while the card is under 97 % of its budget
+            // (`crate::resource::ShortOfRoom`): a blurred texture, not a
+            // black one. Off, nothing here changes.
+            let mut short = false;
             if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
-                if !has_its_texture {
+                short = !has_its_texture
+                    && crate::resource::texture_short()
+                    && *short_room.get_or_insert_with(crate::resource::room_for_short);
+                if short {
+                    let n = HEAP_TEXTURES_SHORT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(500) {
+                        tracing::info!(
+                            so_far = n,
+                            slot = index,
+                            "the card has no room for a new texture: it is made with its small levels alone (VICTORY_TEXTURE_SHORT)"
+                        );
+                    }
+                }
+                if !has_its_texture && !short {
                     refused += 1;
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
@@ -2539,15 +2568,20 @@ impl State {
                     }
                     continue;
                 }
-                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n.is_multiple_of(500) {
-                    tracing::info!(
-                        so_far = n,
-                        slot = index,
-                        "a texture already on the card is brought up to date although the card has no room for new ones"
-                    );
+                if has_its_texture {
+                    let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(500) {
+                        tracing::info!(
+                            so_far = n,
+                            slot = index,
+                            "a texture already on the card is brought up to date although the card has no room for new ones"
+                        );
+                    }
                 }
             }
+            // Alive for the rest of this slot's turn: a host copy made in it
+            // (by the mirror below, or by the upload) is made short.
+            let _short = short.then(crate::resource::ShortOfRoom::begin);
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
@@ -2618,6 +2652,13 @@ impl State {
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
                 room = crate::resource::room();
+            }
+            if short {
+                since_short += bytes;
+                if since_short >= 32 << 20 {
+                    since_short = 0;
+                    short_room = None;
+                }
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);

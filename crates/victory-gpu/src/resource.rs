@@ -1162,6 +1162,11 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// The title's largest levels its host copy leaves out, set as each
+    /// host copy is made ([`drop_levels`] then, short of room or not);
+    /// `u32::MAX` before the first. Read by [`dropped`] with
+    /// `VICTORY_TEXTURE_SHORT=1` only, without the lock of `made`.
+    dropped: std::sync::atomic::AtomicU32,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1283,8 +1288,22 @@ fn fills(desc: &ResourceDesc) -> bool {
 /// texel for texel. Shaders see the texture at half the size per level
 /// left out: views shift their levels ([`shift_levels`]), and copies
 /// between such a texture and another are skipped (`list.rs` `unlike`).
+///
+/// Short of room (`VICTORY_TEXTURE_SHORT=1`, while a [`ShortOfRoom`] is
+/// alive on this thread): as many more as bring a single 2D texture down
+/// to `short_side()` texels ([`short_levels`]). Off, this is what it was.
 #[cfg(windows)]
 pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
+    let always = drop_always(desc);
+    if !SHORT.get() {
+        return always;
+    }
+    always.max(short_levels(desc, short_side()))
+}
+
+/// [`drop_levels`] by `VICTORY_TEXTURE_DROP_MIPS` alone.
+#[cfg(windows)]
+fn drop_always(desc: &ResourceDesc) -> u32 {
     const TEXTURE_2D: u32 = 3;
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let n = *N.get_or_init(|| {
@@ -1306,13 +1325,146 @@ pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
     n
 }
 
-/// [`drop_levels`] of title resource `this`; 0 for buffers and null.
+/// [`drop_levels`] of title resource `this`; 0 for buffers and null. With
+/// `VICTORY_TEXTURE_SHORT=1`, once a host copy was made, the levels that
+/// copy leaves out (made short of room or not: [`Hosted::dropped`]).
 #[cfg(windows)]
 pub(crate) fn dropped(this: This) -> u32 {
     if this.is_null() {
         return 0;
     }
-    drop_levels(&resource(this).desc)
+    let r = resource(this);
+    if texture_short() {
+        let made = r.host.dropped.load(std::sync::atomic::Ordering::Acquire);
+        if made != u32::MAX {
+            return made;
+        }
+    }
+    drop_levels(&r.desc)
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// Host copies made on this thread now leave out the levels larger
+    /// than `short_side()` ([`ShortOfRoom`]).
+    static SHORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, host copies of title-filled single 2D textures made on
+/// this thread leave out their levels larger than `short_side()` texels
+/// (256 unless said: about 87 KB for a BC7 texture) instead of waiting
+/// for room on the card (`VICTORY_TEXTURE_SHORT=1`, `draw.rs`
+/// `heap_textures`). A blurred texture instead of a black one.
+/// From LoverCatys/ruff-lab ac473bf2, adapted there from ka1qux/BRVIctory-ka1qux
+/// (after Belobug ebd990d and fxceless/victory-fork #610).
+#[cfg(windows)]
+pub(crate) struct ShortOfRoom(());
+
+#[cfg(windows)]
+impl ShortOfRoom {
+    pub(crate) fn begin() -> ShortOfRoom {
+        SHORT.set(true);
+        ShortOfRoom(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ShortOfRoom {
+    fn drop(&mut self) {
+        SHORT.set(false);
+    }
+}
+
+/// `VICTORY_TEXTURE_SHORT=1`: a texture picked by index that would wait
+/// for room on the card is made short instead ([`ShortOfRoom`]), up to
+/// [`room_for_short`]. Off unless said (ruff-lab has it on, `=0` there
+/// turns it off), and off with `VICTORY_TEXTURE_BUDGET_MB`, as there.
+#[cfg(windows)]
+pub(crate) fn texture_short() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_TEXTURE_SHORT").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_none()
+    })
+}
+
+/// Whether short host copies ([`ShortOfRoom`]) may still be made while
+/// the card has no room for whole ones ([`room`]): while the card's use,
+/// with what is kept for others, is under `VICTORY_TEXTURE_SHORT_PERCENT`
+/// of its budget (97 unless said, at least [`room_percent`], at most 98).
+/// Asks the system.
+#[cfg(windows)]
+pub(crate) fn room_for_short() -> bool {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let percent = *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SHORT_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(97u64.max(room_percent()), |p| p.clamp(room_percent(), 98))
+    });
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    room_for_short_by(memory, crate::shadow::card_room_kept() + targets_room_kept(), percent)
+}
+
+/// [`room_for_short`]'s answer from its figures (for the tests): the card's
+/// budget and use (`crate::host::Host::video_memory`), the bytes kept for
+/// others and counted as used, the share of the budget. Without a budget:
+/// no.
+fn room_for_short_by(memory: Option<[u64; 4]>, kept: u64, percent: u64) -> bool {
+    match memory {
+        Some([budget, used, ..]) => used.saturating_add(kept) < budget / 100 * percent,
+        None => false,
+    }
+}
+
+/// The largest side of a short host copy, in texels
+/// (`VICTORY_TEXTURE_SHORT_SIDE`, 256 unless said, 16 to 4,096).
+#[cfg(windows)]
+fn short_side() -> u64 {
+    static SIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIDE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SHORT_SIDE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(256, |side| side.clamp(16, 4096))
+    })
+}
+
+/// The levels a short host copy of a texture described by `desc` leaves
+/// out ([`short_levels_by`]): only 2D textures the title fills, one slice,
+/// not multisampled, with two levels or more.
+#[cfg(windows)]
+fn short_levels(desc: &ResourceDesc, side: u64) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    if !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.sample_count > 1
+        || desc.mip_levels < 2
+    {
+        return 0;
+    }
+    short_levels_by(desc.width, u64::from(desc.height), u32::from(desc.mip_levels), side)
+}
+
+/// As many of the largest levels as bring a `width` by `height` texture of
+/// `mips` levels to `side` texels or less, within [`levels_to_drop`].
+fn short_levels_by(width: u64, height: u64, mips: u32, side: u64) -> u32 {
+    let mut n = 0u32;
+    while n < 32 && width.max(height) >> n > side {
+        n += 1;
+    }
+    levels_to_drop(n, width, height, mips)
+}
+
+/// Of `wanted` levels to leave out, as many as leave a level and halve
+/// both sides exactly into whole 4-texel blocks.
+fn levels_to_drop(wanted: u32, width: u64, height: u64, mips: u32) -> u32 {
+    let mut n = wanted.min(mips.saturating_sub(1));
+    while n > 0 && !(width.is_multiple_of(4 << n) && height.is_multiple_of(4 << n)) {
+        n -= 1;
+    }
+    n
 }
 
 /// The host copy's subresource for subresource `index` of title texture
@@ -1414,6 +1566,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         const TEXTURE_2D: u32 = 3;
         let mut tiled = None;
         let mut texture = None;
+        // The levels the host copy leaves out (with `VICTORY_TEXTURE_SHORT=1`
+        // more of them if this thread makes it short of room: `ShortOfRoom`).
+        let drop = drop_levels(&r.desc);
         let shape_fits = fills(&r.desc)
             && r.desc.dimension == TEXTURE_2D
             && r.desc.depth_or_array_size == 1
@@ -1421,7 +1576,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.sample_count <= 1
             // The tile path numbers levels as the title does; a texture
             // whose host copy leaves out levels stays on the plain path.
-            && drop_levels(&r.desc) == 0;
+            && drop == 0;
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
@@ -1465,6 +1620,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 "depth texture with unordered access"
             );
         }
+        // Before the copy is there to be found: what it leaves out
+        // ([`dropped`]; a tiled copy leaves out none, `shape_fits`).
+        r.host.dropped.store(if tiled.is_some() { 0 } else { drop }, std::sync::atomic::Ordering::Release);
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = match tiled {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
@@ -2440,6 +2598,7 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            dropped: std::sync::atomic::AtomicU32::new(u32::MAX),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -3072,6 +3231,76 @@ mod tests {
         assert_eq!(shifted(1, 3, 2, 2.5), (2, 2, 1.5));
         assert_eq!(shifted(2, 1, 1, 0.0), (0, 1, 0.0));
         assert_eq!(shifted(0, 3, 2, 1.0), (3, 2, 1.0));
+    }
+
+    /// From ruff-lab ac473bf2: the levels left out keep whole 4-texel
+    /// blocks and a level, and views shift by them.
+    #[test]
+    fn levels_to_drop_and_shift_levels_keep_block_alignment() {
+        assert_eq!(levels_to_drop(3, 2048, 2048, 12), 3);
+        assert_eq!(levels_to_drop(10, 64, 64, 7), 4); // 64 / (4 << 4) == 1
+        assert_eq!(levels_to_drop(2, 1024, 1024, 1), 0); // at least 1 mip left
+        let (mut first, mut levels, mut clamp) = (0, u32::MAX, 2.5);
+        shift_levels(2, &mut first, &mut levels, &mut clamp);
+        assert_eq!((first, levels, clamp), (0, u32::MAX, 0.5));
+        let (mut first, mut levels, mut clamp) = (1, 4, 1.0);
+        shift_levels(2, &mut first, &mut levels, &mut clamp);
+        assert_eq!((first, levels, clamp), (0, 3, 0.0));
+    }
+
+    /// A short copy (`VICTORY_TEXTURE_SHORT`) stops at the side asked for,
+    /// within whole blocks and with a level left.
+    #[test]
+    fn short_copies_stop_at_the_side_asked_for() {
+        assert_eq!(short_levels_by(2048, 2048, 12, 256), 3);
+        assert_eq!(short_levels_by(4096, 1024, 13, 256), 4);
+        assert_eq!(short_levels_by(256, 256, 9, 256), 0);
+        assert_eq!(short_levels_by(300, 300, 9, 256), 0, "300 is not halved into whole blocks");
+        assert_eq!(short_levels_by(1024, 1024, 2, 256), 1, "a level is left");
+        assert_eq!(short_levels_by(2048, 2048, 12, 16), 7);
+    }
+
+    /// Short copies go on up to the share asked for, with what is kept
+    /// counted as used; not without a budget.
+    #[test]
+    fn short_copies_go_on_to_their_share_of_the_budget() {
+        const MB: u64 = 1 << 20;
+        let card = |used: u64| Some([8000 * MB, used * MB, 4000 * MB, 0]);
+        // 97 % of 8,000 MB is 7,760 MB.
+        assert!(room_for_short_by(card(7000), 700 * MB, 97));
+        assert!(!room_for_short_by(card(7060), 700 * MB, 97), "equal is no room");
+        assert!(!room_for_short_by(None, 0, 97));
+        assert!(!room_for_short_by(Some([u64::MAX, u64::MAX, 0, 0]), u64::MAX, 98));
+    }
+
+    /// Without a `ShortOfRoom` alive on the thread (never begun without
+    /// `VICTORY_TEXTURE_SHORT=1`) the levels left out are what they were;
+    /// with one, a single 2D texture the title fills is made short, a
+    /// target or an array is not, and once it goes all is as before.
+    #[cfg(windows)]
+    #[test]
+    fn without_short_of_room_the_levels_left_out_are_as_before() {
+        if std::env::var_os("VICTORY_TEXTURE_SHORT").is_none() {
+            assert!(!texture_short());
+        }
+        let shapes = [(2048, 2048, 12), (4096, 1024, 13), (512, 512, 10), (300, 300, 9), (64, 64, 7)];
+        for (w, h, mips) in shapes {
+            let d = texture(w, h, 77, mips);
+            assert_eq!(drop_levels(&d), drop_always(&d));
+        }
+        let d = texture(2048, 2048, 77, 12);
+        let target = ResourceDesc { flags: 1, ..d };
+        let array = ResourceDesc { depth_or_array_size: 6, ..d };
+        {
+            let _short = ShortOfRoom::begin();
+            assert_eq!(drop_levels(&d), drop_always(&d).max(3));
+            assert_eq!(drop_levels(&target), drop_always(&target));
+            assert_eq!(drop_levels(&array), drop_always(&array));
+        }
+        for (w, h, mips) in shapes {
+            let d = texture(w, h, 77, mips);
+            assert_eq!(drop_levels(&d), drop_always(&d));
+        }
     }
 
     type Release = extern "system" fn(This) -> u32;
