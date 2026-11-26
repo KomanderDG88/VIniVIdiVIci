@@ -178,6 +178,7 @@ pub fn report_crashes() {
             && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
         Ordering::Relaxed,
     );
+    crate::cpu_patches::read_switches();
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -198,25 +199,54 @@ const FATAL: [i32; 6] = [
 ];
 
 /// The kinds of AMD-only instructions emulated ([`emulate_amd_only`]),
-/// counted in [`AMD_EMULATED`]: `clzero`, `monitorx`, `mwaitx`, `rdpru`, and
-/// the others (`clwb` and its loops, SSE4a).
+/// counted in [`AMD_EMULATED`], in the order the rate line names them.
 #[derive(Clone, Copy)]
 enum AmdKind {
     Clzero,
     Monitorx,
     Mwaitx,
     Rdpru,
-    Other,
+    /// One `clwb` ([`clwb_len`]).
+    Clwb,
+    /// A whole `clwb` write-back loop done in one exception ([`clwb_loop`]).
+    ClwbLoop,
+    /// SSE4a `extrq` (`66` prefix, [`sse4a`]).
+    Extrq,
+    /// SSE4a `insertq` (`f2` prefix, [`sse4a`]).
+    Insertq,
+}
+
+impl AmdKind {
+    const COUNT: usize = 8;
+    /// Names in the rate line, by [`AmdKind`] value.
+    const NAMES: [&'static str; Self::COUNT] =
+        ["clzero", "monitorx", "mwaitx", "rdpru", "clwb", "clwb loops", "extrq", "insertq"];
 }
 
 /// AMD-only instructions emulated since the start, by [`AmdKind`]; each is
 /// an exception (about a microsecond, and a kernel round trip).
-static AMD_EMULATED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static AMD_EMULATED: [std::sync::atomic::AtomicU64; AmdKind::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; AmdKind::COUNT];
+
+/// The rate line: each kind's count per second, then the sum, e.g.
+/// `clzero 14180, monitorx 6536, ..., insertq 0; 47543 in all`.
+fn amd_rate_line(rates: &[f64; AmdKind::COUNT]) -> String {
+    let mut line = String::new();
+    for (name, rate) in AmdKind::NAMES.iter().zip(rates) {
+        if !line.is_empty() {
+            line.push_str(", ");
+        }
+        line.push_str(&format!("{name} {rate:.0}"));
+    }
+    line.push_str(&format!("; {:.0} in all", rates.iter().sum::<f64>()));
+    line
+}
 
 /// Counts one emulation and, at most every five seconds, says the counts
 /// per second since the last line, in every build: the measure that tells
-/// whether rewriting the sites (`VICTORY_PATCH_WAITS`, `VICTORY_PATCH_CLZERO`)
-/// can pay here (another project counted some 25,000 a second on Intel).
+/// whether rewriting the sites (`VICTORY_PATCH_WAITS`, `VICTORY_PATCH_CLZERO`,
+/// `VICTORY_PATCH_CLWB`) can pay here (another project counted some 25,000
+/// a second on Intel).
 /// One faulting thread wins the line (a compare-exchange on the time), so
 /// the others only count.
 fn note_amd(kind: AmdKind) {
@@ -224,22 +254,18 @@ fn note_amd(kind: AmdKind) {
     AMD_EMULATED[kind as usize].fetch_add(1, Relaxed);
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
-    static BEFORE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static BEFORE: [AtomicU64; AmdKind::COUNT] = [const { AtomicU64::new(0) }; AmdKind::COUNT];
     let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
     let last = LAST_MS.load(Relaxed);
     if now < last + 5_000 || LAST_MS.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
         return;
     }
     let seconds = (now - last).max(1) as f64 / 1e3;
-    let rate = |k: usize| {
+    let rates: [f64; AmdKind::COUNT] = std::array::from_fn(|k| {
         let total = AMD_EMULATED[k].load(Relaxed);
         (total - BEFORE[k].swap(total, Relaxed)) as f64 / seconds
-    };
-    let [clzero, monitorx, mwaitx, rdpru, other] = [rate(0), rate(1), rate(2), rate(3), rate(4)];
-    tracing::info!(
-        "AMD-only instructions emulated per second: clzero {clzero:.0}, monitorx {monitorx:.0}, mwaitx {mwaitx:.0}, rdpru {rdpru:.0}, others {other:.0}; {:.0} in all",
-        clzero + monitorx + mwaitx + rdpru + other
-    );
+    });
+    tracing::info!("AMD-only instructions emulated per second: {}", amd_rate_line(&rates));
 }
 
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
@@ -249,7 +275,9 @@ fn note_amd(kind: AmdKind) {
 /// around them works with mwaitx as a yield; `rdpru` (`0f 01 fd`) reads
 /// MPERF (`ecx` 0) or APERF (1), cycles at the nominal and the actual
 /// frequency, and gets the time-stamp counter for both: a core that never
-/// changes frequency.
+/// changes frequency. With `VICTORY_PATCH_WAITS=1`, `VICTORY_PATCH_CLZERO=1`
+/// or `VICTORY_PATCH_CLWB=1`, [`crate::cpu_patches`] rewrites a site once
+/// emulated, so it stops faulting.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
@@ -260,15 +288,31 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             return false;
         }
         let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
+        let site = context.Rip as usize;
+        let bytes = crate::cpu_patches::site_bytes(site);
+        match bytes {
             [0x0f, 0x01, 0xfc] => {
                 note_amd(AmdKind::Clzero);
-                return clzero(context);
+                let resumed = clzero(context);
+                let skipped = context.Rip - site as u64;
+                let now = crate::cpu_patches::site_bytes(site);
+                if skipped == 3 && crate::cpu_patches::rewritten_under_fault(now) {
+                    // A recognised loop rewritten while its bytes were read:
+                    // its trampoline zeroes the line again and goes on.
+                    context.Rip = site as u64;
+                } else {
+                    crate::cpu_patches::after_clzero(site, skipped);
+                }
+                return resumed;
             }
-            [0x0f, 0x01, 0xfa] => note_amd(AmdKind::Monitorx),
+            [0x0f, 0x01, 0xfa] => {
+                note_amd(AmdKind::Monitorx);
+                crate::cpu_patches::after_wait(site, bytes);
+            }
             [0x0f, 0x01, 0xfb] => {
                 note_amd(AmdKind::Mwaitx);
                 std::thread::yield_now();
+                crate::cpu_patches::after_wait(site, bytes);
             }
             [0x0f, 0x01, 0xfd] => {
                 note_amd(AmdKind::Rdpru);
@@ -279,6 +323,11 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 context.Rax = cycles & 0xffff_ffff;
                 context.Rdx = cycles >> 32;
             }
+            _ if crate::cpu_patches::rewritten_under_fault(bytes) => {
+                // Rewritten (`VICTORY_PATCH_*`) after the CPU fetched the old
+                // instruction: run the new one, from the same address.
+                return true;
+            }
             _ => {
                 // Only bytes inside the faulting instruction's page are read: the next page may
                 // not be mapped.
@@ -286,6 +335,13 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 let mut bytes = [0u8; 32];
                 let n = room.min(bytes.len());
                 std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
+                // A `clwb` rewrite (`VICTORY_PATCH_CLWB`) may land during the
+                // copy: its word is read again whole, and if the NOP is
+                // there now, the thread runs it.
+                crate::cpu_patches::reread_site_word(site, &mut bytes[..n]);
+                if crate::cpu_patches::rewritten_under_fault([bytes[0], bytes[1], bytes[2]]) {
+                    return true;
+                }
                 if let Some(pass) = clwb_loop(&bytes[..n])
                     && let Some(end) =
                         clwb_loop_end(*gpr(context, pass.base), *gpr(context, pass.limit))
@@ -296,19 +352,24 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     let flags = cmp_flags(end, limit);
                     context.EFlags = context.EFlags & !CMP_FLAGS | flags;
                     context.Rip += pass.len as u64;
-                    note_amd(AmdKind::Other);
+                    note_amd(AmdKind::ClwbLoop);
+                    if let Some(len) = clwb_len(&bytes[..n]) {
+                        crate::cpu_patches::after_clwb(site, &bytes[..len], true);
+                    }
                     return true;
                 }
                 if let Some(len) = clwb_len(&bytes[..n]) {
-                    note_amd(AmdKind::Other);
+                    note_amd(AmdKind::Clwb);
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
+                    crate::cpu_patches::after_clwb(site, &bytes[..len], false);
                     return true;
                 }
                 let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
-                note_amd(AmdKind::Other);
+                // `sse4a` accepted only a `66` (extrq) or `f2` (insertq) prefix.
+                note_amd(if bytes[0] == 0x66 { AmdKind::Extrq } else { AmdKind::Insertq });
                 context.Rip += len as u64;
                 return true;
             }
@@ -1107,6 +1168,19 @@ mod tests {
         // just the 4-byte `clwb` instruction and let the CPU run add/cmp/jbe.
         assert_eq!(run(0, u64::MAX - 10), (4, 0));
         assert_eq!(run(u64::MAX - 16, 0x100), (4, u64::MAX - 16));
+    }
+
+    #[test]
+    fn the_rate_line_names_every_kind_in_order_then_the_sum() {
+        let rates = [14180.0, 6536.0, 6535.0, 0.0, 12.0, 3.4, 1.0, 0.0];
+        assert_eq!(
+            amd_rate_line(&rates),
+            "clzero 14180, monitorx 6536, mwaitx 6535, rdpru 0, clwb 12, clwb loops 3, extrq 1, insertq 0; 27267 in all"
+        );
+        assert_eq!(AmdKind::NAMES[AmdKind::Clwb as usize], "clwb");
+        assert_eq!(AmdKind::NAMES[AmdKind::ClwbLoop as usize], "clwb loops");
+        assert_eq!(AmdKind::NAMES[AmdKind::Insertq as usize], "insertq");
+        assert_eq!(AmdKind::Insertq as usize + 1, AmdKind::COUNT);
     }
 
     #[test]

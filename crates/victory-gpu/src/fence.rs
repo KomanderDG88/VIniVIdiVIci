@@ -83,8 +83,28 @@ extern "system" fn release(this: This) -> u32 {
 pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
+/// The title's [`completed`]. A signal of the fence carried behind merged
+/// title submissions (`VICTORY_MERGE_SUBMISSIONS=2`, dangerous:
+/// `crate::merge::level`) goes to the card with them first, so that the
+/// title, asking again, sees it once they have run.
+extern "system" fn completed_asked(this: This) -> u64 {
+    #[cfg(windows)]
+    crate::host::merge_fence_asked(this as usize);
+    completed(this)
+}
+/// Where the fence's value is (address, bytes): titles read it there, and a
+/// list may wait for it as a memory value.
+#[cfg(windows)]
+pub(crate) fn value_place(this: This) -> (usize, usize) {
+    (gpu_address(this) as usize, 8)
+}
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
+    // As [`completed_asked`], for a value not reached yet.
+    #[cfg(windows)]
+    if fence.value.load(Ordering::Acquire) < value {
+        crate::host::merge_fence_asked(this as usize);
+    }
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
@@ -310,7 +330,7 @@ static FUNCTIONS: Table<24> = {
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
-    f[8] = completed as *const (); // 0x40
+    f[8] = completed_asked as *const (); // 0x40
     f[9] = set_event_on_completion as *const (); // 0x48
     f[10] = signal as *const (); // 0x50
     f[11] = creation_flags as *const (); // 0x58

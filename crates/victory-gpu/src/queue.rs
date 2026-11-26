@@ -713,9 +713,10 @@ fn send_joined(joined: &mut Joined) {
         }
         joined.parts = 0;
     }
-    // Behind what was just sent, in the order they were met.
+    // Behind what was just sent, in the order they were met (and behind
+    // title submissions held back to be merged, which go first or carry it).
     for (fence, value) in joined.signals.drain(..) {
-        if !crate::host::late_signal(fence, value) {
+        if !crate::host::merge_signal(fence, value) && !crate::host::late_signal(fence, value) {
             crate::fence::set(fence as This, value);
         }
     }
@@ -778,6 +779,9 @@ fn release_held_now(all: bool) {
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
+                        // A signal of the fence carried behind merged
+                        // submissions goes to the card with them now.
+                        crate::host::merge_fence_asked(fence);
                         break;
                     }
                     // With parts taken and not sent: only what is known
@@ -925,7 +929,7 @@ fn release_held_now(all: bool) {
                         if !joined.is_empty() {
                             // Behind parts not sent yet: with them.
                             joined.signals.push((fence, value));
-                        } else if !crate::host::late_signal(fence, value) {
+                        } else if !crate::host::merge_signal(fence, value) && !crate::host::late_signal(fence, value) {
                             crate::fence::set(fence as This, value);
                         }
                     }
@@ -952,7 +956,7 @@ fn release_held_now(all: bool) {
 /// will once those in the air have run.
 #[cfg(windows)]
 fn value_met(wait: &crate::list::ValueWait) -> bool {
-    wait.met() || (crate::host::late() && crate::host::late_met(wait))
+    wait.met() || (crate::host::late() && (crate::host::merge_wait(wait) || crate::host::late_met(wait)))
 }
 
 fn queue<'a>(this: This) -> &'a Queue {
@@ -1157,6 +1161,12 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if hold(this, || Held::Signal(fence as usize, value)) {
         return S_OK;
     }
+    // Behind the title submissions held back to be merged: they go to the
+    // card first, or carry it.
+    #[cfg(windows)]
+    if crate::host::merge_signal(fence as usize, value) {
+        return S_OK;
+    }
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
@@ -1243,6 +1253,10 @@ pub(crate) enum Written {
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// A query result the host GPU resolved into a read-back buffer
+    /// (`crate::query::resolve`, `VICTORY_OCCLUSION`): read when written,
+    /// which is once the list has run.
+    Query(u32),
 }
 
 impl Written {
@@ -1256,6 +1270,7 @@ impl Written {
                 (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
             }
             Written::SystemTimestamp => system_timestamp(),
+            Written::Query(slot) => crate::query::result(slot),
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
@@ -1376,6 +1391,10 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     crate::copystat::present_begins();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::profile::frame();
+    // Title submissions held back to be merged go to the card before
+    // anything of the present (`Host::present` sends what is held after).
+    #[cfg(windows)]
+    crate::host::merge_send(crate::merge::Why::Present);
     // With `present_behind`: the frame is shown by our thread, behind what
     // the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
@@ -1640,6 +1659,10 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
+    // The queue's submissions before it saw the mappings as they were:
+    // those held back to be merged are prepared now, before the change.
+    #[cfg(windows)]
+    crate::host::merge_send(crate::merge::Why::Mappings);
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
@@ -1651,6 +1674,8 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    // The remapping meter: what the title asks for, by kind of range.
+    crate::framelog::add(crate::framelog::T::PageMapCalls, 1);
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -1662,6 +1687,19 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
+            {
+                use crate::framelog::{T, add};
+                let counted = match r.kind {
+                    0 => Some((T::PageMapRanges0, T::PageMapPages0)),
+                    1 => Some((T::PageMapRanges1, T::PageMapPages1)),
+                    2 => Some((T::PageMapRanges2, T::PageMapPages2)),
+                    _ => None,
+                };
+                if let Some((ranges, pages)) = counted {
+                    add(ranges, 1);
+                    add(pages, u64::from(r.count));
+                }
+            }
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
                 1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),

@@ -40,6 +40,11 @@ mod float64;
 #[path = "image_buffer.rs"]
 mod image_buffer;
 
+/// Format loads that move 16-bit halves without the d16 form, a child
+/// module so it shares the emitter's state.
+#[path = "halves.rs"]
+mod halves;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -70,6 +75,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -216,6 +223,11 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel
+    /// ([`super::HostShader::half_views`]): root parameter, dword offset.
+    half_views: std::collections::BTreeSet<(u8, u32)>,
+    /// [`Self::places_read_as_halves`], found before the code is lowered.
+    halves_only: std::collections::BTreeSet<(u8, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -841,6 +853,44 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_NAN_SCRUB=1` (off by default): a NaN or an infinity in a colour a pixel program
+/// writes, or in an image store, becomes 0 ([`Lower::scrub_nan`]). Unset, the translation is
+/// as before; the switch joins the shader cache key as every `VICTORY_*` literal here does
+/// (`build.rs`, [`super::translation_fingerprint`]).
+fn nan_scrub() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NAN_SCRUB.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`nan_scrub`], for its thread only.
+    pub(super) static TEST_NAN_SCRUB: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_SHADER_EARLY_DEPTH=1` (off by default): a pixel program the console tests depth
+/// for before it runs declares ForceEarlyDepthStencil ([`early_depth`]). Unset, the
+/// translation is as before; the switch joins the shader cache key as every `VICTORY_*`
+/// literal here does (`build.rs`, [`super::translation_fingerprint`]).
+fn early_depth_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_EARLY_DEPTH.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_EARLY_DEPTH").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`early_depth_on`], for its thread only.
+    pub(super) static TEST_EARLY_DEPTH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -989,6 +1039,29 @@ fn packed_half(
     })
 }
 
+/// Whether a pixel program runs its depth and stencil tests before the
+/// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
+/// HLSL `[earlydepthstencil]`), so the host is told too (ShaderFlags
+/// ForceEarlyDepthStencil). Without it the host tests after the shader, and
+/// a program that writes unordered views writes them for pixels the depth
+/// test then rejects: the title's glass prepass wrote its depth and motion
+/// for every pixel of a window pane, the character standing in front of it
+/// too, and a later pass copied those over the character's. Not for a
+/// program that exports depth, stencil or coverage (bits 0-2 and 8, or such
+/// an output), which cannot test before it runs.
+pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    let StageIo::Ps { db_shader_control, .. } = io else {
+        return false;
+    };
+    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage,
+    // SV_StencilRef.
+    db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & EXPORTS == 0
+        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
 /// The pixel inputs packing two 16-bit rows per dword, as (first row,
 /// second row) ([`packed_layout`]).
 fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
@@ -1105,6 +1178,10 @@ impl<'a> Lower<'a> {
         // (the signatures stay whole while the program is lowered: rows of 16-bit values and
         // the like are found by the elements around them; what is left out goes at the end)
         let (drop_in, drop_out) = super::link::left_out(&x.inputs, &x.outputs);
+        // `VICTORY_SHADER_EARLY_DEPTH=1` ([`early_depth_on`], off by default).
+        if early_depth_on() && early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1384,6 +1461,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: Default::default(),
+            halves_only: Default::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -1632,6 +1711,7 @@ impl<'a> Lower<'a> {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
+        let mut near = None;
         let h = if a.param == CODE {
             None
         } else {
@@ -1641,6 +1721,13 @@ impl<'a> Lower<'a> {
                 words: [0, 0],
             };
             if let Some(bias) = self.root_bias(a.param) {
+                // `VICTORY_BVH_BOUNDS=1`: far from the root view, nothing.
+                if Self::builder_bounds_here(self.x.native) {
+                    let n = self.near_root(off);
+                    let zero = self.s.m.i32(0);
+                    off = self.s.m.select(c, n, off, zero);
+                    near = Some(n);
+                }
                 off = self.s.m.bin(c, Bin::Add, off, bias);
             }
             Some(self.handle((b, i), &src, false, (11, 0))?)
@@ -1666,6 +1753,7 @@ impl<'a> Lower<'a> {
         };
         if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
             for (k, x) in self.raw_dwords(h, off, n).into_iter().enumerate() {
+                let x = self.bounded(near, false, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -1692,9 +1780,49 @@ impl<'a> Lower<'a> {
                         .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
                 }
             };
+            let x = self.bounded(near, false, x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// `VICTORY_BVH_BOUNDS=1` and a program with a spilled user-data table
+    /// (the ray-tracing structure builder's stages): its reads through root
+    /// views stay near them ([`Lower::near_root`], [`Lower::bounded`]).
+    fn builder_bounds_here(native: &NativeProgram) -> bool {
+        super::builder_bounds() && crate::spill::is_spilled(native)
+    }
+
+    /// Whether byte `off` of a root view (from the title's address, not the
+    /// host view's start) is near the view: from 16 MiB below it to 64 MiB
+    /// above. No structure is near 64 MiB (the greatest seen has 14). One
+    /// whose memory was written over says it has gigabytes, and the
+    /// builder's copy of it went through all other structures' memory after
+    /// it and, past 2 GiB, before it. Nothing is there instead.
+    fn near_root(&mut self, off: V) -> V {
+        let c = self.cur;
+        let (below, all) = (self.s.m.i32(16 << 20), self.s.m.i32(80 << 20));
+        let at = self.s.m.bin(c, Bin::Add, off, below);
+        self.s.m.cmp(c, pred::IULT, at, all)
+    }
+
+    /// A dword read through a root view with `near` ([`Lower::near_root`]):
+    /// 0 where it was not near; with `size` (the size in a structure's
+    /// header, see `smem`) also 0 where it cannot be one (1 MiB or more).
+    /// `x` itself without `near`.
+    fn bounded(&mut self, near: Option<V>, size: bool, x: V) -> V {
+        let Some(n) = near else {
+            return x;
+        };
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let mut x = self.s.m.select(c, n, x, zero);
+        if size {
+            let most = self.s.m.i32(1 << 20);
+            let sane = self.s.m.cmp(c, pred::IULT, x, most);
+            x = self.s.m.select(c, sane, x, zero);
+        }
+        x
     }
 
     /// Finds the whole-wave sections and the values they leave.
@@ -2189,6 +2317,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        self.halves_only = self.places_read_as_halves();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -2388,6 +2517,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
@@ -2396,6 +2526,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -3747,6 +3878,26 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, tie, odd);
         let up = self.s.m.bin(c, Bin::Or, nearer, tie);
         self.s.m.select(c, up, hi, lo)
+    }
+
+    /// With `VICTORY_NAN_SCRUB=1` ([`nan_scrub`], off by default), `f`, or 0 where it is NaN
+    /// or either infinity; `f` itself otherwise. Used on the colours a pixel program writes
+    /// and on image stores: one NaN that reaches the title's bloom, blur or temporal
+    /// upscaler spreads into black patches that stay in its history (seen on NVIDIA as black
+    /// blotches on faces and in the air), and an infinity through the same passes whitens
+    /// the picture. Not what the console does, hence the switch. Three instructions per
+    /// value: an absolute value, an unordered compare and a select.
+    fn scrub_nan(&mut self, f: V) -> V {
+        if !nan_scrub() {
+            return f;
+        }
+        // |f| >= inf, unordered: true for NaN and for either infinity.
+        let c = self.cur;
+        let a = self.unary(6, f);
+        let inf = self.s.m.f32(0x7F80_0000);
+        let bad = self.s.m.cmp(c, pred::UGE, a, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
@@ -5298,6 +5449,17 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
+        // `VICTORY_BVH_FENCES=1`: the structure builder's threads take turns
+        // through atomics (a tree built from its leaves up): what one wrote
+        // before its atomic is seen by the thread that comes after it. The
+        // console's program waits for its writes there, and those waits are
+        // not in the code here (after beloooo's 72e748ea, VIctory-Belobug-AMD).
+        let ordered = (name.starts_with("buffer_atomic") || name.starts_with("global_atomic"))
+            && crate::spill::is_spilled(self.x.native)
+            && super::builder_fences();
+        if ordered {
+            self.memory_fence();
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -5343,6 +5505,9 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        if ordered && r.is_ok() {
+            self.memory_fence();
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -5497,6 +5662,13 @@ impl<'a> Lower<'a> {
         }
         self.mirror(inst);
         Ok(())
+    }
+
+    /// Writes to buffers made before are seen, by every group, before those made after
+    /// (a UAV fence, no wait for the group).
+    fn memory_fence(&mut self) {
+        let (mode, void) = (self.s.m.i32(2), self.s.t.void);
+        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
@@ -6261,8 +6433,29 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
+            // `VICTORY_BVH_BOUNDS=1`, through a root view of the structure
+            // builder: far from the view, nothing, and the size in a
+            // structure's header (its second dword), which a copy of it
+            // loops over, counts as none where it cannot be one.
+            let (mut near, mut size) = (None, false);
+            if let Source::Built { address, .. } = src
+                && address.param != CODE
+                && Self::builder_bounds_here(self.x.native)
+                && let Some(bias) = self.root_bias(address.param)
+            {
+                let c = self.cur;
+                let at = self.s.m.bin(c, Bin::Sub, addr, bias);
+                let n = self.near_root(at);
+                addr = self.s.m.select(c, n, addr, bias);
+                near = Some(n);
+                size = *offset == 4
+                    && count == 1
+                    && address.dynamic.is_none()
+                    && matches!(soffset, Operand::Scalar { code: NULL, .. });
+            }
             if Self::wide_loads() {
                 for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                    let x = self.bounded(near, size, x);
                     self.write(inst, Reg::S(code + k as u8), x, None);
                 }
                 return Ok(());
@@ -6282,6 +6475,7 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                let x = self.bounded(near, size, x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6565,6 +6759,22 @@ impl<'a> Lower<'a> {
             _ => false,
         };
         biased.then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
+    }
+
+    /// The table descriptor `src` is, as (root parameter, dword in the
+    /// table), when the code loads it from a fixed place in a table: the
+    /// load's own place, not the start of the range its used-resource
+    /// entry describes (a range of several descriptors starts before most
+    /// of them). `None` for a descriptor picked at run time, built in the
+    /// code or chosen by control flow.
+    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::Table && a.dynamic.is_none())
+            .then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -8128,33 +8338,43 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit result outside a VGPR");
         };
         let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
+        // SDWA: the word written, the other one kept (preserve), bit 15
+        // copied upward (sext: dst_unused 1 with WORD_0), or zero (pad; a sign
+        // extension above the high word or a whole dword adds nothing). The
+        // reserved dst_unused 3 is refused. (Upstream VIctory #3124: a 16-bit
+        // -1 written with sext came out as 0x0000FFFF.)
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 1) => (keep, sext) = (false, true),
+                (4, 0) | (6, 0..=2) => keep = false,
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) if keep => o,
-            _ => self.s.m.i32(0),
-        };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
-            let o = self.s.m.bin(c, Bin::And, old, low);
-            let x = self.s.m.bin(c, Bin::Shl, x, k16);
-            self.s.m.bin(c, Bin::Or, o, x)
+        let r = if sext {
+            let t = self.s.m.bin(c, Bin::Shl, x, k16);
+            self.s.m.bin(c, Bin::AShr, t, k16)
         } else {
-            let keep = self.s.m.i32(0xFFFF_0000);
-            let o = self.s.m.bin(c, Bin::And, old, keep);
-            self.s.m.bin(c, Bin::Or, o, x)
+            let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                Some(Ok(o)) if keep => o,
+                _ => self.s.m.i32(0),
+            };
+            let x = self.s.m.bin(c, Bin::And, x, low);
+            if high {
+                let o = self.s.m.bin(c, Bin::And, old, low);
+                let x = self.s.m.bin(c, Bin::Shl, x, k16);
+                self.s.m.bin(c, Bin::Or, o, x)
+            } else {
+                let keep = self.s.m.i32(0xFFFF_0000);
+                let o = self.s.m.bin(c, Bin::And, old, keep);
+                self.s.m.bin(c, Bin::Or, o, x)
+            }
         };
         self.write_placed(inst, Reg::V(reg), r, guard);
         Ok(())
@@ -9765,6 +9985,8 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // A colour a pixel program writes (`VICTORY_NAN_SCRUB`: [`Self::scrub_nan`]).
+        let colour = self.s.pixel && matches!(e.target, Target::Color(_));
         for (id, col, value, half) in stores {
             // (an output a linked pixel program does not read: neither stored nor declared)
             if !primitive && self.drop_out.get(id).copied().unwrap_or(false) {
@@ -9787,13 +10009,16 @@ impl<'a> Lower<'a> {
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let f = self.as_float(x);
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
+                }
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
-                    (".f32", f)
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
                 }
                 _ => (".i32", x),
             };
@@ -10026,7 +10251,10 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
+        // Compute programs: `VICTORY_SHADER_LOOP_LIMIT_CS` if set (`compute_loop_limit`).
+        let compute = !self.s.pixel && self.s.mesh.is_none() && self.s.threads.is_some();
+        let named = if compute { super::compute_loop_limit() } else { super::loop_limit() };
+        let limit = match named {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
@@ -10726,6 +10954,50 @@ mod tests {
             assert_ne!(features & 0x800, 0, "dmask {dmask:#x}: SFI0 {features:#x}");
         }
         assert_eq!(store(0xF) & 0x800, 0);
+    }
+
+    /// An image store of four channels (v0, the thread id, as a float, and 1.0) is
+    /// translated as before unless `VICTORY_NAN_SCRUB` is on, and with it the scrub
+    /// (absolute value, compare, select per channel) is in the program.
+    #[test]
+    fn an_image_store_is_scrubbed_of_nan_only_with_the_switch() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_0300, // v_mov_b32 v4, v0
+            0x7E0A_02F2, // v_mov_b32 v5, 1.0
+            0x7E0C_02F2, // v_mov_b32 v6, 1.0
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0xF020_0F08,
+            0x0002_0402, // image_store v[4:7], v[2:3], s[8:15] dmask:0xf dim:2D
+            S_ENDPGM,
+        ];
+        let lowered = |scrub: Option<bool>| {
+            let used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }];
+            let was = super::TEST_NAN_SCRUB.replace(scrub);
+            let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used);
+            super::TEST_NAN_SCRUB.set(was);
+            l.unwrap().dxil
+        };
+        let (off, on) = (lowered(Some(false)), lowered(Some(true)));
+        if std::env::var_os("VICTORY_NAN_SCRUB").is_none() {
+            assert_eq!(lowered(None), off, "the switch unset changed the translation");
+        }
+        assert_ne!(on, off);
+        assert!(on.len() > off.len(), "{} bytes scrubbed, {} not", on.len(), off.len());
     }
 
     #[test]

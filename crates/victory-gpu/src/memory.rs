@@ -43,6 +43,18 @@
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
+//!
+//! `VICTORY_BVH_NAMED_WRITES=1` (off by default): a stage of the structure
+//! builder declares written only the copies its own root arguments named in
+//! that call (the copy around each address and the one after it, see
+//! [`Memory::name`]), not every numbered copy; the refresh stays as it is.
+//! With the builder on, its dispatches declared up to 1,023 copies (mostly
+//! 4 MiB windows) written: 10 to 20 GB snapshotted and compared on the CPU
+//! a frame, 6 to 12 s, and no piece found changed.
+//! Risk: what a stage reaches only through pointers it reads out of memory
+//! (or a structure longer than the named address and the 4 MiB after it)
+//! stays on the card: those writes do not go back into title memory, and a
+//! later refresh of that copy may put the title's bytes back over them.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -115,28 +127,30 @@ impl Memory {
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
-    /// is the title's.
-    fn map(&mut self, address: u64) {
+    /// is the title's. The index in `copies` of the copy that holds the
+    /// page, numbered now or before; none if it has none.
+    fn map(&mut self, address: u64) -> Option<usize> {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
-            return;
+            return None;
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
-            return;
+        let have = unsafe { entry.read() };
+        if have != 0 {
+            return Some(have as usize - 1);
         }
         let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
-            return;
+            return None;
         }
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
-            return;
+            return None;
         }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
@@ -145,12 +159,12 @@ impl Memory {
             .filter(whole)
             .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
         else {
-            return;
+            return None;
         };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return;
+            return None;
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
@@ -182,7 +196,7 @@ impl Memory {
                 ONCE.call_once(|| {
                     tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
                 });
-                return;
+                return None;
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
@@ -192,6 +206,7 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        Some(n)
     }
 
     /// The pages shaders found empty since the last frame.
@@ -221,30 +236,50 @@ impl Memory {
             }
         }
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            let _ = self.map(u64::from(page) * PAGE);
         }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
-    /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+    /// after it. Their indices in `copies` go into `named`.
+    fn name(&mut self, address: u64, named: &mut Vec<usize>) {
+        named.extend(self.map(address));
+        named.extend(self.map((address & !(CELL - 1)) + CELL));
     }
+}
+
+/// Whether a dispatch whose shader can store declares copy `n` written:
+/// with `named` (`VICTORY_BVH_NAMED_WRITES=1`, a stage of the structure
+/// builder) only a copy its root arguments named in this call; otherwise
+/// every copy at the list's first such dispatch (`first_write`) and each
+/// one numbered by this call (`n >= numbered`). Pure, for testing.
+fn declared(n: usize, numbered: usize, first_write: bool, named: Option<&[usize]>) -> bool {
+    match named {
+        Some(named) => named.contains(&n),
+        None => first_write || n >= numbered,
+    }
+}
+
+/// `VICTORY_BVH_NAMED_WRITES=1`: see the module.
+pub(crate) fn named_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_NAMED_WRITES").is_some_and(|v| v == "1"))
 }
 
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
 /// has its view in `heap`'s run and is brought up to date when `list` is
-/// submitted (and, with `writes`, copied back after). None if the host
-/// cannot hold it; the draw is then dropped.
+/// submitted (and, with `writes`, copied back after; with `named_only` only
+/// the copies this call's arguments named, see [`declared`]). None if the
+/// host cannot hold it; the draw is then dropped.
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
     addresses: &[u64],
     constants: &[u32],
     writes: bool,
+    named_only: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -258,8 +293,9 @@ pub(crate) fn ready(
         m.take_faults();
     }
     let numbered = m.copies.len();
+    let mut named = Vec::new();
     for &address in addresses {
-        m.name(address);
+        m.name(address, &mut named);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -269,10 +305,10 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            m.name(u64::from(c) | u64::from(high) << 32, &mut named);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            m.name(u64::from(c) << 8, &mut named);
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -294,16 +330,23 @@ pub(crate) fn ready(
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
     // by that list's submission, which may run after this one's.
+    // With `named_only`: each named copy once per list (key `NAMED - n`),
+    // and the declaration of every copy is left to a stage without it.
     const READ: usize = usize::MAX - 0x6d;
     const WRITE: usize = usize::MAX - 0x6e;
+    const NAMED: usize = usize::MAX - 0x1000;
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
+    let first_write = writes && !named_only && list.first_use(WRITE);
+    let named = named_only.then_some(named.as_slice());
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if writes
+            && declared(n, numbered, first_write, named)
+            && (named.is_none() || list.first_use(NAMED - n))
+        {
             shadow.gpu_writes(list, start, len);
         }
     }
@@ -316,4 +359,29 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::declared;
+
+    /// The copies of 0 to 7 declared, 4 numbered before the call.
+    fn picked(first_write: bool, named: Option<&[usize]>) -> Vec<usize> {
+        (0..8).filter(|&n| declared(n, 4, first_write, named)).collect()
+    }
+
+    #[test]
+    fn every_copy_at_the_first_write_and_the_new_ones_after() {
+        assert_eq!(picked(true, None), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(picked(false, None), [4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn named_only_the_named_ones() {
+        let named = [2usize, 5, 2];
+        for first_write in [false, true] {
+            assert_eq!(picked(first_write, Some(&named[..])), [2, 5]);
+        }
+        assert!(picked(true, Some(&[][..])).is_empty());
+    }
 }

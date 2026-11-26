@@ -12,6 +12,35 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The register space the host's own amplification shader binds in (`b0`,
+/// `t0`, `u0`; `victory-gpu`'s `launch`): no translated shader binds there.
+pub const LAUNCH_SPACE: u32 = 9;
+
+/// Whether the host puts an amplification shader of its own in front of
+/// every translated mesh shader (`victory-gpu`'s `launch`: the launch of an
+/// indirect mesh record by the draw itself; `VICTORY_MESH_LAUNCH=1`, off by
+/// default). Part of the translation: with it every translated mesh shader
+/// declares a payload of [`MESH_LAUNCH_PAYLOAD_BYTES`] (see
+/// [`mesh_payload_bytes`]); the shader cache keys on the switch, as on
+/// every `VICTORY_*` switch the translator reads (`build.rs`).
+pub fn mesh_launch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_some_and(|v| v == "1"))
+}
+
+/// The payload bytes a translated mesh shader declares and never reads
+/// with [`mesh_launch`]: the host's amplification shader must pass a
+/// payload of the size the mesh shader declares (a mesh shader that
+/// declares none is refused with one: `E_INVALIDARG` on an RTX 5080, as
+/// the fork that brought this found), and a mesh shader that declares one
+/// is still taken without an amplification shader.
+pub const MESH_LAUNCH_PAYLOAD_BYTES: u32 = 4;
+
+/// The payload bytes every translated mesh shader declares: 0 (as always)
+/// unless [`mesh_launch`].
+pub fn mesh_payload_bytes() -> u32 {
+    if mesh_launch() { MESH_LAUNCH_PAYLOAD_BYTES } else { 0 }
+}
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -87,6 +116,8 @@ pub const USER_THREAD_LIMIT: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// ForceEarlyDepthStencil (`[earlydepthstencil]`; no `SFI0` bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -748,7 +779,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];

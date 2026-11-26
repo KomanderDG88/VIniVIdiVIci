@@ -272,8 +272,11 @@ pub(crate) const fn least() -> usize {
     LEAST
 }
 
-/// With the frame line: what [`copy`] did per frame over `frames`.
+/// With the frame line: what [`copy`] did per frame over `frames`. (Also
+/// the line of `crate::launch`, said from here: `host.rs`, which says the
+/// frame line, is kept under the tree's size limit for a source file.)
 pub(crate) fn line(frames: f64) {
+    crate::launch::line(frames);
     if mode() == 0 {
         return;
     }

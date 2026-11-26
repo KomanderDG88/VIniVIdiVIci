@@ -27,7 +27,9 @@
 //! unwritten since, and whose earlier writes are all in the journal has a
 //! bit ([`PUBLISHED`]): a range whose blocks all have theirs is answered
 //! from the journal alone, with no lock of the guards and no kernel call
-//! ([`light`]).
+//! ([`light`]). With `VICTORY_GUARD_RUNS=1` as well, a range of which only
+//! some blocks have theirs sends only the others to the guards
+//! ([`guard_runs`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -111,7 +113,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -182,7 +184,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if !j.kept {
         j.ahead.clear();
     }
@@ -226,7 +228,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -262,7 +264,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -273,7 +275,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if !j.kept || len == 0 {
         return;
     }
@@ -299,7 +301,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// last found `page` written (0: never) and the new one, for the copy
 /// that wrote to note itself current.
 pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     j.asked += 1;
     let now = j.asked;
@@ -322,7 +324,7 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
 /// never). Read only, for `crate::backreads`.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn stamp(page: usize) -> u64 {
-    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.get(&page).copied().unwrap_or(0)
+    journal().written.get(&page).copied().unwrap_or(0)
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -390,7 +392,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = journal();
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
@@ -412,12 +414,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_multiple_of(65_536) {
             let [bits, locked, filled] = light_asks();
+            let runs = runs_line();
             tracing::info!(
-                "refreshes of host copies go the light way (VICTORY_LIGHT_REFRESH=1): of the last 65536 askings that allowed for view memory {bits} were answered by the bits of their blocks and {locked} took the guards' lock (the others were of memory the kernel watches); {filled} holes found filled with nobody telling"
+                "refreshes of host copies go the light way (VICTORY_LIGHT_REFRESH=1): of the last 65536 askings that allowed for view memory {bits} were answered by the bits of their blocks and {locked} took the guards' lock (the others were of memory the kernel watches); {filled} holes found filled with nobody telling{runs}"
             );
         }
     }
-    writes_as(start, end, guarded, light)
+    writes_in(start, end, guarded, light, guard_runs())
 }
 
 /// [`writes`] with the light refresh as `light` says ([`light`]): 0, as
@@ -425,12 +428,20 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// leaves clean get their bits and none is asked (the phase of `alt`
 /// without); 2, a range whose blocks all have their bit is answered from
 /// the journal.
+#[cfg(test)]
 fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_in(start, end, guarded, light, false)
+}
+
+/// [`writes_as`], and with `runs` ([`guard_runs`]; only with `light` 2) a
+/// range of view memory of which only some blocks have their bit sends the
+/// guards only the blocks without.
+fn writes_in(start: usize, end: usize, guarded: bool, light: u8, runs: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    let mut held = journal();
+    let j = &mut *held;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -448,6 +459,9 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     // the answer, with the guards' lock not taken and no kernel call.
     if guarded && light == 2 && published(j, first * PAGE, last * PAGE) {
         LIGHT_ASKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if runs {
+            RUN_ASKS[1].fetch_add((last - first) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         j.asked += 1;
         return Some((
             j.asked,
@@ -491,6 +505,9 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     if failed && !known_view && guarded {
         failed_asking(first * PAGE, last * PAGE);
     }
+    // With [`guard_outside`]: the guards' blocks to make read-only, once
+    // the journal is let go.
+    let mut arming = Arming(Vec::new());
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -498,10 +515,31 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
         }
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
+        // `VICTORY_GUARD_RUNS=1` ([`guard_runs`]): the blocks with their bit
+        // are answered as a range all of whose blocks have theirs is, from
+        // the journal (the bits read under its lock, held until the answer
+        // is read from it, as [`published`] wants); only the runs of blocks
+        // without go to the guards, under one lock of theirs. What they find
+        // is noted under this one asking, as for the whole range.
+        let written = if runs && light == 2 {
+            let split = published_runs(j, first * PAGE, last * PAGE);
+            let ask: Vec<(usize, usize)> = split.iter().filter(|r| !r.2).map(|r| (r.0, r.1)).collect();
+            let sent: usize = ask.iter().map(|r| r.1 - r.0).sum();
+            let blocks: usize = split.iter().map(|r| r.1 - r.0).sum();
+            if sent < blocks && sent > 0 {
+                RUN_ASKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            RUN_ASKS[1].fetch_add((blocks - sent) as u64, std::sync::atomic::Ordering::Relaxed);
+            RUN_ASKS[2].fetch_add(sent as u64, std::sync::atomic::Ordering::Relaxed);
+            guard_in(first * PAGE, last * PAGE, &ask, guard_outside())
+        } else {
+            guard_later(first * PAGE, last * PAGE, guard_outside())
+        };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-        written?
+        let (written, later) = written?;
+        arming = later;
+        written
     } else {
         Vec::new()
     };
@@ -534,13 +572,17 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
         LIGHT_ASKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         publish(j, &pages, first * PAGE, last * PAGE, told());
     }
-    Some((
+    let answer = (
         now,
         j.written
             .range(first..last)
             .map(|(&p, &w)| (p, w))
             .collect(),
-    ))
+    );
+    drop(held);
+    // Read-only before the caller reads the blocks.
+    arming.finish(failed && light != 0);
+    Some(answer)
 }
 
 /// Diagnostics: one in 2,048 of the askings the kernel's write watch
@@ -666,6 +708,12 @@ struct Guards {
     /// others are answered from their notes, which then grow old
     /// ([`note_life`]).
     holes: BTreeSet<usize>,
+    /// Blocks noted read-only and clean whose protection an asking is
+    /// changing outside the lock ([`Arming`]).
+    arming: BTreeSet<usize>,
+    /// Of those, the ones an opening met meanwhile: made writable again
+    /// when the asking is done.
+    disturbed: BTreeSet<usize>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -717,10 +765,53 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     viewed: BTreeSet::new(),
     verified: BTreeMap::new(),
     holes: BTreeSet::new(),
+    arming: BTreeSet::new(),
+    disturbed: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    waited(&GUARDS, 0)
+}
+
+fn journal() -> std::sync::MutexGuard<'static, Journal> {
+    waited(&JOURNAL, 1)
+}
+
+/// Since the start: the times the guards' lock (0) and the journal's (1)
+/// were found taken, and the microseconds waited for them; a lock found
+/// free costs nothing more than before.
+pub(crate) static WAITS: [[std::sync::atomic::AtomicU64; 2]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 2];
+
+thread_local! {
+    /// [`WAITS`]' microseconds of this thread alone (guards', journal's).
+    static WAITED: [std::cell::Cell<u64>; 2] = const { [std::cell::Cell::new(0), std::cell::Cell::new(0)] };
+}
+
+/// The microseconds this thread has waited for the guards' lock and for
+/// the journal's since it began ([`WAITS`]).
+#[cfg(test)]
+pub(crate) fn waited_here() -> [u64; 2] {
+    WAITED.with(|w| [w[0].get(), w[1].get()])
+}
+
+/// Takes `lock`, timing the wait if it is taken ([`WAITS`]`[which]`). The
+/// fault handler comes here too: no allocation, a clock read only when
+/// it waits.
+fn waited<T>(lock: &'static Mutex<T>, which: usize) -> std::sync::MutexGuard<'static, T> {
+    match lock.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let us = started.elapsed().as_micros() as u64;
+            WAITS[which][0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WAITS[which][1].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+            WAITED.with(|w| w[which].set(w[which].get() + us));
+            held
+        }
+    }
 }
 
 /// Whether the block `page` is read-only by our hand and unwritten since a
@@ -778,8 +869,9 @@ pub(crate) fn light() -> bool {
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
                 let [bits, locked, filled] = light_asks();
+                let runs = runs_line();
                 tracing::info!(
-                    "refreshes of host copies go the light way from now (VICTORY_LIGHT_REFRESH=alt): {}; since the change before: {bits} askings of view memory answered by the bits of their blocks, {locked} that took the guards' lock, {filled} holes found filled with nobody telling",
+                    "refreshes of host copies go the light way from now (VICTORY_LIGHT_REFRESH=alt): {}; since the change before: {bits} askings of view memory answered by the bits of their blocks, {locked} that took the guards' lock, {filled} holes found filled with nobody telling{runs}",
                     if on { "ON" } else { "off, as usual (the bits are kept)" }
                 );
             }
@@ -797,6 +889,56 @@ static LIGHT_ASKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomi
 /// [`LIGHT_ASKS`], taken.
 fn light_asks() -> [u64; 3] {
     [0, 1, 2].map(|i| LIGHT_ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Whether an asking of view memory of which only some blocks have their
+/// bit ([`PUBLISHED`]) sends only the runs of blocks without to the guards
+/// (`VICTORY_GUARD_RUNS=1`; off by default).
+///
+/// With the light refresh alone such a range goes whole to the guards: a
+/// big range asked at every flush of a submission (the title's 174 MB
+/// heap) has some block written nearly always, and the guards walk all its
+/// blocks for the few without their bit, under the lock the title's write
+/// faults wait for. With the switch the blocks with their bit are answered
+/// from the journal as a range all of whose blocks have theirs is
+/// ([`writes`]), and the guards walk only the others ([`guard_in`]).
+///
+/// Only with the light refresh asking its bits ([`light`]): without
+/// `VICTORY_LIGHT_REFRESH` no bit is kept and this switch does nothing (it
+/// keeps none itself: a bit is trusted only where the light refresh has
+/// kept the bits from the start), and with `alt` it splits in the phase
+/// that asks them.
+///
+/// What changes in the answers: nothing. A block with its bit is one the
+/// guards would find clean (or a hole noted for good), as for a whole
+/// range ([`PUBLISHED`]); a write that takes a bit after it was read is
+/// reported by the next asking, as a write just after an asking is.
+fn guard_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_RUNS").is_some_and(|v| v == "1"))
+}
+
+/// Since they were last taken ([`run_asks`]), with [`guard_runs`]: askings
+/// split between the bits and the guards, blocks of view memory answered
+/// by their bits (in split askings and in those wholly known by them), and
+/// blocks sent to the guards by askings that could have split.
+static RUN_ASKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`RUN_ASKS`], taken.
+fn run_asks() -> [u64; 3] {
+    [0, 1, 2].map(|i| RUN_ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The end of the light refresh's log lines with [`guard_runs`] (nothing
+/// without: the lines stay as they were).
+fn runs_line() -> String {
+    if !guard_runs() {
+        return String::new();
+    }
+    let [split, by_bits, to_guards] = run_asks();
+    format!(
+        "; VICTORY_GUARD_RUNS=1: {split} askings split between the bits and the guards, {by_bits} blocks answered by their bits, {to_guards} sent to the guards"
+    )
 }
 
 /// The words of a piece of [`Bits`]: the bits of 4 GiB.
@@ -850,6 +992,12 @@ impl Bits {
         if let Some(piece) = self.piece(word) {
             piece[word % BITS_WORDS].fetch_and(!(1u64 << (block % 64)), std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// The bits of the blocks `64 * word..64 * word + 64`, the lowest the
+    /// first (0 where none was ever set).
+    fn word(&self, word: usize) -> u64 {
+        self.piece(word).map_or(0, |piece| piece[word % BITS_WORDS].load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Whether the bits of all of `[first, last)` are set (not so of none).
@@ -920,7 +1068,7 @@ fn publish(_noted: &Journal, written: &[usize], start: usize, end: usize, holes:
         let block = page * PAGE / BLOCK;
         // (Not one that a write has opened since the guards were asked,
         // nor one that could not be made read-only.)
-        if g.clean.contains(&block) {
+        if g.clean.contains(&block) && !g.arming.contains(&block) {
             PUBLISHED.set(block);
         }
     }
@@ -957,6 +1105,38 @@ fn publish(_noted: &Journal, written: &[usize], start: usize, end: usize, holes:
 /// has read the journal (no bit is set meanwhile: [`publish`]).
 fn published(_held: &Journal, start: usize, end: usize) -> bool {
     PUBLISHED.all(start / BLOCK, end.div_ceil(BLOCK))
+}
+
+/// The blocks of `[start, end)` in runs alike in their bit ([`PUBLISHED`]):
+/// `(first block, end block, has its bit)`, in order. The blocks are those
+/// [`published`] looks at (a block the range holds in part is one of them,
+/// judged by its own bit, which stands for the whole block): it says yes
+/// exactly when this gives one run, with the bit. `_held`: the journal's
+/// lock, as for [`published`].
+fn published_runs(_held: &Journal, start: usize, end: usize) -> Vec<(usize, usize, bool)> {
+    bit_runs(start, end, |word| PUBLISHED.word(word))
+}
+
+/// [`published_runs`] with the bits read off `word` (the bits of blocks
+/// `64 * w..64 * w + 64` for word `w`, the lowest bit the first block): one
+/// look per word, not per block (the title's heap is 2,700 blocks).
+fn bit_runs(start: usize, end: usize, word: impl Fn(usize) -> u64) -> Vec<(usize, usize, bool)> {
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+    let mut block = first;
+    while block < last {
+        // The block's bit at the bottom; zeros come in at the top.
+        let bits = word(block / 64) >> (block % 64);
+        let has = bits & 1 != 0;
+        let alike = (if has { !bits } else { bits }).trailing_zeros() as usize;
+        let len = alike.min(64 - block % 64).min(last - block);
+        match runs.last_mut() {
+            Some((_, to, with)) if *with == has && *to == block => *to = block + len,
+            _ => runs.push((block, block + len, has)),
+        }
+        block += len;
+    }
+    runs
 }
 
 /// Whether a block noted uncommitted stays noted until the runtime tells
@@ -1140,7 +1320,7 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     if taken.contains(&0) {
         return false;
     }
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = journal();
     // The bits first, then the journal, both under its lock ([`published`]).
     let by_bits = !j.ahead.iter().any(|&(a, b)| a <= first && last <= b);
     if by_bits && !published(&j, first * PAGE, last * PAGE) {
@@ -1184,7 +1364,7 @@ pub(crate) fn unchanged_known(start: usize, end: usize, base: usize, copied: &[u
         return false;
     }
     let ahead = {
-        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = journal();
         if !j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first]) {
             return false;
         }
@@ -1289,9 +1469,36 @@ fn guard_ms() -> u64 {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_later(start, end, false).map(|(written, arming)| {
+        arming.finish(false);
+        written
+    })
+}
+
+/// [`guard`], with `later` ([`guard_outside`]): the blocks to make
+/// read-only again are noted so under the lock and made so by
+/// [`Arming::finish`], which the caller calls once it has let go of the
+/// journal, and before it reads them.
+fn guard_later(start: usize, end: usize, later: bool) -> Option<(Vec<usize>, Arming)> {
+    guard_in(start, end, &[(start / BLOCK, end.div_ceil(BLOCK))], later)
+}
+
+/// [`guard_later`] of `[start, end)` that walks only the block runs `runs`
+/// (`(first block, end block)`, in order, inside the range's blocks): the
+/// others are known clean ([`guard_runs`]). Whether the range is view
+/// memory is decided for the whole range, as by [`guard`].
+fn guard_in(start: usize, end: usize, runs: &[(usize, usize)], later: bool) -> Option<(Vec<usize>, Arming)> {
     let keep = if absent_once() { absent_keep_ms() } else { 0 };
-    let written = guard_at(start, end, if keep != 0 { guard_ms() } else { 0 }, keep);
+    let written = guard_runs_at(
+        start,
+        end,
+        runs,
+        if keep != 0 { guard_ms() } else { 0 },
+        keep,
+        later,
+    );
     // Always on: the counts every 65,536 askings (in turn they are said
     // at each change).
     if absent_mode() == 1 {
@@ -1310,7 +1517,36 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// [`guard`] at the moment `now` ([`guard_ms`]). `keep`: for how many
 /// milliseconds a block Windows said is uncommitted is not asked about
 /// again ([`absent_once`]); 0: it is asked about at every asking.
+#[cfg(test)]
 fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>> {
+    guard_at_later(start, end, now, keep, false).map(|(written, arming)| {
+        arming.finish(false);
+        written
+    })
+}
+
+/// [`guard_at`], with `later` as [`guard_later`] has it.
+#[cfg(test)]
+fn guard_at_later(
+    start: usize,
+    end: usize,
+    now: u64,
+    keep: u64,
+    later: bool,
+) -> Option<(Vec<usize>, Arming)> {
+    guard_runs_at(start, end, &[(start / BLOCK, end.div_ceil(BLOCK))], now, keep, later)
+}
+
+/// [`guard_at_later`] that walks only the block runs `runs` of the range
+/// ([`guard_in`]).
+fn guard_runs_at(
+    start: usize,
+    end: usize,
+    runs: &[(usize, usize)],
+    now: u64,
+    keep: u64,
+    later: bool,
+) -> Option<(Vec<usize>, Arming)> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -1328,10 +1564,40 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
         return None;
     }
     install();
-    let mut g = guards();
-    let mut written = Vec::new();
-    let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let mut g = guards();
+    // Blocks of the range another asking is making read-only outside the
+    // lock ([`Arming`]): noted clean, and perhaps writable still. Read now
+    // and taken for unwritten, a write that lands before their guard
+    // stands would be in nobody's copy; so the asking waits for that one.
+    while g.arming.range(first..last).next().is_some() {
+        g = ARMED.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    let _held = Held::new();
+    let mut arming = Arming(Vec::new());
+    let mut written = Vec::new();
+    for &(first, last) in runs {
+        guard_run(&mut g, first, last, now, keep, later, &mut written, &mut arming);
+    }
+    Some((written, arming))
+}
+
+/// The walk of [`guard_runs_at`] over blocks `[first, last)`, under the
+/// guards' lock (`g`): the pages of the blocks found written go on
+/// `written`; with `later`, the blocks to make read-only go on `arming`
+/// ([`guard_outside`]).
+#[allow(clippy::too_many_arguments)]
+fn guard_run(
+    g: &mut Guards,
+    first: usize,
+    last: usize,
+    now: u64,
+    keep: u64,
+    later: bool,
+    written: &mut Vec<usize>,
+    arming: &mut Arming,
+) {
+    let mut run: Option<usize> = None;
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
@@ -1340,7 +1606,7 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
+        return;
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
@@ -1356,7 +1622,7 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             // and that takes the block out of `absent` and its note away.
             // (With the light refresh, kept for good only in a placeholder
             // reservation: [`note_life`].)
-            let life = note_life(&g, block, keep);
+            let life = note_life(g, block, keep);
             let noted = life != 0 && g.verified.get(&block).is_some_and(|&at| now < at.saturating_add(life));
             if noted {
                 ABSENT_LOOKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1372,7 +1638,7 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
                 if open {
                     g.absent.remove(&block);
                     g.verified.remove(&block);
-                    forget_hole(&mut g, block);
+                    forget_hole(g, block);
                 } else if keep != 0 {
                     g.verified.insert(block, now);
                 }
@@ -1389,10 +1655,236 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             }
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, block);
+            // Later, outside the lock, where no other view of the pages is
+            // known (those are guarded together, under it).
+            if later
+                && (!view_guard()
+                    || crate::inplace::views_between(from * BLOCK, block * BLOCK).is_empty())
+            {
+                g.protected.extend(from..block);
+                g.clean.extend(from..block);
+                if view_known() {
+                    g.viewed.extend(from..block);
+                }
+                g.arming.extend(from..block);
+                arming.0.push((from, block));
+            } else {
+                protect(g, from, block);
+            }
         }
     }
-    Some(written)
+}
+
+/// Tests: [`guard_outside`] as the environment says (0), off (1), on (2).
+#[cfg(test)]
+pub(crate) static GUARD_OUTSIDE_TEST: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Signalled, under the guards' lock, when an asking's blocks are made
+/// read-only ([`Arming::finish`]).
+static ARMED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Runs of blocks `[from, to)` an asking noted read-only and clean, and
+/// in `Guards::arming`, whose protection it has yet to change
+/// ([`guard_outside`]).
+///
+/// Why the answers stay what they were. Until `finish` has made a block
+/// read-only, a write to it lands with no fault: the asking's own copy,
+/// which reads after `finish`, holds it; no other asking reads the block
+/// meanwhile (they wait, [`guard_at_later`]), and no bit of the light
+/// refresh is set for it before `finish` ([`publish`]). Whatever opens
+/// the block meanwhile ([`open_here`], [`title_memory_remapped`]) notes
+/// it in `Guards::disturbed` and makes it writable as before; `finish`
+/// makes it writable again after its own change, and a write that faults
+/// on it in between is let through by the handler like any other opening.
+#[must_use]
+struct Arming(Vec<(usize, usize)>);
+
+impl Arming {
+    /// Makes the blocks read-only and takes them out of `arming`. With
+    /// `bits` (the light refresh's bits kept), the blocks that are clean
+    /// afterwards get their bit ([`PUBLISHED`]), under the journal's lock
+    /// as [`publish`] sets them. Called with neither lock held.
+    fn finish(mut self, bits: bool) {
+        Self::arm(std::mem::take(&mut self.0), bits);
+    }
+
+    /// [`Arming::finish`] of `runs`.
+    fn arm(runs: Vec<(usize, usize)>, bits: bool) {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+        if runs.is_empty() {
+            return;
+        }
+        let set = |from: usize, to: usize| {
+            let mut old = 0;
+            let started = std::time::Instant::now();
+            // SAFETY: title view memory; only its protection changes.
+            let set = unsafe {
+                VirtualProtect(
+                    (from * BLOCK) as *const _,
+                    (to - from) * BLOCK,
+                    PAGE_READONLY,
+                    &mut old,
+                ) != 0
+            };
+            GUARD_WORK[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            GUARD_WORK[3].fetch_add(
+                started.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            set
+        };
+        let mut failed = Vec::new();
+        for &(from, to) in &runs {
+            if set(from, to) {
+                continue;
+            }
+            // Across views: a block at a time, as `protect_here`.
+            for block in from..to {
+                if !set(block, block + 1) {
+                    failed.push(block);
+                }
+            }
+        }
+        let mut held = guards();
+        let g = &mut *held;
+        for &block in &failed {
+            // Not read-only: written at every asking, as before. One the
+            // runtime has not committed is noted absent.
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+            if !g.disturbed.contains(&block) && block < uncommitted_end(block) {
+                g.absent.insert(block);
+            }
+        }
+        for &(from, to) in &runs {
+            for block in from..to {
+                g.arming.remove(&block);
+                if g.disturbed.remove(&block) {
+                    let mut old = 0;
+                    // SAFETY: a block of ours that was opened while it was
+                    // being made read-only: writable, as the opening left it.
+                    unsafe {
+                        VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
+                    };
+                }
+            }
+        }
+        drop(held);
+        ARMED.notify_all();
+        if !bits {
+            return;
+        }
+        // The bits, as [`publish`] sets them: the journal's lock first (an
+        // asking waiting for these blocks holds it, so not before they
+        // are out of `arming`), then the guards'.
+        let j = journal();
+        let g = guards();
+        for &(from, to) in &runs {
+            for block in from..to {
+                if g.clean.contains(&block) && !g.arming.contains(&block) {
+                    PUBLISHED.set(block);
+                }
+            }
+        }
+        drop(g);
+        drop(j);
+    }
+}
+
+impl Drop for Arming {
+    /// Not finished (a panic on the way): made read-only all the same, or
+    /// every later asking of the blocks would wait for good.
+    fn drop(&mut self) {
+        Self::arm(std::mem::take(&mut self.0), false);
+    }
+}
+
+/// Whether an asking of view memory makes the blocks it found written
+/// read-only again outside the guards' lock and the journal's
+/// (`VICTORY_GUARD_OUTSIDE=1`; off by default: under both, as before).
+/// `alt`: twenty seconds with, twenty without, in turn, each change said
+/// in the log with the guards' counts since the start.
+///
+/// Why (fork issue #1083): the protection changes are most of the time an
+/// asking holds the guards' lock, and the title's threads wait for that
+/// lock at every write fault; while they are made the journal is held as
+/// well, so refreshes spread over several threads (`VICTORY_WIDE_REFRESH`)
+/// take turns at them, though Windows makes them side by side. Measured in
+/// `crate::shadow::guard_bench`. What changes in the answers: nothing
+/// ([`Arming`]).
+fn guard_outside() -> bool {
+    #[cfg(test)]
+    match GUARD_OUTSIDE_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_GUARD_OUTSIDE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs()
+                / 20)
+                % 2
+                == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                use std::sync::atomic::Ordering::Relaxed;
+                let [askings, held, calls, us] = GUARD_WORK.each_ref().map(|c| c.load(Relaxed));
+                tracing::info!(
+                    "blocks are made read-only again outside the guards' lock from now (VICTORY_GUARD_OUTSIDE=alt): {}; since the start: {askings} askings held the guards' lock {} ms, {calls} protection changes took {} ms, the guards' lock was waited for {} times ({} ms), the journal's {} times ({} ms)",
+                    if on {
+                        "ON"
+                    } else {
+                        "off, under the lock as usual"
+                    },
+                    held / 1000,
+                    us / 1000,
+                    WAITS[0][0].load(Relaxed),
+                    WAITS[0][1].load(Relaxed) / 1000,
+                    WAITS[1][0].load(Relaxed),
+                    WAITS[1][1].load(Relaxed) / 1000,
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the start: askings of the guards that took their lock to walk a
+/// range ([`guard_at`]), the microseconds they held it, the calls that
+/// made blocks read-only again ([`protect_here`]) and their microseconds.
+pub(crate) static GUARD_WORK: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Counts a hold of the guards' lock in [`GUARD_WORK`] when dropped.
+struct Held(std::time::Instant);
+
+impl Held {
+    fn new() -> Held {
+        Held(std::time::Instant::now())
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        GUARD_WORK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GUARD_WORK[1].fetch_add(
+            self.0.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -1518,15 +2010,22 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
+        let started = std::time::Instant::now();
         // SAFETY: title view memory; only its protection changes.
-        unsafe {
+        let set = unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
                 &mut old,
             ) != 0
-        }
+        };
+        GUARD_WORK[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GUARD_WORK[3].fetch_add(
+            started.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        set
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
@@ -1616,11 +2115,20 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let range = start / BLOCK..end.div_ceil(BLOCK);
+    let mut blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
+    if g.arming.range(range.clone()).next().is_some() {
+        // Being made read-only by an asking outside the lock ([`Arming`]):
+        // opened as any guarded block (it may be read-only already, or
+        // become so), and made writable again when the asking is done.
+        let arming: Vec<usize> = g.arming.range(range).copied().collect();
+        for &block in &arming {
+            g.disturbed.insert(block);
+        }
+        blocks.extend(arming);
+        blocks.sort_unstable();
+        blocks.dedup();
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
@@ -1946,6 +2454,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.verified.remove(&block);
         forget_hole(&mut g, block);
     }
+    let arming: Vec<usize> = g.arming.range(range.clone()).copied().collect();
+    // Being made read-only outside the lock ([`Arming`]): writable again
+    // when that is done.
+    g.disturbed.extend(arming);
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
@@ -2036,7 +2548,7 @@ fn writable(at: usize) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -2634,8 +3146,9 @@ mod tests {
 
     /// The tests of the light refresh take turns: they read its counts,
     /// which no other test moves (the switch is not set in tests, so
-    /// [`writes`] itself keeps no bits and asks none).
-    fn light_turn() -> std::sync::MutexGuard<'static, ()> {
+    /// [`writes`] itself keeps no bits and asks none; a test run with it
+    /// set takes its turn too, `crate::shadow::guard_bench`).
+    pub(crate) fn light_turn() -> std::sync::MutexGuard<'static, ()> {
         static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
         TURN.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -2647,7 +3160,7 @@ mod tests {
 
     /// Whether `[start, end)` is known by its bits.
     fn known(start: usize, end: usize) -> bool {
-        published(&JOURNAL.lock().unwrap_or_else(|e| e.into_inner()), start, end)
+        published(&journal(), start, end)
     }
 
     /// The pages of an answer of [`writes`] written after the asking `since`.
@@ -2756,6 +3269,108 @@ mod tests {
         drop_views(section, &[one, two], SIZE);
     }
 
+    /// The runs of a range's blocks alike in their bit ([`bit_runs`]): in
+    /// order, joined across words, cut at the range's ends. A block the
+    /// range holds in part is one of its blocks, judged by its own bit, as
+    /// [`published`] judges it.
+    #[test]
+    fn a_range_splits_into_runs_of_blocks_with_and_without_their_bit() {
+        // Blocks 0-63 are word 0, 64-127 word 1, and so on.
+        let set = [2usize, 3, 4, 63, 64, 65];
+        let word = |w: usize| set.iter().filter(|&&b| b / 64 == w).fold(0u64, |m, &b| m | (1u64 << (b % 64)));
+        let at = |block: usize| block * BLOCK;
+        assert_eq!(bit_runs(at(0), at(8), word), [(0, 2, false), (2, 5, true), (5, 8, false)]);
+        assert_eq!(bit_runs(at(60), at(70), word), [(60, 63, false), (63, 66, true), (66, 70, false)], "across words");
+        assert_eq!(bit_runs(at(2) + 8, at(4) + 8, word), [(2, 5, true)], "blocks held in part, with their bits");
+        assert_eq!(bit_runs(at(1) + 8, at(2) + 8, word), [(1, 2, false), (2, 3, true)], "held in part, without, then with");
+        assert_eq!(bit_runs(at(3), at(3) + 1, word), [(3, 4, true)]);
+        assert_eq!(bit_runs(at(5), at(6), word), [(5, 6, false)]);
+        assert!(bit_runs(at(5), at(5), word).is_empty());
+        assert_eq!(bit_runs(at(200), at(400), word), [(200, 400, false)], "words with no bit");
+        assert_eq!(bit_runs(at(10), at(300), |_| u64::MAX), [(10, 300, true)], "all, over many words");
+        assert_eq!(
+            bit_runs(at(126), at(131), |_| 0x5555_5555_5555_5555),
+            [(126, 127, true), (127, 128, false), (128, 129, true), (129, 130, false), (130, 131, true)]
+        );
+    }
+
+    /// [`bit_runs`] over real bits ([`Bits::word`]) tiles every range with
+    /// runs that alternate, each block in the run its own bit says, and
+    /// gives one run with the bit exactly when [`Bits::all`] says yes.
+    #[test]
+    fn the_runs_of_a_range_agree_with_its_bits() {
+        static BITS: Bits = Bits::new();
+        // Far from any block a test guards (64 TiB up).
+        let base = 1usize << 30;
+        for block in [0, 1, 2, 5, 63, 64, 65, 127, 128, 130] {
+            BITS.set(base + block);
+        }
+        for from in 0..140 {
+            for to in from..140 {
+                let runs = bit_runs((base + from) * BLOCK, (base + to) * BLOCK, |w| BITS.word(w));
+                assert_eq!(runs.len() == 1 && runs[0].2, BITS.all(base + from, base + to), "{from}..{to}");
+                let mut at = base + from;
+                for (k, &(a, b, has)) in runs.iter().enumerate() {
+                    assert!(a == at && a < b, "{from}..{to}: {runs:?}");
+                    assert!(k == 0 || runs[k - 1].2 != has, "{from}..{to}: alike runs are one: {runs:?}");
+                    assert!((a..b).all(|block| BITS.all(block, block + 1) == has), "{from}..{to}: {runs:?}");
+                    at = b;
+                }
+                assert_eq!(at, base + to);
+            }
+        }
+    }
+
+    /// `VICTORY_GUARD_RUNS`: a range of which some blocks have their bit
+    /// sends only the others to the guards, in one asking that takes their
+    /// lock once, and the answer is the one the whole range would have had:
+    /// the written blocks under this asking, the others as the journal had
+    /// them.
+    #[test]
+    fn a_range_split_by_its_bits_reports_what_the_whole_range_would() {
+        let _turn = light_turn();
+        const SIZE: usize = 4 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let pages = |block: usize| (one + block * BLOCK) / PAGE;
+        let b0 = one / BLOCK;
+        let runs = || RUN_ASKS.each_ref().map(|n| n.load(std::sync::atomic::Ordering::Relaxed));
+        // No bit yet: the whole range goes to the guards, as without.
+        let before = runs();
+        let (first, all) = writes_in(one, one + SIZE, true, 2, true).expect("a view");
+        assert_eq!(all, [(pages(0), first), (pages(1), first), (pages(2), first), (pages(3), first)]);
+        assert_eq!(runs(), [before[0], before[1], before[2] + 4], "not split: four blocks to the guards");
+        assert!(known(one, one + SIZE));
+        // Blocks 1 and 3 written, through either view: they lose their bits.
+        // SAFETY: the first view, read-write once the handler has opened it.
+        unsafe { ((one + BLOCK + 8) as *mut u8).write_volatile(1) };
+        // SAFETY: the second view, as above.
+        unsafe { ((two + 3 * BLOCK + 8) as *mut u8).write_volatile(1) };
+        assert_eq!(
+            published_runs(&JOURNAL.lock().unwrap_or_else(|e| e.into_inner()), one, one + SIZE),
+            [(b0, b0 + 1, true), (b0 + 1, b0 + 2, false), (b0 + 2, b0 + 3, true), (b0 + 3, b0 + 4, false)]
+        );
+        let (before, counted) = (light_counts(), runs());
+        let (second, written) = writes_in(one, one + SIZE, true, 2, true).expect("a view");
+        assert!(second > first);
+        assert_eq!(written, [(pages(0), first), (pages(1), second), (pages(2), first), (pages(3), second)]);
+        assert_eq!(light_counts(), [before[0], before[1] + 1], "one asking, the guards asked once");
+        assert_eq!(runs(), [counted[0] + 1, counted[1] + 2, counted[2] + 2], "split: two blocks each way");
+        assert!(known(one, one + SIZE), "guarded again and noted");
+        // Known whole by its bits now.
+        let before = light_counts();
+        let (third, written) = writes_in(one, one + SIZE, true, 2, true).expect("a view");
+        assert!(since(second, written).is_empty());
+        assert_eq!(light_counts(), [before[0] + 1, before[1]]);
+        // The range's first block written (told of, `writing`): the run
+        // without its bit starts the range, which is still taken for a view.
+        writing(one + 8, 8);
+        let (fourth, written) = writes_in(one, one + SIZE, true, 2, true).expect("a view");
+        assert!(fourth > third);
+        assert_eq!(since(third, written), [pages(0)]);
+        assert!(known(one, one + SIZE));
+        drop_views(section, &[one, two], SIZE);
+    }
+
     /// A range with unmapped blocks is not known by its bits while its
     /// holes are asked about at every asking. Noted for good, a hole that
     /// lies in a placeholder is; then nothing is asked until the runtime
@@ -2838,7 +3453,7 @@ mod tests {
         // Noted for good, as with `VICTORY_ABSENT_MS=told`, and looked at
         // as the asking after the notes does.
         assert_eq!(guard_at(from, to, 1, u64::MAX), Some(Vec::new()));
-        publish(&JOURNAL.lock().unwrap_or_else(|e| e.into_inner()), &[], from, to, true);
+        publish(&journal(), &[], from, to, true);
         assert!(known(from, to), "holes in a placeholder, noted for good");
         let before = light_counts();
         let (three, written) = writes_as(from, to, true, 2).expect("a view");
@@ -2876,7 +3491,7 @@ mod tests {
         assert!(!placeholder(plain / BLOCK));
         assert_eq!(guard_at(plain, plain + BLOCK, 1, u64::MAX), Some(vec![plain / PAGE]));
         assert_eq!(guard_at(plain, plain + BLOCK, 2, u64::MAX), Some(Vec::new()), "noted");
-        publish(&JOURNAL.lock().unwrap_or_else(|e| e.into_inner()), &[], plain, plain + BLOCK, true);
+        publish(&journal(), &[], plain, plain + BLOCK, true);
         assert!(!known(plain, plain + BLOCK));
         // Nor does its note live for good: committed with no word, it is
         // found when the note is old.

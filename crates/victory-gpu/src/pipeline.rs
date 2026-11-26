@@ -382,12 +382,19 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// programs that shade those rays' hits (`CS_RaytracingResolve`).
 ///
 /// With the switch such a dispatch is dropped until the builder has run
-/// whole. What the passes would have written stays as the title left it
+/// whole (`alt`: only in an ON turn, [`crate::AltTurn`]: twenty seconds
+/// without, twenty with, in turn, each change said in the log). What the passes would have written stays as the title left it
 /// (their targets are not cleared by us): the picture has to be looked at.
 #[cfg(windows)]
 pub(crate) fn walk_held(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_BVH_HOLD").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    });
+    if this.is_null() || mode == 0 {
         return false;
     }
     let p = pipeline(this);
@@ -397,6 +404,16 @@ pub(crate) fn walk_held(this: This) -> bool {
     // (Asked only for the few programs that walk: the lock is the builder's.)
     if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
         return false;
+    }
+    if mode == 2 {
+        static TURN: crate::AltTurn = crate::AltTurn::new();
+        if !TURN.on(
+            "dispatches of programs that walk ray-tracing structures nothing has built are held back",
+            "VICTORY_BVH_HOLD",
+            "off, run as usual",
+        ) {
+            return false;
+        }
     }
     if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -408,6 +425,103 @@ pub(crate) fn walk_held(this: This) -> bool {
         });
     }
     true
+}
+
+/// Whether a compute container is one of the title's `bvh_skinning`
+/// programs, by the name it carries: they pose every animated mesh (and
+/// its motion) once more, only for the ray-tracing structures, which the
+/// structure builder makes from what they write.
+#[cfg(windows)]
+fn skins_for_rays(bytes: &[u8]) -> bool {
+    const NAME: &[u8] = b"bvh_skinningCS";
+    bytes.windows(NAME.len()).any(|w| w == NAME)
+}
+
+/// `VICTORY_RT_SKIN_SKIP=1` (off by default): dispatches of the title's
+/// `bvh_skinning` programs ([`skins_for_rays`]) are left out, direct and
+/// indirect. Only while the structure builder is off (without
+/// `VICTORY_BVH_BUILDER=1`): then nothing reads what they write. Meant
+/// with `VICTORY_BVH_NO_HIT=1` or `VICTORY_BVH_HOLD=1`, under which no
+/// ray reads the structures either. Read once, when pipelines are made:
+/// off, no container is looked at. `alt`: the pipelines are marked as
+/// with `1`, and a dispatch is left out only in an ON turn
+/// ([`crate::AltTurn`]: twenty seconds without, twenty with, in turn,
+/// each change said in the log).
+///
+/// 0 off (or the builder may run), 1 on, 2 in turn.
+///
+/// From edsuuu/VI-BR-PORT ab4571df (GPL-3.0), where it rides on their
+/// `VICTORY_RT_MISS=1`: the largest share of the card's time in a cutscene
+/// there (~6 ms a dispatch, hundreds a frame).
+#[cfg(windows)]
+fn rt_skin_skip_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if builder_allowed() {
+            return 0;
+        }
+        match std::env::var("VICTORY_RT_SKIN_SKIP").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        }
+    })
+}
+
+/// At pipeline creation: whether `bvh_skinning` programs are looked for
+/// and marked ([`rt_skin_skip_mode`]: `1` or `alt`).
+#[cfg(windows)]
+fn rt_skin_skip_on() -> bool {
+    rt_skin_skip_mode() != 0
+}
+
+/// Whether a dispatch with the title's pipeline `this` is left out because
+/// it only feeds the ray-tracing structures nothing builds
+/// ([`rt_skin_skip_mode`]; with `alt` only in an ON turn).
+#[cfg(windows)]
+pub(crate) fn skips_rt_skin(this: This, indirect: bool) -> bool {
+    if this.is_null() || !pipeline(this).rt_skin {
+        return false;
+    }
+    let skip = if rt_skin_skip_mode() != 2 {
+        true
+    } else {
+        static TURN: crate::AltTurn = crate::AltTurn::new();
+        TURN.on(
+            "dispatches of bvh_skinning programs are left out",
+            "VICTORY_RT_SKIN_SKIP",
+            "off, run as usual",
+        )
+    };
+    #[cfg(feature = "diagnostics")]
+    RT_SKIN_DISPATCHES[usize::from(!skip) * 2 + usize::from(indirect)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = indirect;
+    skip
+}
+
+/// bvh_skinning pipelines known so far ([`skins_for_rays`]).
+#[cfg(feature = "diagnostics")]
+static RT_SKIN_PIPELINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dispatches of bvh_skinning pipelines since the last frame line: left
+/// out direct, left out indirect, run direct, run indirect (run: in the
+/// off turns of `=alt`).
+#[cfg(feature = "diagnostics")]
+static RT_SKIN_DISPATCHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The frame line's part of [`skips_rt_skin`]: per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn rt_skin_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [left_direct, left_indirect, ran_direct, ran_indirect] = RT_SKIN_DISPATCHES.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames.max(1.0));
+    if rt_skin_skip_mode() == 0 {
+        return;
+    }
+    tracing::info!(
+        "bvh_skinning dispatches per frame (VICTORY_RT_SKIN_SKIP): left out {left_direct:.1} direct, {left_indirect:.1} indirect; run {ran_direct:.1} direct, {ran_indirect:.1} indirect (the off turns of alt); {} such pipelines known",
+        RT_SKIN_PIPELINES.load(Relaxed)
+    );
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -551,6 +665,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// One of the title's skinning passes for the ray-tracing structures,
+    /// left out ([`skips_rt_skin`]).
+    #[cfg(windows)]
+    rt_skin: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -742,6 +860,20 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        rt_skin: {
+            let skin = rt_skin_skip_on()
+                && shaders
+                    .iter()
+                    .any(|s| s.stage == "compute" && skins_for_rays(&s.container));
+            #[cfg(feature = "diagnostics")]
+            if skin {
+                let n = RT_SKIN_PIPELINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let hash = shaders.iter().find(|s| s.stage == "compute").map_or("", |s| s.hash.as_str());
+                tracing::info!(shader = hash, so_far = n, "a bvh_skinning program known (VICTORY_RT_SKIN_SKIP): its dispatches can be left out");
+            }
+            skin
+        },
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -976,6 +1108,20 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// The title's skinning passes for the ray-tracing structures are known
+    /// by the name in their container; other skinning programs are not.
+    #[cfg(windows)]
+    #[test]
+    fn ray_skinning_programs_are_known_by_name() {
+        assert!(skins_for_rays(
+            b"..\0bvh_skinningCSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."
+        ));
+        assert!(skins_for_rays(b"bvh_skinningCS"));
+        assert!(!skins_for_rays(b"PS_PedSkin_0001"));
+        assert!(!skins_for_rays(b"bvh_skinningPS"));
+        assert!(!skins_for_rays(b""));
+    }
 
     /// Which stores give title-memory copies as written: a vector store
     /// through a buffer descriptor does not; flat, global and scalar-memory

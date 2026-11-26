@@ -107,6 +107,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         "image mapped"
     );
     crate::threads::mapped(&loaded);
+    crate::cpu_patches::note_title_code(loaded.base(), &loaded.info);
     Ok(loaded)
 }
 
@@ -442,6 +443,7 @@ impl LoadedImage {
     /// image may be used afterwards.
     pub unsafe fn unload(self) {
         crate::threads::unmapped(self.base());
+        crate::cpu_patches::forget_title_code(self.base(), self.info.size_of_image as usize);
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
     }
