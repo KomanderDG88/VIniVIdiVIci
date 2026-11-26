@@ -4645,6 +4645,7 @@ fn late_line(frames: f64) {
     }
 }
 
+pub(crate) mod awake;
 mod card_steps;
 
 #[cfg(test)]
@@ -6855,6 +6856,7 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            awake::sent(&self.device);
             self.card_sent();
             prep_part(5, prepared);
             if let Err(e) = signalled {
@@ -6901,6 +6903,7 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                awake::sent(&self.device);
                 self.card_sent();
                 let waited = self
                     .queue
