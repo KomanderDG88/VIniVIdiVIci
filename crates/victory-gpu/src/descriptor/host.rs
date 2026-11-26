@@ -786,6 +786,18 @@ pub(crate) fn page_written(at: usize, len: usize) {
     ranges.push((start, end));
 }
 
+/// Whether each view heap keeps its own cursor into [`REMAPPED`] (the
+/// default); `VICTORY_REMAP_PER_HEAP=0`: all heaps share
+/// [`SHARED_REMAP_CURSOR`], so the first heap whose pass runs takes the
+/// ranges and the others see none of them, as before.
+fn remap_per_heap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_PER_HEAP").is_none_or(|v| v != "0"))
+}
+
+/// The one cursor of all view heaps with `VICTORY_REMAP_PER_HEAP=0`.
+static SHARED_REMAP_CURSOR: Mutex<u64> = Mutex::new(0);
+
 /// Recent title memory mappings, unmaps and writes, shared by all view heaps.
 static REMAPPED: Mutex<RemapQueue> = Mutex::new(RemapQueue::new());
 const REMAP_LIMIT: usize = 1 << 15;
@@ -1955,7 +1967,8 @@ impl HostHeap {
 
     fn refresh_remapped(&self, history: &Mutex<RemapQueue>, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let mut cursor = self.remap_cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let cursor = if remap_per_heap() { &self.remap_cursor } else { &SHARED_REMAP_CURSOR };
+        let mut cursor = cursor.lock().unwrap_or_else(|e| e.into_inner());
         let (latest, ranges) = {
             let mut remapped = history.lock().unwrap_or_else(|e| e.into_inner());
             if remapped.latest == *cursor {
