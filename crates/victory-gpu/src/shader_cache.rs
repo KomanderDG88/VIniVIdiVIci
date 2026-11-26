@@ -21,6 +21,11 @@ use victory_shader::{HwStage, RootType};
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+/// Programs translated since the start whose console threads come from a group counter
+/// (issue #1243, `victory_shader::emit::thread_tickets`), and those that would have but for
+/// `VICTORY_THREAD_TICKET=0`.
+static TICKETS: AtomicU64 = AtomicU64::new(0);
+static TICKETS_OFF: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -35,6 +40,44 @@ pub fn use_shader_cache(dir: PathBuf) {
 /// Shaders found in the cache and translated since the start.
 pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
+}
+
+/// Of the programs translated since the start (a cache hit translates nothing), those whose
+/// console threads come from a group counter (issue #1243), and those that would have but
+/// for `VICTORY_THREAD_TICKET=0`.
+pub(crate) fn tickets() -> (u64, u64) {
+    (TICKETS.load(Ordering::Relaxed), TICKETS_OFF.load(Ordering::Relaxed))
+}
+
+/// `container` translated, counted in [`tickets`] and said once when the program takes its
+/// console threads from a group counter or would have but for the switch (the translator's
+/// counts are per thread, and it translates on the calling thread).
+fn translate_counted(container: &[u8]) -> Result<HostShader, String> {
+    let (took, off) = victory_shader::emit::thread_tickets();
+    let shader = victory_shader::emit::translate(container).map_err(|e| e.to_string());
+    let (took_now, off_now) = victory_shader::emit::thread_tickets();
+    // (a program lowered more than once, forms tried in turn, is still one program)
+    let (counter, what) = if took_now > took {
+        (
+            &TICKETS,
+            "a program with console lanes in a group of several host waves takes its threads from a group counter (#1243)",
+        )
+    } else if off_now > off {
+        (
+            &TICKETS_OFF,
+            "a program with console lanes in a group of several host waves keeps the rounded flat id: VICTORY_THREAD_TICKET=0 (#1243)",
+        )
+    } else {
+        return shader;
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::info!(
+        programs_so_far = n,
+        translated = shader.is_ok(),
+        container = %blake3::hash(container).to_hex().get(..16).unwrap_or_default(),
+        "{what}"
+    );
+    shader
 }
 
 /// What identifies the translation, besides the container: the shader
@@ -86,7 +129,7 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        translate_counted(c)
     };
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
@@ -94,7 +137,7 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_counted;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),

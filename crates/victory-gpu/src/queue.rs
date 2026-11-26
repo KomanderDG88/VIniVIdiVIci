@@ -1384,7 +1384,16 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         #[cfg(windows)]
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
-            tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            // (of those translated: programs whose console threads come from a group
+            // counter, #1243, and those that would have but for VICTORY_THREAD_TICKET=0)
+            let (tickets, tickets_off) = crate::shader_cache::tickets();
+            tracing::info!(
+                hits,
+                misses,
+                tickets,
+                tickets_off,
+                "shaders from the cache and translated so far"
+            );
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]

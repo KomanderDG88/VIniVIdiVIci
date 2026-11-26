@@ -1252,3 +1252,179 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+/// A console wave32 program with console lanes (`v_mbcnt`) in a 32 x 2 group: thread (x, y)
+/// stores 1 at dword 32y + x. Every dword must be written once: the host's relabelled thread
+/// ids are a bijection of the group. A 32-lane host need not give a host wave a 32-aligned run
+/// of flat ids (2-D groups are filled from 16 x 2 tiles on NVIDIA and RDNA), so the first flat
+/// id of a wave rounded down gave two waves the same ids (issue #1243); the waves now take
+/// their threads from a group counter. With `VICTORY_THREAD_TICKET=0` (the old rounding) the
+/// count of dwords written is printed, not checked: it depends on the card.
+#[test]
+fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
+    let words = [
+        0xD765_0003, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0x0001_007E,
+        0x3408_0285, // v_lshlrev_b32 v4, 5, v1
+        0x4A08_0104, // v_add_nc_u32 v4, v4, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 4, // buffer_store_dword v5, v4, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, false, 64);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11, // 5 user SGPRs, thread ids x and y in v0, v1
+        threads: [32, 2, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let lower_with = |ticket: bool| {
+        // (the switch for this thread only: other tests translate meanwhile)
+        let was = lower::TEST_TICKET.replace(Some(ticket));
+        let shader = lowered_on(&native, &p, &HashSet::new(), 32);
+        lower::TEST_TICKET.set(was);
+        shader.expect("lower")
+    };
+    let shader = lower_with(true);
+    let old = lower_with(false);
+    assert_ne!(shader.dxil, old.dxil, "the counter is used for a group of two host waves");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let run = |shader: &HostShader| -> Option<Vec<u32>> {
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("the hardware device does not take this program: {e}; not run");
+                return None;
+            }
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out[0][..64].to_vec())
+    };
+    let Some(got) = run(&shader) else { return };
+    let missing: Vec<usize> = (0..64).filter(|&i| got[i] != 1).collect();
+    assert!(missing.is_empty(), "dwords not written once: {missing:?}");
+    if let Some(before) = run(&old) {
+        let written = before.iter().filter(|&&d| d == 1).count();
+        eprintln!("the old rounding on this device: {written} of 64 dwords written");
+    }
+    eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
+}
+
+/// A console program with console lanes (`v_mbcnt` of EXEC, lo and hi in wave64) storing 1 at
+/// dword `x` + `y` times the group's width, thread ids x and y in v0, v1, in a group of
+/// `threads` (x and y; the width a power of two up to 64).
+fn console_lanes_in(wave64: bool, threads: [u32; 2]) -> NativeProgram {
+    let mut w = vop3(0x365, 3, EXEC, k(0)).to_vec(); // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+    if wave64 {
+        w.extend(vop3(0x366, 3, EXEC + 1, v(3))); // v_mbcnt_hi_u32_b32 v3, exec_hi, v3
+    }
+    w.extend([
+        vop2(0x1A, 4, k(threads[0].trailing_zeros()), 1), // v_lshlrev_b32 v4, log2(width), v1
+        vop2(0x25, 4, v(0), 4),                           // v_add_nc_u32 v4, v0, v4
+        vop2(0x1A, 4, k(2), 4),                           // v_lshlrev_b32 v4, 2, v4
+        vop2(0x25, 5, k(1), 3),                           // v_add_nc_u32 v5, 1, v3
+    ]);
+    w.extend(store(5, 4, 0)); // buffer_store_dword v5, v4, s[8:11], 0 offen
+    let mut native = native_of(&w, wave64, 64);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11, // 5 user SGPRs, thread ids x and y in v0, v1
+        threads: [threads[0], threads[1], 1],
+    });
+    native
+}
+
+/// Which lowerings take the group counter of issue #1243 (`ticket`), counted as the shader
+/// cache counts them (`lower::thread_tickets`, per thread): a program with console lanes in a
+/// group of more than one host wave, not one that fits a wave, and not a wave64 program in
+/// host waves of 32, whose waves keep their own counter (`halves`); with the switch off, the
+/// same lowerings are counted as those that would have taken it.
+#[test]
+fn the_group_counter_is_taken_by_groups_of_several_host_waves_and_counted() {
+    // (wave64, x by y, host wave, switch) -> (took, would have)
+    let cases = [
+        (false, [32, 1], 32, true, (0, 0)),  // one host wave: the flat id is the lane
+        (false, [32, 2], 32, true, (1, 0)),  // #1243's 32 x 2
+        (false, [32, 2], 32, false, (0, 1)), // the same with VICTORY_THREAD_TICKET=0
+        (false, [16, 4], 64, true, (1, 0)),  // a host of 64 lanes still runs waves of 32
+        (true, [64, 1], 64, true, (0, 0)),   // one console wave in one host wave
+        (true, [64, 2], 64, true, (1, 0)),   // two console waves of 64 on a host of 64
+        (true, [64, 2], 32, true, (0, 0)),   // in host waves of 32: `halves`, not `ticket`
+    ];
+    for (wave64, threads, host_wave, on, want) in cases {
+        let native = console_lanes_in(wave64, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let was = lower::TEST_TICKET.replace(Some(on));
+        let before = lower::thread_tickets();
+        // (refused or not, the choice is made and counted before the program is lowered)
+        let _ = lowered_on(&native, &p, &HashSet::new(), host_wave);
+        let after = lower::thread_tickets();
+        lower::TEST_TICKET.set(was);
+        let got = (after.0 - before.0, after.1 - before.1);
+        assert_eq!(got, want, "wave64 {wave64}, {threads:?}, host waves of {host_wave}, switch {on}");
+    }
+}
+
+/// [`console_lanes_in`]'s program in the paired form on a host of 32-lane waves with the
+/// switch `on` or off, and how many lowerings took the group counter of issue #1243 and would
+/// have (`lower::thread_tickets`) while it was made.
+fn paired_with_ticket(native: &NativeProgram, on: bool) -> (HostShader, (u64, u64)) {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let ticket = lower::TEST_TICKET.replace(Some(on));
+    let before = lower::thread_tickets();
+    let shader = super::paired(&c, native, &p, &io, &res);
+    let after = lower::thread_tickets();
+    lower::TEST_TICKET.set(ticket);
+    lower::TEST_HOST_WAVE.set(was);
+    let (shader, wave) = shader.expect("the paired form");
+    assert_eq!(wave, Some(32));
+    (shader, (after.0 - before.0, after.1 - before.1))
+}
+
+/// A console wave64 program with console lanes in a 64 x 2 group (two console waves) on a host
+/// of 32-lane waves, in the paired form: a host group of 64 threads in a row, each host wave
+/// one console wave, its waves numbered by the paired form's own counter (`halves`, 64 console
+/// threads a wave). The group counter of issue #1243 (`ticket`) is not taken there, nor
+/// counted, and the switch leaves the program as it was; on the card each of the 128 console
+/// threads is given once, with its console lane (`v_mbcnt` of EXEC, stored plus 1).
+#[test]
+fn a_two_dimensional_group_in_the_paired_form_keeps_its_own_counter() {
+    let native = console_lanes_in(true, [64, 2]);
+    let shader = paired(&native);
+    let (on, counted_on) = paired_with_ticket(&native, true);
+    let (off, counted_off) = paired_with_ticket(&native, false);
+    assert_eq!((counted_on, counted_off), ((0, 0), (0, 0)), "the paired form counted as a ticket");
+    assert!(on.dxil == off.dxil, "the switch changed the paired form");
+    assert!(on.dxil == shader.dxil, "the paired form with the switch set is not the default's");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 128) else { return };
+    let want: Vec<u32> = (0..128).map(|t| t % 64 + 1).collect();
+    let wrong: Vec<usize> = (0..128).filter(|&t| got[t] != want[t]).collect();
+    assert!(wrong.is_empty(), "console threads not given once with their lane: {wrong:?}");
+    eprintln!("ran on the hardware device: 128 of 128 console threads of a 64 x 2 group in the paired form, each once");
+}
