@@ -961,6 +961,14 @@ use super::ticket::{count_ticket, ticket_on};
 /// `VICTORY_FMAC_MODS` (on unless `0`): the VOP3 abs and neg bit 2 of `v_fmac_f32`,
 /// `v_mac_f32` and `v_mac_legacy_f32` apply to the accumulator; `0` reads it without them, as
 /// before. Read by the translator, so it joins the shader cache key (`build.rs`).
+/// `VICTORY_LEGACY_MUL_DENORM` (on unless `0`): the zero test of [`Lower::legacy_mul`] is on
+/// the exponent bits, so a denormal operand counts as zero, as on RDNA 2; `0` brings back the
+/// float compare. Read by the translator, so it joins the shader cache key (`build.rs`).
+fn legacy_mul_denorm() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_MUL_DENORM").is_none_or(|v| v != "0"))
+}
+
 fn fmac_mods() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FMAC_MODS").is_none_or(|v| v != "0"))
@@ -4075,6 +4083,13 @@ impl<'a> Lower<'a> {
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        if !legacy_mul_denorm() {
+            let zero = self.s.m.f32(0);
+            let az = self.s.m.cmp(c, pred::OEQ, a, zero);
+            let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
+            let z = self.s.m.bin(c, Bin::Or, az, bz);
+            return self.s.m.select(c, z, zero, m);
+        }
         let exp = self.s.m.i32(0x7F80_0000);
         let izero = self.s.m.i32(0);
         let is_zero = |l: &mut Self, v: V| {
