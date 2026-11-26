@@ -59,6 +59,8 @@ mod ambient;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod launch;
 pub mod list;
 pub mod object;
 pub mod pipeline;

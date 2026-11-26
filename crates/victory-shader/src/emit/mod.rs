@@ -122,10 +122,21 @@ pub use sampler::StaticSampler;
 pub use lower::{set_host_max_wave, thread_tickets};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    LAUNCH_SPACE, MEMORY_FAULTS, MEMORY_PAGES, MESH_LAUNCH_PAYLOAD_BYTES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_THREAD_LIMIT, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, mesh_launch, mesh_payload_bytes, set_view_heap_limit, view_heap_limit,
 };
+
+/// Writes D3D12's container hash into the DXIL container `c` (bytes 4 to
+/// 20, over everything from byte 20 on), as every translation carries it:
+/// for a shader of the host's own that its compiler left unsigned (no
+/// `dxil.dll` beside it; `victory-gpu`'s `launch`). Touches no translation.
+pub fn sign_container(c: &mut [u8]) {
+    if c.len() > 20 {
+        let digest = container::hash(&c[20..]);
+        c[4..20].copy_from_slice(&digest);
+    }
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

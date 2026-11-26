@@ -346,8 +346,16 @@ const WINDOW_MOST: u64 = 64;
 /// reports to the system (`crate::drvwatch`): every loss of the card in a
 /// run with windows was announced that way seconds ahead.
 fn windows() -> bool {
+    windows_asked() && !crate::drvwatch::tripped()
+}
+
+/// Whether [`windows`] are asked for (`VICTORY_INDIRECT_WINDOW=1`), even
+/// after the driver's first error turned them off: no mesh record is
+/// launched by the card in such a run (`crate::launch`), the two are not
+/// mixed.
+fn windows_asked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
 /// Whether a record that is not on the window's walk opens a window of its
@@ -3968,6 +3976,19 @@ impl State {
         }
     }
 
+    /// The launch stage (`crate::launch`) of the mesh pipeline
+    /// `prepare_for` bound, if it has one (`VICTORY_MESH_LAUNCH=1`).
+    fn bound_launch<'a>(&self) -> Option<&'a crate::pipeline::host::Launch> {
+        if !crate::launch::on() {
+            return None;
+        }
+        let p = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)?;
+        if p.pso.as_raw() as usize != self.host_pipeline {
+            return None;
+        }
+        p.launch.as_ref()
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
@@ -3984,8 +4005,15 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    // With the launch stage (`VICTORY_MESH_LAUNCH=1`) the
+                    // count goes to it as a root constant (`crate::launch`).
+                    match self.bound_launch() {
+                        Some(launch) => {
+                            crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
+                        }
+                        // SAFETY: an open list with everything set.
+                        None => unsafe { l6.DispatchMesh(x, 1, 1) },
+                    }
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -4742,6 +4770,44 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // One mesh record without a count buffer, drawn by a pipeline with
+        // the launch stage (`crate::launch`, `VICTORY_MESH_LAUNCH=1`): the
+        // draw reads it itself, no clamp of ours before it. Not in a run
+        // that asks for windows (and so for gathers): they clamp mesh
+        // records ahead into a scratch buffer of their own and serve the
+        // draws after from it, which this would bypass; there every mesh
+        // record keeps the clamp, on the pipeline without the stage
+        // (below).
+        if kind == MESH && max == 1 && count.is_none() && crate::launch::ready() && !windows_asked() {
+            let offset = args.offset(arguments);
+            if !offset.is_multiple_of(4) {
+                why("a mesh record not 4-byte aligned");
+                return false;
+            }
+            self.window = None;
+            args.refresh(list, arguments, len);
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            // (A pipeline bound without the stage: the clamp, below.)
+            if let Some(launch) = self.bound_launch() {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x} launched"), false));
+                // SAFETY: a live buffer.
+                let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
+                list.keep(&args.buffer);
+                self.mesh_scissor(list, true);
+                let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
+                self.mesh_scissor(list, false);
+                if !launched {
+                    why("no budget for the launch");
+                    return false;
+                }
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -4985,6 +5051,22 @@ impl State {
         if !ran {
             why("prepare failed");
             return false;
+        }
+        // A mesh call the launch stage does not take (a count buffer, more
+        // than one record, windows asked for): the same pipeline without
+        // the stage (`crate::launch`).
+        if kind == MESH
+            && let Some(launch) = self.bound_launch()
+        {
+            let Some(plain) = launch.plain() else {
+                why("no host pipeline without the launch stage");
+                return false;
+            };
+            // SAFETY: an open list and a live pipeline of the same root
+            // signature.
+            unsafe { list.list.SetPipelineState(plain) };
+            self.host_pipeline = plain.as_raw() as usize;
+            list.keep(plain);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
