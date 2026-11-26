@@ -40,6 +40,11 @@ mod float64;
 #[path = "image_buffer.rs"]
 mod image_buffer;
 
+/// Format loads that move 16-bit halves without the d16 form, a child
+/// module so it shares the emitter's state.
+#[path = "halves.rs"]
+mod halves;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -70,6 +75,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -216,6 +223,11 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel
+    /// ([`super::HostShader::half_views`]): root parameter, dword offset.
+    half_views: std::collections::BTreeSet<(u8, u32)>,
+    /// [`Self::places_read_as_halves`], found before the code is lowered.
+    halves_only: std::collections::BTreeSet<(u8, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1384,6 +1396,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: Default::default(),
+            halves_only: Default::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2189,6 +2203,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        self.halves_only = self.places_read_as_halves();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -2388,6 +2403,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
@@ -2396,6 +2412,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -6567,6 +6584,22 @@ impl<'a> Lower<'a> {
         biased.then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
     }
 
+    /// The table descriptor `src` is, as (root parameter, dword in the
+    /// table), when the code loads it from a fixed place in a table: the
+    /// load's own place, not the start of the range its used-resource
+    /// entry describes (a range of several descriptors starts before most
+    /// of them). `None` for a descriptor picked at run time, built in the
+    /// code or chosen by control flow.
+    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::Table && a.dynamic.is_none())
+            .then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -8128,33 +8161,43 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit result outside a VGPR");
         };
         let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
+        // SDWA: the word written, the other one kept (preserve), bit 15
+        // copied upward (sext: dst_unused 1 with WORD_0), or zero (pad; a sign
+        // extension above the high word or a whole dword adds nothing). The
+        // reserved dst_unused 3 is refused. (Upstream VIctory #3124: a 16-bit
+        // -1 written with sext came out as 0x0000FFFF.)
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 1) => (keep, sext) = (false, true),
+                (4, 0) | (6, 0..=2) => keep = false,
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) if keep => o,
-            _ => self.s.m.i32(0),
-        };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
-            let o = self.s.m.bin(c, Bin::And, old, low);
-            let x = self.s.m.bin(c, Bin::Shl, x, k16);
-            self.s.m.bin(c, Bin::Or, o, x)
+        let r = if sext {
+            let t = self.s.m.bin(c, Bin::Shl, x, k16);
+            self.s.m.bin(c, Bin::AShr, t, k16)
         } else {
-            let keep = self.s.m.i32(0xFFFF_0000);
-            let o = self.s.m.bin(c, Bin::And, old, keep);
-            self.s.m.bin(c, Bin::Or, o, x)
+            let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                Some(Ok(o)) if keep => o,
+                _ => self.s.m.i32(0),
+            };
+            let x = self.s.m.bin(c, Bin::And, x, low);
+            if high {
+                let o = self.s.m.bin(c, Bin::And, old, low);
+                let x = self.s.m.bin(c, Bin::Shl, x, k16);
+                self.s.m.bin(c, Bin::Or, o, x)
+            } else {
+                let keep = self.s.m.i32(0xFFFF_0000);
+                let o = self.s.m.bin(c, Bin::And, old, keep);
+                self.s.m.bin(c, Bin::Or, o, x)
+            }
         };
         self.write_placed(inst, Reg::V(reg), r, guard);
         Ok(())
