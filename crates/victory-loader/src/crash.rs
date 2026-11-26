@@ -199,20 +199,48 @@ const FATAL: [i32; 6] = [
 ];
 
 /// The kinds of AMD-only instructions emulated ([`emulate_amd_only`]),
-/// counted in [`AMD_EMULATED`]: `clzero`, `monitorx`, `mwaitx`, `rdpru`, and
-/// the others (`clwb` and its loops, SSE4a).
+/// counted in [`AMD_EMULATED`], in the order the rate line names them.
 #[derive(Clone, Copy)]
 enum AmdKind {
     Clzero,
     Monitorx,
     Mwaitx,
     Rdpru,
-    Other,
+    /// One `clwb` ([`clwb_len`]).
+    Clwb,
+    /// A whole `clwb` write-back loop done in one exception ([`clwb_loop`]).
+    ClwbLoop,
+    /// SSE4a `extrq` (`66` prefix, [`sse4a`]).
+    Extrq,
+    /// SSE4a `insertq` (`f2` prefix, [`sse4a`]).
+    Insertq,
+}
+
+impl AmdKind {
+    const COUNT: usize = 8;
+    /// Names in the rate line, by [`AmdKind`] value.
+    const NAMES: [&'static str; Self::COUNT] =
+        ["clzero", "monitorx", "mwaitx", "rdpru", "clwb", "clwb loops", "extrq", "insertq"];
 }
 
 /// AMD-only instructions emulated since the start, by [`AmdKind`]; each is
 /// an exception (about a microsecond, and a kernel round trip).
-static AMD_EMULATED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static AMD_EMULATED: [std::sync::atomic::AtomicU64; AmdKind::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; AmdKind::COUNT];
+
+/// The rate line: each kind's count per second, then the sum, e.g.
+/// `clzero 14180, monitorx 6536, ..., insertq 0; 47543 in all`.
+fn amd_rate_line(rates: &[f64; AmdKind::COUNT]) -> String {
+    let mut line = String::new();
+    for (name, rate) in AmdKind::NAMES.iter().zip(rates) {
+        if !line.is_empty() {
+            line.push_str(", ");
+        }
+        line.push_str(&format!("{name} {rate:.0}"));
+    }
+    line.push_str(&format!("; {:.0} in all", rates.iter().sum::<f64>()));
+    line
+}
 
 /// Counts one emulation and, at most every five seconds, says the counts
 /// per second since the last line, in every build: the measure that tells
@@ -225,22 +253,18 @@ fn note_amd(kind: AmdKind) {
     AMD_EMULATED[kind as usize].fetch_add(1, Relaxed);
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
-    static BEFORE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static BEFORE: [AtomicU64; AmdKind::COUNT] = [const { AtomicU64::new(0) }; AmdKind::COUNT];
     let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
     let last = LAST_MS.load(Relaxed);
     if now < last + 5_000 || LAST_MS.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
         return;
     }
     let seconds = (now - last).max(1) as f64 / 1e3;
-    let rate = |k: usize| {
+    let rates: [f64; AmdKind::COUNT] = std::array::from_fn(|k| {
         let total = AMD_EMULATED[k].load(Relaxed);
         (total - BEFORE[k].swap(total, Relaxed)) as f64 / seconds
-    };
-    let [clzero, monitorx, mwaitx, rdpru, other] = [rate(0), rate(1), rate(2), rate(3), rate(4)];
-    tracing::info!(
-        "AMD-only instructions emulated per second: clzero {clzero:.0}, monitorx {monitorx:.0}, mwaitx {mwaitx:.0}, rdpru {rdpru:.0}, others {other:.0}; {:.0} in all",
-        clzero + monitorx + mwaitx + rdpru + other
-    );
+    });
+    tracing::info!("AMD-only instructions emulated per second: {}", amd_rate_line(&rates));
 }
 
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
@@ -319,11 +343,11 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     let flags = cmp_flags(end, limit);
                     context.EFlags = context.EFlags & !CMP_FLAGS | flags;
                     context.Rip += pass.len as u64;
-                    note_amd(AmdKind::Other);
+                    note_amd(AmdKind::ClwbLoop);
                     return true;
                 }
                 if let Some(len) = clwb_len(&bytes[..n]) {
-                    note_amd(AmdKind::Other);
+                    note_amd(AmdKind::Clwb);
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
                     return true;
@@ -331,7 +355,8 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
-                note_amd(AmdKind::Other);
+                // `sse4a` accepted only a `66` (extrq) or `f2` (insertq) prefix.
+                note_amd(if bytes[0] == 0x66 { AmdKind::Extrq } else { AmdKind::Insertq });
                 context.Rip += len as u64;
                 return true;
             }
@@ -1130,6 +1155,19 @@ mod tests {
         // just the 4-byte `clwb` instruction and let the CPU run add/cmp/jbe.
         assert_eq!(run(0, u64::MAX - 10), (4, 0));
         assert_eq!(run(u64::MAX - 16, 0x100), (4, u64::MAX - 16));
+    }
+
+    #[test]
+    fn the_rate_line_names_every_kind_in_order_then_the_sum() {
+        let rates = [14180.0, 6536.0, 6535.0, 0.0, 12.0, 3.4, 1.0, 0.0];
+        assert_eq!(
+            amd_rate_line(&rates),
+            "clzero 14180, monitorx 6536, mwaitx 6535, rdpru 0, clwb 12, clwb loops 3,              extrq 1, insertq 0; 27267 in all"
+        );
+        assert_eq!(AmdKind::NAMES[AmdKind::Clwb as usize], "clwb");
+        assert_eq!(AmdKind::NAMES[AmdKind::ClwbLoop as usize], "clwb loops");
+        assert_eq!(AmdKind::NAMES[AmdKind::Insertq as usize], "insertq");
+        assert_eq!(AmdKind::Insertq as usize + 1, AmdKind::COUNT);
     }
 
     #[test]
