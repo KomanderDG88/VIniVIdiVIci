@@ -278,17 +278,59 @@ pub(crate) static DYNAMIC_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomi
 /// [`LOCKS`]`[at]` and add the nanoseconds it then waits to `[at + 1]`.
 #[cfg(feature = "diagnostics")]
 fn locked<T>(lock: &Mutex<T>, at: usize) -> std::sync::MutexGuard<'_, T> {
+    locked_waited(lock, at).0
+}
+
+/// [`locked`], and the nanoseconds the take waited when it found the lock
+/// held (`None`: it did not; only such takes are timed).
+#[cfg(feature = "diagnostics")]
+fn locked_waited<T>(lock: &Mutex<T>, at: usize) -> (std::sync::MutexGuard<'_, T>, Option<u64>) {
     use std::sync::atomic::Ordering::Relaxed;
     match lock.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Ok(guard) => (guard, None),
+        Err(std::sync::TryLockError::Poisoned(e)) => (e.into_inner(), None),
         Err(std::sync::TryLockError::WouldBlock) => {
             let started = std::time::Instant::now();
             let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let waited = started.elapsed().as_nanos() as u64;
             LOCKS[at].fetch_add(1, Relaxed);
-            LOCKS[at + 1].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
-            guard
+            LOCKS[at + 1].fetch_add(waited, Relaxed);
+            (guard, Some(waited))
         }
+    }
+}
+
+/// Diagnostics, for the pass over the heap's buffer views (`heap_buffers`
+/// in the draw code, [`HostHeap::mirror_heap_buffer`]), since the last
+/// line (`crate::draw::heap_pass_parts_line`): the slots it looked at by
+/// their record against what the slot holds. 0: the record the slot was
+/// made from, seen without the lock; 1: the same, under the lock; 2: a new
+/// record of the very view the slot was made from; 3: a new record of a
+/// view the host makes the same (it differs only in fields [`make`] does
+/// not read: [`same_host_view`]); 4: a new record of another view; 5: a
+/// new record where the slot held none, or its old view is gone (its
+/// resource released); 6: a record of no view. Then 7: the takes of the
+/// records' lock, 8: of them, those that found it held, 9: the
+/// nanoseconds those waited.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_PASS_SLOTS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Whether making `a` and making `b` give the same host view (diagnostics,
+/// [`HEAP_PASS_SLOTS`]): views of placed buffer memory are compared by
+/// what [`make`] reads of them (the kind, the width, the view's words and
+/// its address; not the console's fields nor the rest of the resource
+/// description), every other view whole.
+#[cfg(feature = "diagnostics")]
+fn same_host_view(a: &View, b: &View) -> bool {
+    const BUFFER: u32 = 1;
+    match (a, b) {
+        (View::Placed(unordered, resource, desc), View::Placed(other_unordered, other, other_desc))
+            if resource[0] == BUFFER && other[0] == BUFFER =>
+        {
+            unordered == other_unordered && resource[4..6] == other[4..6] && desc[..12] == other_desc[..12]
+        }
+        _ => a == b,
     }
 }
 
@@ -2975,11 +3017,33 @@ impl HostHeap {
             {
                 #[cfg(feature = "diagnostics")]
                 mirror_how(MIRROR_FAST);
+                // (Only the pass over the heap's buffer views mirrors
+                // without noting the change: `mirror_heap_buffer`.)
+                #[cfg(feature = "diagnostics")]
+                if !record_change {
+                    HEAP_PASS_SLOTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return Some((view, None));
             }
         }
         // (Its wait counted as the records' lock: `locked`, slot 4.)
+        #[cfg(not(feature = "diagnostics"))]
         let mut made = locked(&self.made, 4);
+        // The pass over the heap's buffer views also counts its own takes,
+        // and the waits of those that found the lock held.
+        #[cfg(feature = "diagnostics")]
+        let mut made = {
+            let (made, waited) = locked_waited(&self.made, 4);
+            if !record_change {
+                use std::sync::atomic::Ordering::Relaxed;
+                HEAP_PASS_SLOTS[7].fetch_add(1, Relaxed);
+                if let Some(waited) = waited {
+                    HEAP_PASS_SLOTS[8].fetch_add(1, Relaxed);
+                    HEAP_PASS_SLOTS[9].fetch_add(waited, Relaxed);
+                }
+            }
+            made
+        };
         self.mirror_with_made(&mut made, index, handle, for_draw, record_change, None)
     }
 
@@ -3022,6 +3086,10 @@ impl HostHeap {
             // title released): nothing to read.
             #[cfg(feature = "diagnostics")]
             mirror_how(MIRROR_NOT_VIEW);
+            #[cfg(feature = "diagnostics")]
+            if !record_change {
+                HEAP_PASS_SLOTS[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if made[index as usize] != 0 {
                 #[cfg(feature = "diagnostics")]
                 held.slot_changed();
@@ -3041,6 +3109,26 @@ impl HostHeap {
         };
         // The copy the make resolved for a buffer view, if it made one.
         let mut resolved = None;
+        // The pass over the heap's buffer views: whether the slot is made
+        // again from a new record of the view it holds (read before `made`
+        // changes below; the old view is looked up as `keep_views` does).
+        #[cfg(feature = "diagnostics")]
+        if !record_change {
+            let old = made[index as usize];
+            let class = if old == key {
+                1
+            } else if old == 0 {
+                5
+            } else {
+                match view_at(old as u32, (old >> 32) as u32) {
+                    None => 5,
+                    Some(old) if old == view => 2,
+                    Some(old) if same_host_view(&old, &view) => 3,
+                    Some(_) => 4,
+                }
+            };
+            HEAP_PASS_SLOTS[class].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if made[index as usize] != key {
             #[cfg(feature = "diagnostics")]
             held.slot_changed();

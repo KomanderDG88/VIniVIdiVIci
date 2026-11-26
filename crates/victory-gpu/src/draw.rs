@@ -998,6 +998,54 @@ pub(crate) enum Into<'a> {
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Diagnostics, for [`State::heap_buffers`] (not the marked pass), since
+/// the last frame line: nanoseconds of its parts (0: taking its ranges and
+/// the slots to look at; 1: walking the slots and making their views; 2:
+/// rebuilding the spans; 3: noting the refreshes, `defer_refresh`; 4: the
+/// pass over textures picked by index, or handing it to its thread), then
+/// 5: its passes, 6: of them, those that looked at every buffer slot.
+#[cfg(feature = "diagnostics")]
+static HEAP_PASS_NS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// The line of [`HEAP_PASS_NS`] and `descriptor::host::HEAP_PASS_SLOTS`,
+/// per frame, from the frame line (diagnostics; nothing while the pass did
+/// not run).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn heap_pass_parts_line(frames: f64) {
+    let ns: [u64; 7] = std::array::from_fn(|i| HEAP_PASS_NS[i].swap(0, Ordering::Relaxed));
+    let slots: [u64; 10] =
+        std::array::from_fn(|i| crate::descriptor::host::HEAP_PASS_SLOTS[i].swap(0, Ordering::Relaxed));
+    if ns[5] == 0 {
+        return;
+    }
+    let ms = |n: u64| n as f64 / 1e6 / frames;
+    let each = |n: u64| n as f64 / frames;
+    tracing::info!(
+        "heap buffers by part, per frame ({:.2} passes, {:.2} of every buffer slot): {:.2} ms setup, {:.2} ms walk+make \
+         (of it {:.2} ms waiting for the records' lock: {:.1} of {:.0} takes found it held), {:.2} ms spans rebuild, \
+         {:.2} ms noting refreshes (defer_refresh), {:.2} ms textures; slots by record against what the slot holds: \
+         {:.0} same record without the lock, {:.0} same record, {:.0} new record of the identical view, \
+         {:.0} new record of a view made the same (fields make ignores differ), {:.0} new record of another view, \
+         {:.0} new record where the slot held none or its old view is gone, {:.0} no view",
+        each(ns[5]),
+        each(ns[6]),
+        ms(ns[0]),
+        ms(ns[1]),
+        ms(slots[9]),
+        each(slots[8]),
+        each(slots[7]),
+        ms(ns[2]),
+        ms(ns[3]),
+        ms(ns[4]),
+        each(slots[0]),
+        each(slots[1]),
+        each(slots[2]),
+        each(slots[3]),
+        each(slots[4]),
+        each(slots[5]),
+        each(slots[6]),
+    );
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -2265,6 +2313,11 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
+        // Diagnostics: whether this pass looks at every buffer slot (as
+        // [`pass_slots`] decides: never, after the first, when spread).
+        #[cfg(feature = "diagnostics")]
+        let every = (!heap_rescan_spread() || *passes == 0)
+            && passes.is_multiple_of(heap_rescan_frames().max(1));
         let slots = pass_slots(
             *passes,
             (heap_rescan_frames(), heap_rescan_spread()),
@@ -2273,6 +2326,8 @@ impl State {
             ranges,
         );
         *passes += 1;
+        #[cfg(feature = "diagnostics")]
+        let walking = std::time::Instant::now();
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2338,6 +2393,8 @@ impl State {
                 ranges.insert(index, (shadow, address, address + len));
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let spanning = std::time::Instant::now();
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover: one entry per copy
         // (some 4,600 against 29,000 slots), so it is sized for the slots it
@@ -2352,6 +2409,8 @@ impl State {
         }
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        #[cfg(feature = "diagnostics")]
+        let refreshing = std::time::Instant::now();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -2389,6 +2448,21 @@ impl State {
             Self::heap_textures(Into::List(list), heap, host);
         }
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            let parts = [
+                walking - started,
+                spanning - walking,
+                refreshing - spanning,
+                textures_began - refreshing,
+                textures_began.elapsed(),
+            ];
+            for (at, part) in parts.into_iter().enumerate() {
+                HEAP_PASS_NS[at].fetch_add(part.as_nanos() as u64, Ordering::Relaxed);
+            }
+            HEAP_PASS_NS[5].fetch_add(1, Ordering::Relaxed);
+            HEAP_PASS_NS[6].fetch_add(u64::from(every), Ordering::Relaxed);
+        }
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);

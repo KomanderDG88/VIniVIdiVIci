@@ -9857,6 +9857,9 @@ impl Meter {
                 },
             );
         }
+        // The buffer views' pass by part, and its slots by what changed.
+        #[cfg(feature = "diagnostics")]
+        crate::draw::heap_pass_parts_line(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
