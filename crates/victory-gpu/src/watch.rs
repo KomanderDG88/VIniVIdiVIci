@@ -1526,6 +1526,7 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
 }
 
 /// [`guard_at`], with `later` as [`guard_later`] has it.
+#[cfg(test)]
 fn guard_at_later(
     start: usize,
     end: usize,
