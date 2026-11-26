@@ -7857,13 +7857,14 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
-            let [through, left, moved] =
-                [0, 1, 2].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left + moved > 0.0 {
+            let [through, left, moved, part] =
+                [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if through + left + moved + part > 0.0 {
                 tracing::info!(
                     "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
                      {through:.1} read through the kernel, {left:.1} left for a later refresh (a page was not there), \
-                     {moved:.1} read but not taken (a mapping under the read changed while it read)"
+                     {moved:.1} read but not taken (a mapping under the read changed while it read), \
+                     {part:.1} read in part (a texture partly mapped: pages not there read as nothing)"
                 );
             }
         }

@@ -1135,15 +1135,34 @@ pub(crate) enum Unlocked {
 /// way when it began, and none began or ended before it was done: the
 /// epochs are the same, and even, before and after.
 pub(crate) fn read_unlocked(src: *const u8, dst: &mut [u8]) -> Unlocked {
+    still_while(src, dst.len(), || crate::host::read_into(src, dst))
+}
+
+/// [`read_unlocked`] of memory that may be partly mapped: pages that are
+/// not there read as zeros (`crate::host::copy_mapped`, which reads in
+/// place with faults caught, or through the kernel, and needs no lock to
+/// not fault), as the refresh that waits reads a texture that is still
+/// streaming in. Never [`Unlocked::Missing`].
+pub(crate) fn read_unlocked_standing(src: *const u8, dst: &mut [u8]) -> Unlocked {
+    still_while(src, dst.len(), || {
+        crate::host::copy_mapped(dst.as_mut_ptr(), src, dst.len(), false);
+        true
+    })
+}
+
+/// `read` of `[src, src + len)`, taken only if no change of mapping in
+/// its zones was under way when it began and none began or ended before
+/// it was done; false from `read` is [`Unlocked::Missing`].
+fn still_while(src: *const u8, len: usize, read: impl FnOnce() -> bool) -> Unlocked {
     use std::sync::atomic::Ordering::SeqCst;
-    let zones = zones(src as usize, dst.len());
+    let zones = zones(src as usize, len);
     // A texture lies in one zone or two: the allocation is that of a
     // handful of words, against a read of the whole texture.
     let seen: Vec<u64> = zones.clone().map(|z| EPOCH[z % ZONES].load(SeqCst)).collect();
     if seen.iter().any(|e| e & 1 == 1) {
         return Unlocked::Moved;
     }
-    if !crate::host::read_into(src, dst) {
+    if !read() {
         return Unlocked::Missing;
     }
     std::sync::atomic::fence(SeqCst);
@@ -1831,7 +1850,7 @@ mod mapping_tests {
     /// are taken, some not.
     #[test]
     fn reads_without_the_lock_never_take_two_mappings() {
-        use super::{Unlocked, read_unlocked};
+        use super::{Unlocked, read_unlocked, read_unlocked_standing};
         use std::time::Instant;
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -1865,8 +1884,11 @@ mod mapping_tests {
         let mut read = vec![0u8; PAGES * PAGE];
         let (mut taken, mut moved) = (0u64, 0u64);
         let end = Instant::now() + Duration::from_millis(400);
+        let readers: [fn(*const u8, &mut [u8]) -> Unlocked; 2] = [read_unlocked, read_unlocked_standing];
+        let mut turn = 0usize;
         while Instant::now() < end {
-            match read_unlocked(at as *const u8, &mut read) {
+            turn += 1;
+            match readers[turn % 2](at as *const u8, &mut read) {
                 Unlocked::Read => {
                     taken += 1;
                     assert!(read.iter().all(|&b| b == read[0]), "a read taken holds two contents");
@@ -1881,5 +1903,39 @@ mod mapping_tests {
         unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
         assert!(taken > 0, "no read was taken");
         assert!(moved > 0, "no read met a change");
+    }
+
+    /// A range with a page not there in its middle: the read through the
+    /// kernel gives it up, the standing read takes it with zeros for that
+    /// page and what is there for the rest.
+    #[test]
+    fn a_standing_read_takes_what_is_there() {
+        use super::{Unlocked, read_unlocked, read_unlocked_standing};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const PAGE: usize = 4096;
+        const PAGES: usize = 16;
+        const HOLE: usize = 7;
+        // SAFETY: a fresh allocation of ours.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        // SAFETY: committed memory of ours; then one of its pages given up.
+        unsafe {
+            std::ptr::write_bytes(at as *mut u8, 5, PAGES * PAGE);
+            assert_ne!(VirtualFree((at + HOLE * PAGE) as _, PAGE, MEM_DECOMMIT), 0);
+        }
+        let mut read = vec![9u8; PAGES * PAGE];
+        assert_eq!(read_unlocked(at as *const u8, &mut read), Unlocked::Missing);
+        read.fill(9);
+        assert_eq!(read_unlocked_standing(at as *const u8, &mut read), Unlocked::Read);
+        for (page, bytes) in read.chunks(PAGE).enumerate() {
+            let expected = if page == HOLE { 0 } else { 5 };
+            assert!(bytes.iter().all(|&b| b == expected), "page {page}");
+        }
+        // SAFETY: the allocation above, no longer used.
+        unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
     }
 }

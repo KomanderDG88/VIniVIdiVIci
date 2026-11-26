@@ -431,8 +431,9 @@ fn no_wait() -> bool {
 /// for a later refresh because a page was not there (or the texture was
 /// found partly mapped less than 30 frames before), and those whose read was
 /// not taken because a mapping under it changed while it read
-/// (`crate::watch::read_unlocked`).
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// (`crate::watch::read_unlocked`), and those of a partly mapped texture
+/// read in part, pages not there read as zeros.
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -1202,13 +1203,41 @@ impl Staging {
                 last.partial = None;
                 size
             }
-            Unlocked::Missing => {
+            Unlocked::Missing if committed(self.memory, size) => {
+                // All there now: a page went and came back during the
+                // read. Read again at the next refresh.
                 UNLOCKED[1].fetch_add(1, Relaxed);
                 last.asked = 0;
-                if !committed(self.memory, size) {
-                    last.partial = Some(frame);
-                }
                 0
+            }
+            Unlocked::Missing => {
+                // Partly mapped, the usual state while a texture streams
+                // in: what is there is read and uploaded, pages not there
+                // as zeros, at most every 30 frames, as the refresh that
+                // waits does (else the texture showed nothing at all
+                // until every page of it had come).
+                let found = with_read(size, |read| {
+                    let found = crate::watch::read_unlocked_standing(self.memory, read);
+                    if found == Unlocked::Read {
+                        let hash = blake3::hash(read);
+                        if last.hash != Some(hash) {
+                            last.hash = Some(hash);
+                            if !read.iter().all(|&b| b == 0) {
+                                self.detile(read);
+                            }
+                        }
+                    }
+                    found
+                });
+                if found == Unlocked::Read {
+                    UNLOCKED[3].fetch_add(1, Relaxed);
+                    last.partial = Some(frame);
+                    size
+                } else {
+                    UNLOCKED[2].fetch_add(1, Relaxed);
+                    last.asked = 0;
+                    0
+                }
             }
             Unlocked::Moved => {
                 UNLOCKED[2].fetch_add(1, Relaxed);
