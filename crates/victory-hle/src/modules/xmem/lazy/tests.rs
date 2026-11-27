@@ -500,3 +500,21 @@ fn a_fault_under_the_record_lock_is_passed_on_without_taking_it() {
     }
     assert!(!holding(), "the flag goes with the lock");
 }
+
+/// Pure: a section page keeps its generation until a recorded page showing
+/// it is touched; another page, or the same one once forgotten, never
+/// shares it.
+#[test]
+fn a_generation_stands_until_its_page_is_touched() {
+    let mut gens = Gens::default();
+    let (a, b) = ((1, 0), (1, 1));
+    let first = gens.of(a);
+    assert_eq!(gens.of(a), first, "untouched: the same");
+    assert_ne!(gens.of(b), first, "another section page");
+    gens.touched(a);
+    let touched = gens.of(a);
+    assert_ne!(touched, first, "touched: a new one");
+    gens.forget(a);
+    let again = gens.of(a);
+    assert!(again != first && again != touched, "shown again after none showed it: a new one");
+}

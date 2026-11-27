@@ -18,6 +18,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod fidelityfx;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -78,5 +80,13 @@ pub(crate) fn all() -> Vec<HleModule> {
     }
     #[cfg(windows)]
     all.push(xsystem::module());
+    // The title's FidelityFX loader served by the host's PC upscaler, only
+    // when `VICTORY_FIDELITYFX_DIR` names one that loaded
+    // (`fidelityfx::init_from_env`, before the first import is bound):
+    // without it the title's own loader DLL serves these imports as before.
+    #[cfg(windows)]
+    if fidelityfx::serving() {
+        all.push(fidelityfx::module());
+    }
     all
 }

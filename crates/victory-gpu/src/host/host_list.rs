@@ -81,6 +81,9 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // Refreshes a thread of ours was still finding for it
+        // (`VICTORY_HEAP_PASS_ASIDE`): among its steps before it goes.
+        self.take_coming();
         // The copies below write buffers on the card: no draw after them joins a window.
         crate::indirect::end_window(self);
         // Host queries begun in this list and never ended here: ended now, answered "visible".
@@ -156,6 +159,9 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.clamp_window.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // (A list reset without its close: what was still coming is not
+        // waited for, and goes nowhere.)
+        *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         // Oversized per-list tables shrunk on reset only with
         // `VICTORY_RAM_TRIM=1`.
@@ -999,7 +1005,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
         if list_reuse_set() {
             deferred.filled.clear();
         }
@@ -1044,6 +1050,46 @@ impl HostList {
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
         }
+    }
+
+    /// `work` finds, on a thread of ours, refreshes that belong at this place
+    /// among the list's steps (`VICTORY_HEAP_PASS_ASIDE`, [`aside`]); they
+    /// are there when the list is closed. One at a time: one still coming
+    /// is put in first.
+    pub(crate) fn refreshes_coming(&self, work: impl FnOnce() -> Vec<aside::Refresh> + Send + 'static) {
+        self.take_coming();
+        let at = self.deferred().copies.len();
+        let coming = aside::begin(work);
+        *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, coming));
+    }
+
+    /// The refreshes that were still to come are put among the steps, where
+    /// they were asked for, noted once as [`HostList::defer_refresh`] notes
+    /// them ([`aside::splice_once`]: a title copy or a run of ours notes a
+    /// range anew).
+    fn take_coming(&self) {
+        let Some((at, coming)) = self.coming.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let found = coming.wait();
+        if found.is_empty() {
+            return;
+        }
+        let mut deferred = self.deferred();
+        let found = found
+            .into_iter()
+            .map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, to.saturating_sub(from) as usize))
+            .collect();
+        aside::splice_once(
+            &mut deferred.copies,
+            at,
+            found,
+            |step| match step {
+                Step::Refresh(shadow, address, len) => Some((std::sync::Arc::as_ptr(shadow) as usize, *address, *len)),
+                _ => None,
+            },
+            |step| matches!(step, Step::Copy(..) | Step::CardCopy(..) | Step::Run(..)),
+        );
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
@@ -1385,6 +1431,12 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// The next [`HostList::first_use`] of `key` is a first one again: its
+    /// host copy was replaced (`crate::resource::card_will_write`).
+    pub(crate) fn use_again(&self, key: usize) {
+        self.deferred().textures.remove(&key);
+    }
+
     pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
         let view = view.as_raw() as usize;
         let source = source.as_raw() as usize;
@@ -1396,10 +1448,11 @@ impl HostList {
     /// (refreshes after it copy again; [`near_writes`] uses the place,
     /// without the switch any write of title memory is assumed).
     pub(crate) fn defer_at(&self, at: usize, len: usize, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work), Some((at, len))));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work), Some((at, len))));
+        deferred.title_written();
         if list_reuse_set() {
-            self.deferred().filled.clear();
+            deferred.filled.clear();
         }
     }
 
@@ -1483,17 +1536,25 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for (i, step) in self.deferred().copies.iter().enumerate() {
-            if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
+            if matches!(step, Step::Copy(..) | Step::CardCopy(..) | Step::Fill(..)) && taken(i) {
+                continue;
+            }
+            // A title copy the submission left to the card ([`readcopy`]):
+            // the card's copy in the list is the copy.
+            if !step.on_cpu() {
                 continue;
             }
             let started = std::time::Instant::now();
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
+                &Step::Copy(dst, src, len) | &Step::CardCopy(dst, src, len, _) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    // Fills put off read title memory as it is before the
+                    // write ([`wide_fills`]).
+                    batch.fill();
                     if near_writes() {
                         batch.title_wrote_near(dst, len, false);
                     } else {
@@ -1507,6 +1568,11 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    // With `VICTORY_SEND_OWN=1`: what the card holds there
+                    // may be another value although ours did not change.
+                    if super::send::own() {
+                        crate::shadow::send_copied(dst, len);
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len, _) => {
@@ -1519,6 +1585,13 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                     crate::port::filled(src, len);
+                    if wide_fills() {
+                        // Done with the others before the next write of
+                        // ours or step of ours ([`Batch::fill`]).
+                        batch.put_off_fill(dst, src, len);
+                        preparing(1, len as u64);
+                        continue;
+                    }
                     copy_fill(dst as *mut u8, src as *const u8, len);
                     len
                 }
@@ -1536,6 +1609,7 @@ impl HostList {
                     // to date first and checked again after it, and the
                     // submission's one asking stands, told of the write, as
                     // for a title buffer copy ([`near_writes`]).
+                    batch.fill();
                     let written = batch.title_wrote_near(*at, *len, true);
                     work();
                     for &(from, to) in &written {
@@ -1549,6 +1623,7 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work, _) | Step::Host(work, _) => {
+                    batch.fill();
                     if matches!(step, Step::Run(..)) {
                         batch.title_written();
                     } else if !batch.due_textures.is_empty() {

@@ -264,6 +264,11 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// Diagnostics, `VICTORY_RESIDENCY_STATS=1`: per title slot, the frame a
+    /// draw last sampled it and how that is known
+    /// (`crate::residency::stamp`; 0: never). Empty with the switch off.
+    #[cfg(feature = "diagnostics")]
+    sampled: Vec<std::sync::atomic::AtomicU32>,
     /// Per title slot, bits saying which sets the slot may be in without
     /// taking their lock to ask ([`SLOT_IN_TEXTURES`],
     /// [`SLOT_IN_PLACED`], [`SLOT_IN_BUFFERS`]): `note_buffer_into` runs
@@ -1169,6 +1174,14 @@ impl TextureQueue {
         self.slots.get_mut(&index).filter(|w| w.write == write)
     }
 
+    /// Replacing a retry also clears a card-space hold for the same write.
+    fn reschedule(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+        if self.held.get(&index) == Some(&write) {
+            self.held.remove(&index);
+        }
+        self.same(index, write)
+    }
+
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
         if self.same(index, write).is_some() {
@@ -1179,7 +1192,7 @@ impl TextureQueue {
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
         }
@@ -1220,7 +1233,7 @@ impl TextureQueue {
     /// not all of it: looked at again from frame `due` (`frame`: the
     /// frame of the upload).
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64, frame: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
             if w.part == 0 {
                 w.part = frame.max(1);
@@ -1234,7 +1247,7 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             (w.shown, w.part) = (false, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
@@ -1697,6 +1710,10 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            #[cfg(feature = "diagnostics")]
+            sampled: (0..if sampler || !crate::residency::stats_on() { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
             slot_flags: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
@@ -1905,6 +1922,44 @@ impl HostHeap {
     /// See [`TextureQueue::queued`].
     pub(crate) fn texture_slots_queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).queued(indices)
+    }
+
+    /// Of the slots `indices` (each once), the ones whose host slot shows
+    /// nothing and that wait in the queue otherwise: not held for room, not
+    /// waiting for their memory to be mapped, not uploaded whole and
+    /// waiting for another look (the slot census's "in the queue
+    /// otherwise", `HostHeap::placed_slot_census`). For a draw that uploads
+    /// such slots before it samples them
+    /// (`crate::draw::State::draw_sources_pass`). Takes the queue, then
+    /// `made` and pieces of `kept` (as `mirror` takes them), in turn.
+    pub(crate) fn texture_slots_null_queued(&self, indices: &[u32]) -> Vec<u32> {
+        let mut out: Vec<u32> = {
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            indices
+                .iter()
+                .copied()
+                .filter(|index| {
+                    textures.slots.get(index).is_some_and(|w| {
+                        w.checked.2 == 0 && !(w.looks > 0 && w.mapped == 0) && !textures.held.contains_key(index)
+                    })
+                })
+                .collect()
+        };
+        if out.is_empty() {
+            return out;
+        }
+        out.sort_unstable();
+        out.dedup();
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        out.retain(|&index| {
+            made.get(index as usize).is_none_or(|&key| key == 0)
+                || !self.kept[(index % KEPT_PIECES) as usize]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get((index / KEPT_PIECES) as usize)
+                    .is_some_and(Option::is_some)
+        });
+        out
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -2488,6 +2543,8 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
+            #[cfg(feature = "diagnostics")]
+            self.slot_sampled_in(index, frame, crate::residency::TABLE);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.slots.remove(&index).is_some() {
@@ -2504,6 +2561,27 @@ impl HostHeap {
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+    }
+
+    /// Diagnostics, `VICTORY_RESIDENCY_STATS=1`: a draw samples title slot
+    /// `index` in this frame, as `source` says (`crate::residency::ROOT`,
+    /// `crate::residency::BAKE`). A store when the stamp changes; no lock.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn slot_sampled(&self, index: u32, source: u32) {
+        self.slot_sampled_in(index, crate::frame::current(), source);
+    }
+
+    /// [`HostHeap::slot_sampled`] in frame `frame`.
+    #[cfg(feature = "diagnostics")]
+    fn slot_sampled_in(&self, index: u32, frame: u64, source: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(at) = self.sampled.get(index as usize) else {
+            return;
+        };
+        let stamp = crate::residency::stamp(frame, source);
+        if at.load(Relaxed) != stamp {
+            at.store(stamp, Relaxed);
+        }
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -3592,6 +3670,75 @@ impl HostHeap {
         );
     }
 
+    /// Diagnostics, `VICTORY_RESIDENCY_STATS=1`, every
+    /// `crate::residency::EVERY` frames: the host copies of textures the
+    /// title fills that the placed slots show, by whether a draw sampled
+    /// one of their slots in the last `crate::residency::WINDOW` frames
+    /// (exactly: [`HostHeap::slot_sampled`] and the table-read stamp;
+    /// possibly: a slot that is not a table's lately, in a window in which
+    /// a shader picked views by a computed index), and the slots held for
+    /// room by the same classes; one line (`crate::residency::log`). Each
+    /// lock is taken alone, as by [`HostHeap::placed_slot_census`].
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn residency_census(&self, frame: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.sampler || self.sampled.is_empty() || !crate::residency::due(frame) {
+            return;
+        }
+        let began = std::time::Instant::now();
+        let window = crate::residency::WINDOW;
+        let picked = crate::residency::picked_lately(frame, window);
+        let slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            placed.by_slot.keys().copied().collect()
+        };
+        let keys: Vec<u64> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            slots.iter().map(|&slot| made.get(slot as usize).copied().unwrap_or(0)).collect()
+        };
+        let held: Vec<u32> = {
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            textures.held.keys().copied().collect()
+        };
+        let stamp_of = |slot: u32| self.sampled.get(slot as usize).map_or(0, |s| s.load(Relaxed));
+        let possible = |slot: u32| picked && !self.tabled_lately(slot, frame);
+        // Per host copy: its bytes, the newest stamp of its slots, whether
+        // one of them is possibly sampled.
+        let mut by_copy: std::collections::HashMap<usize, (u64, u32, bool)> = std::collections::HashMap::new();
+        // The copy each key's view shows, found once.
+        let mut copies: std::collections::HashMap<u64, Option<(usize, u64)>> = std::collections::HashMap::new();
+        for (&slot, &key) in slots.iter().zip(&keys) {
+            if key == 0 {
+                continue;
+            }
+            let copy = *copies.entry(key).or_insert_with(|| {
+                view_at(key as u32, (key >> 32) as u32)
+                    .and_then(|view| match view {
+                        View::Placed(false, resource, desc) => crate::resource::texture_at_made(
+                            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                            &resource,
+                        ),
+                        View::Shader(texture, _) => Some(texture as crate::object::This),
+                        _ => None,
+                    })
+                    .and_then(crate::resource::card_copy)
+            });
+            let Some((id, bytes)) = copy else {
+                continue;
+            };
+            let entry = by_copy.entry(id).or_insert((bytes, 0, false));
+            entry.1 = crate::residency::newer(entry.1, stamp_of(slot), frame);
+            entry.2 |= possible(slot);
+        }
+        let summary = crate::residency::aggregate(
+            frame,
+            window,
+            by_copy.into_values(),
+            held.iter().map(|&slot| (stamp_of(slot), possible(slot))),
+        );
+        crate::residency::log(frame, &summary, slots.len() as u64, began.elapsed().as_micros() as u64);
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
@@ -4609,7 +4756,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
                 if let Some(d) = desc.as_mut() {
-                    shift_view_levels(crate::resource::dropped(resource), d);
+                    // With held levels (`crate::resource::held_only`), by
+                    // the level count of the copy in hand: a copy with more
+                    // levels may have taken its place since it was handed
+                    // out (`crate::resource::want_level`), and the view
+                    // must fit the copy it is made of.
+                    let drop = if crate::resource::held_only() {
+                        crate::resource::copy_dropped(resource, texture)
+                    } else {
+                        crate::resource::dropped(resource)
+                    };
+                    shift_view_levels(drop, d);
                 }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
@@ -4807,6 +4964,10 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
+    // Held levels (`VICTORY_HELD_LEVELS=1`): a copy without the level this
+    // view starts at is replaced by one with it. After edsuuu/VI-BR-PORT
+    // 8bb5142d.
+    crate::resource::want_level(texture, crate::resource::first_mip(desc));
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
@@ -5702,6 +5863,55 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(q.room(5), 1);
         assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
+    }
+
+    #[test]
+    fn card_room_preserves_texture_retries_after_a_hold() {
+        let mut q = TextureQueue::default();
+        for index in 1..=4 {
+            q.written(index, 0, 0, false);
+        }
+        let due = q.due(0, 4);
+        for &(index, write) in &due {
+            q.hold(index, write, 4);
+        }
+        assert!(q.due(3, 4).is_empty());
+        assert_eq!(q.due(4, 4), due);
+        for (index, write) in due {
+            match index {
+                1 => q.later(index, write, 4, 8),
+                2 => q.partly(index, write, 8, 4, 4),
+                3 => q.recheck(index, write, 10, (16, 8), 1, 0, 4),
+                _ => q.hold(index, write, 12),
+            }
+        }
+        assert_eq!(q.room(4), 1);
+        let due_slots = |frame| {
+            q.due(frame, 4).into_iter().map(|(index, _)| index)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(due_slots(4), [4].into());
+        assert_eq!(due_slots(5), [1, 4].into());
+        assert_eq!(due_slots(8), [1, 2, 4].into());
+        assert_eq!(due_slots(10), [1, 2, 3, 4].into());
+    }
+
+    #[test]
+    fn card_room_preserves_new_hold_after_stale_retry() {
+        let mut q = TextureQueue::default();
+        q.written(1, 0, 0, false);
+        let old = q.due(0, 1)[0].1;
+        q.hold(1, old, 4);
+        q.written(1, 1, 1, false);
+        let new = q.due(1, 1)[0].1;
+        assert_ne!(old, new);
+        q.hold(1, new, 12);
+        q.later(1, old, 2, 8);
+        q.partly(1, old, 8, 4, 2);
+        q.recheck(1, old, 10, (16, 8), 1, 0, 4);
+        assert!(q.due(3, 1).is_empty());
+        assert_eq!(q.room(3), 1);
+        assert_eq!(q.due(3, 1), [(1, new)]);
     }
 
     /// The slots a draw names are handed out whatever their turn: not due

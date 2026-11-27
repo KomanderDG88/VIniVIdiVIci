@@ -81,6 +81,10 @@ pub extern "system" fn CreateWindowExW(
         )
     };
     hook(hwnd);
+    if parent.is_null() {
+        // The user's own icon, if VICTORY_WINDOW_ICON names one.
+        victory_gpu::window_icon::apply(hwnd);
+    }
     hwnd
 }
 
@@ -107,6 +111,10 @@ pub extern "system" fn CreateWindowExA(
         )
     };
     hook(hwnd);
+    if parent.is_null() {
+        // The user's own icon, if VICTORY_WINDOW_ICON names one.
+        victory_gpu::window_icon::apply(hwnd);
+    }
     hwnd
 }
 

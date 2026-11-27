@@ -1174,6 +1174,19 @@ struct Hosted {
     /// `u32::MAX` before the first. Read by [`dropped`] with
     /// `VICTORY_TEXTURE_SHORT=1` only, without the lock of `made`.
     dropped: std::sync::atomic::AtomicU32,
+    /// Of [`Hosted::dropped`], the levels the copy leaves out because no
+    /// view shows them ([`held_only`]); 0: none for that reason. Written
+    /// under the lock of `made`.
+    held: std::sync::atomic::AtomicU32,
+    /// The lowest level a view asked for while it had no host copy
+    /// ([`want_level`]; `u32::MAX`: none said).
+    wanted: std::sync::atomic::AtomicU32,
+    /// Its host copy took the place of one with fewer levels and was not
+    /// uploaded yet ([`take_grown`]).
+    grown: std::sync::atomic::AtomicBool,
+    /// The card writes it (a copy, a resolve, an alias copy:
+    /// [`card_will_write`]): its host copies hold every level from then on.
+    whole: std::sync::atomic::AtomicBool,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1374,13 +1387,251 @@ pub(crate) fn dropped(this: This) -> u32 {
         return 0;
     }
     let r = resource(this);
-    if texture_short() {
+    if texture_short() || held_only() {
         let made = r.host.dropped.load(std::sync::atomic::Ordering::Acquire);
         if made != u32::MAX {
             return made;
         }
     }
     drop_levels(&r.desc)
+}
+
+/// Whether a texture the title places in memory and fills is held, read
+/// and uploaded from the first level its views show
+/// (`VICTORY_HELD_LEVELS=1`; off by default: whole, as before). Such a
+/// title describes every level of a texture and views it from the first
+/// one it holds; the memory of the larger ones is the next texture's, or
+/// nothing. In edsuuu/VI-BR-PORT 8bb5142d (on by default there) the levels
+/// some slot shows were 1.2 and 1.6 GB of the 6.3 and 6.7 GB of such host
+/// copies in two recorded world frames, and most of what was found
+/// "changed" and uploaded again was other textures' bytes.
+///
+/// The copy leaves out its title's largest levels as a copy of
+/// `VICTORY_TEXTURE_DROP_MIPS` does ([`Hosted::dropped`]): views shift
+/// their levels ([`shift_levels`]), the upload and the write watch take
+/// the held levels' bytes alone (`crate::texture` `staging_layout`), and
+/// copies map their levels ([`host_subresource`]). With
+/// `VICTORY_TEXTURE_DROP_MIPS` (or a copy made short of room) as well, a
+/// copy leaves out the larger of the two counts: those levels are a floor
+/// that no view brings back. A view from a lower level than its copy holds
+/// remakes the copy with more levels ([`want_level`]); a texture the card
+/// writes is held whole from then on ([`card_will_write`]). Not with
+/// levels on demand (`VICTORY_LEVELS_ON_DEMAND`), whose copies number their
+/// levels as the title does.
+#[cfg(windows)]
+pub(crate) fn held_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_HELD_LEVELS").is_some_and(|v| v == "1") && !crate::tiles::wanted();
+        if on {
+            tracing::info!("placed textures held from the first level their views show (VICTORY_HELD_LEVELS=1)");
+        }
+        on
+    })
+}
+
+/// The first level a placed texture's view shows: of views of one 2D
+/// texture (the others show whole textures). The view's description:
+/// format, dimension, mapping, a pad, then the first level. After
+/// victory-amd 4436f8f1, through edsuuu/VI-BR-PORT 8bb5142d.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn first_mip(view: &[u32]) -> u32 {
+    const TEXTURE_2D_VIEW: u32 = 4;
+    match *view {
+        [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
+        _ => 0,
+    }
+}
+
+/// The level from which on a texture of layout `layout` is read for a view
+/// that starts at `first`: the smallest levels share a block and are read
+/// together; 0 where the larger ones lie between the smaller ones
+/// (`victory_formats::texture::Layout::bytes_from` takes all of it).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -> u32 {
+    if layout.slices != 1 || layout.mips.is_empty() {
+        return 0;
+    }
+    let first = first.min(layout.first_tail_mip).min(layout.mips.len() as u32 - 1);
+    if layout.bytes_from(first) < layout.size { first } else { 0 }
+}
+
+/// The levels a held host copy of a `width` by `height` texture of `mips`
+/// levels leaves out for views that start at level `first` of a layout read
+/// from `read` ([`read_from`] of `first`): within whole 4-texel blocks and
+/// a level left ([`levels_to_drop`]), as `VICTORY_TEXTURE_DROP_MIPS`, so
+/// that host level `m` is title level `m + n` texel for texel.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn held_levels_by(width: u64, height: u64, mips: u32, read: u32) -> u32 {
+    levels_to_drop(read, width, height, mips)
+}
+
+/// The views of a texture that start at `firsts` (the slots that show one
+/// now, and the levels asked for before a copy was made): the level the
+/// copy is held from, the lowest of them; `None` if no view said.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn held_first(firsts: impl IntoIterator<Item = u32>) -> Option<u32> {
+    firsts.into_iter().filter(|&f| f != u32::MAX).min()
+}
+
+/// Whether a view that wants a host copy leaving out `asked` levels finds
+/// the copy that leaves out `now` levels, `held` of them because no view
+/// showed them, too short: then the copy is remade with more levels. A
+/// copy held for no view (`held` 0: whole, or short only by
+/// `VICTORY_TEXTURE_DROP_MIPS` or of room) stays, and so does one the card
+/// wrote (`written`): its contents are the host's alone, and are not
+/// uploaded again from title memory (`crate::texture::host_wrote`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn grows(now: u32, held: u32, asked: u32, written: bool) -> bool {
+    held > 0 && !written && asked < now
+}
+
+/// The levels a host copy of title texture description `desc` leaves out
+/// for views that start at `first` ([`held_only`]): only single 2D
+/// textures the title fills, of more than one level and one sample, in a
+/// console layout without an XOR mode (what the upload reads).
+#[cfg(windows)]
+fn held_levels(desc: &ResourceDesc, first: u32) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    if first == 0
+        || !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.mip_levels <= 1
+        || desc.sample_count > 1
+    {
+        return 0;
+    }
+    let Some(t) = texture_layout(desc).filter(|t| t.planes.len() == 1) else {
+        return 0;
+    };
+    let layout = &t.planes[0].layout;
+    if layout.desc.swizzle.xor() {
+        return 0;
+    }
+    held_levels_by(desc.width, u64::from(desc.height), u32::from(desc.mip_levels), read_from(layout, first))
+}
+
+/// The levels of title texture `this` that host copy `texture` of it
+/// leaves out, by the copy's own level count: what a view made of that
+/// copy shifts by, even if another copy took its place meanwhile
+/// ([`want_level`]).
+#[cfg(windows)]
+pub(crate) fn copy_dropped(this: This, texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+    let mips = u32::from(resource(this).desc.mip_levels);
+    if mips <= 1 {
+        return 0;
+    }
+    // SAFETY: a live resource.
+    let own = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+    mips.saturating_sub(own)
+}
+
+/// Host copies replaced by ones with more levels, for as long as a thread
+/// that asked for one may still be about to record its use
+/// ([`host_resource`] hands it out without holding it): when, and the copy.
+/// Let go by [`let_go_idle`].
+#[cfg(windows)]
+static REPLACED: std::sync::Mutex<Vec<(u64, Made)>> = std::sync::Mutex::new(Vec::new());
+
+/// Since the start: host copies held from a later level than the title's
+/// first, and their bytes; host copies replaced by one with more levels.
+/// The memory line says 0 and 2 for its own window (`crate::host`
+/// `video_memory_line`), so that copies remade back and forth show.
+#[cfg(windows)]
+pub(crate) static HELD: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A view of the placed texture `this` that starts at level `first` is made
+/// ([`held_only`]): a host copy without that level is replaced by one with
+/// it, made and filled at the next use. Slots made with the old copy go on
+/// showing it (they hold it) until the new one has been uploaded; then the
+/// texture pass makes them again (`crate::descriptor::host::levels_changed`,
+/// which waits for no submission in flight with
+/// `VICTORY_VIEWS_REMADE_QUIET=1`), so no live slot is rewritten here. A
+/// texture with no copy yet notes the level for when one is made. True if
+/// a copy was replaced.
+#[cfg(windows)]
+pub(crate) fn want_level(this: This, first: u32) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() || !held_only() {
+        return false;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || !r.host.placed.load(Relaxed) {
+        return false;
+    }
+    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    if made.is_none() {
+        r.host.wanted.fetch_min(first, Relaxed);
+        return false;
+    }
+    // Both written under this lock with the copy.
+    let now = r.host.dropped.load(Relaxed);
+    let held = r.host.held.load(Relaxed);
+    let asked = held_levels(&r.desc, first).max(drop_always(&r.desc));
+    if !grows(now, held, asked, crate::texture::host_wrote(this as usize)) {
+        return false;
+    }
+    r.host.wanted.store(first, Relaxed);
+    // Under the lock, as in `let_go_idle`: the next use must not find the
+    // staging state of the old copy.
+    crate::texture::unstage(this);
+    r.host.grown.store(true, Relaxed);
+    HELD[2].fetch_add(1, Relaxed);
+    if let Some(old) = made.take() {
+        REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+    }
+    true
+}
+
+/// The card is about to write title texture `this` (a copy, a resolve, an
+/// alias copy): called before its host copy is asked for, so that what the
+/// card writes lands in a copy of every level ([`held_only`]). A held copy
+/// is replaced by a whole one first: it holds nothing the card wrote (the
+/// first such write grows it, and a texture the card wrote is never held
+/// again), so nothing is lost, and the whole copy is filled from title
+/// memory (a caller whose write leaves levels as they are fills it
+/// first: `crate::texture::fill_before_card_write`). From then on every
+/// copy of `this` is whole. True if a held copy was replaced.
+#[cfg(windows)]
+pub(crate) fn card_will_write(this: This) -> bool {
+    if this.is_null() || !held_only() {
+        return false;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return false;
+    }
+    r.host.whole.store(true, std::sync::atomic::Ordering::Relaxed);
+    want_level(this, 0)
+}
+
+/// The card is about to read subresource `index` of title texture `this`
+/// (a copy's source; `None`: all of it): called before its host copy is
+/// asked for, so that the levels read are in it ([`want_level`]).
+#[cfg(windows)]
+pub(crate) fn card_will_read(this: This, index: Option<u32>) {
+    if this.is_null() || !held_only() {
+        return;
+    }
+    let mips = u32::from(resource(this).desc.mip_levels).max(1);
+    want_level(this, index.map_or(0, |i| i % mips));
+}
+
+/// Whether host copy `texture` of title texture `this` took the place of
+/// one with fewer levels and is uploaded now for the first time: once.
+/// (The copy's own level count is asked, so that an upload into the old
+/// copy, recorded by a thread that had it in hand, does not count.)
+#[cfg(windows)]
+pub(crate) fn take_grown(this: This, texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() || !held_only() {
+        return false;
+    }
+    let r = resource(this);
+    r.host.grown.load(Relaxed)
+        && copy_dropped(this, texture) == r.host.dropped.load(Relaxed)
+        && r.host.grown.swap(false, Relaxed)
 }
 
 #[cfg(windows)]
@@ -1646,8 +1897,27 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
+        // The levels no view shows (`held_only`), of the slots shaders
+        // pick by index that show the texture now and of the views asked
+        // for before: on top of `drop`, never below it. Not for a texture
+        // the card writes (`card_will_write`), nor one made level by level
+        // (levels on demand is off with it).
+        let mut held = 0;
+        if tiled.is_none()
+            && held_only()
+            && r.host.placed.load(Relaxed)
+            && !r.host.whole.load(Relaxed)
+            && !crate::texture::host_wrote(this as usize)
+        {
+            let viewed = crate::descriptor::host::first_viewed(r.data() as u64);
+            if let Some(first) = held_first([r.host.wanted.load(Relaxed), viewed.unwrap_or(u32::MAX)]) {
+                held = held_levels(&r.desc, first).saturating_sub(drop);
+            }
+        }
+        let drop = drop + held;
         let texture = match texture {
             Some(texture) => Ok(texture),
+            None if held > 0 => host_texture_from(&r.desc, r.host.state, clear, drop),
             None => host_texture(&r.desc, r.host.state, clear),
         };
         let texture = match texture {
@@ -1685,6 +1955,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // Before the copy is there to be found: what it leaves out
         // ([`dropped`]; a tiled copy leaves out none, `shape_fits`).
         r.host.dropped.store(if tiled.is_some() { 0 } else { drop }, std::sync::atomic::Ordering::Release);
+        r.host.held.store(held, Relaxed);
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = match tiled {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
@@ -1700,6 +1971,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        if held > 0 {
+            HELD[0].fetch_add(1, Relaxed);
+            HELD[1].fetch_add(host.bytes, Relaxed);
+        }
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -2121,6 +2396,21 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
+    // Copies replaced by ones with more levels (`want_level`), as any let
+    // go: once no thread that had one in hand can still be about to record
+    // its use. Lists and slots that hold one keep it past that.
+    {
+        let mut replaced = REPLACED.lock().unwrap_or_else(|e| e.into_inner());
+        if !replaced.is_empty() {
+            let (gone, keep): (Vec<_>, Vec<_>) =
+                replaced.drain(..).partition(|(at, _)| crate::host::long_ago(*at, 1000, IDLE_FRAMES));
+            *replaced = keep;
+            drop(replaced);
+            for (_, made) in gone {
+                crate::host::retire(made);
+            }
+        }
+    }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
@@ -2144,6 +2434,8 @@ pub(crate) fn let_go_idle() {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
+                // The next copy is held from what its views show then.
+                r.host.wanted.store(u32::MAX, Relaxed);
                 made.take()
             } else {
                 None
@@ -2448,6 +2740,31 @@ fn host_texture_as(
     clear: *const c_void,
     reserved: bool,
 ) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+    host_texture_with(desc, state, clear, reserved, drop_levels(desc))
+}
+
+/// [`host_texture`] of a copy that leaves out the title's `drop` largest
+/// levels, as the caller counted them ([`held_only`]: those no view shows
+/// as well as [`drop_levels`]).
+#[cfg(windows)]
+fn host_texture_from(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    drop: u32,
+) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+    host_texture_with(desc, state, clear, false, drop)
+}
+
+/// [`host_texture_as`], leaving out `drop` levels.
+#[cfg(windows)]
+fn host_texture_with(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    reserved: bool,
+    drop: u32,
+) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2458,7 +2775,6 @@ fn host_texture_as(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
-    let drop = drop_levels(desc);
     if drop > 0 {
         d.width >>= drop;
         d.height >>= drop;
@@ -2614,6 +2930,14 @@ impl OnDemand {
         if waiting {
             crate::tiles::STATS[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // `VICTORY_RESIDENCY=1`: levels let go of with tiles are taken back
+        // by a later submission ([`give_back_loose`]).
+        if crate::residency::on() && tiled.loose() != 0 {
+            LOOSE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(std::sync::Arc::as_ptr(&self.0) as usize, Loose(std::sync::Arc::downgrade(&self.0)));
+        }
         waiting
     }
 
@@ -2623,6 +2947,77 @@ impl OnDemand {
             && tiled.card_wrote(&self.0.texture, levels)
         {
             crate::descriptor::host::levels_changed(memory);
+        }
+    }
+}
+
+/// Diagnostics (`crate::residency`): the host copy of title texture `this`,
+/// if it is made and filled from title memory: its address (a key) and the
+/// card's bytes it holds now (the tiles given, for one made level by level).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn card_copy(this: This) -> Option<(usize, u64)> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, _) = hosted(this, false)?;
+    if !host.filled {
+        return None;
+    }
+    let bytes = host.tiled.as_ref().map_or(host.bytes, crate::tiles::Tiled::given_bytes);
+    Some((std::sync::Arc::as_ptr(&host) as usize, bytes))
+}
+
+/// A host copy made level by level with levels let go of that still have
+/// tiles ([`give_back_loose`]); it does not keep the copy alive.
+#[cfg(windows)]
+struct Loose(std::sync::Weak<HostTexture>);
+
+// SAFETY: as for `OnDemand`: the host texture is named only in queue calls,
+// which any thread may make, and what it has been given is behind a lock.
+#[cfg(windows)]
+unsafe impl Send for Loose {}
+
+/// `VICTORY_RESIDENCY=1`: the host copies whose last upload found levels
+/// with tiles let go of, by address.
+#[cfg(windows)]
+static LOOSE: std::sync::Mutex<std::collections::BTreeMap<usize, Loose>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// `VICTORY_RESIDENCY=1`, on the submitting thread as a submission starts,
+/// ahead of its lists: the tiles of the levels the title let go of are
+/// taken away on `queue` (`crate::tiles::Tiled::take_back_on`, at most
+/// [`crate::residency::CALLS_A_PASS`] calls), and retired: they go back to
+/// the pool once that submission has finished. Copies whose levels wait
+/// (their upload has not finished, a write of the card's is recorded) stay
+/// for the next pass.
+#[cfg(windows)]
+pub(crate) fn give_back_loose(queue: &windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue) {
+    let entries = std::mem::take(&mut *LOOSE.lock().unwrap_or_else(|e| e.into_inner()));
+    if entries.is_empty() {
+        return;
+    }
+    let finished = crate::host::submissions_finished();
+    let mut calls = crate::residency::CALLS_A_PASS;
+    let mut later = Vec::new();
+    for (key, loose) in entries {
+        let Some(host) = loose.0.upgrade() else {
+            continue;
+        };
+        let Some(tiled) = &host.tiled else {
+            continue;
+        };
+        let (left, returned) = tiled.take_back_on(queue, &host.texture, true, finished, &mut calls);
+        if let Some(returned) = returned {
+            crate::host::retire(returned);
+        }
+        if left == crate::tiles::TakeBack::Later {
+            later.push((key, loose));
+        }
+    }
+    if !later.is_empty() {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, loose) in later {
+            map.entry(key).or_insert(loose);
         }
     }
 }
@@ -2700,6 +3095,10 @@ fn hand_out_resource(
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             dropped: std::sync::atomic::AtomicU32::new(u32::MAX),
+            held: std::sync::atomic::AtomicU32::new(0),
+            wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
+            grown: std::sync::atomic::AtomicBool::new(false),
+            whole: std::sync::atomic::AtomicBool::new(false),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -4919,5 +5318,273 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// Held levels (`VICTORY_HELD_LEVELS`): a view's first level is word 4
+    /// of a 2D view's description; other views show the whole texture.
+    #[test]
+    fn the_first_level_shown_is_that_of_2d_views() {
+        assert_eq!(first_mip(&[98, 4, 0, 0, 3, 6, 0, 0, 0, 0]), 3);
+        assert_eq!(first_mip(&[98, 4, 0, 0, 40, 6, 0, 0, 0, 0]), 15);
+        assert_eq!(first_mip(&[98, 9, 0, 0, 3, 6, 0, 0, 0, 0]), 0, "a cube shows all of it");
+        assert_eq!(first_mip(&[98, 4]), 0);
+    }
+
+    /// Held levels: a copy for views from level `first` leaves out the
+    /// levels before it that the memory read from `first` on holds alone,
+    /// in whole blocks, with a level left; with `VICTORY_TEXTURE_DROP_MIPS`
+    /// as a floor (`hosted` adds the held levels above it).
+    #[test]
+    fn a_copy_is_held_from_the_level_viewed() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let desc = |swizzle| Desc {
+            dimension: Dimension::Tex2d,
+            width: 1024,
+            height: 1024,
+            depth: 1,
+            mips: 9,
+            element_bytes: 8,
+            block: 4,
+            samples: 1,
+            swizzle,
+        };
+        for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_64KB_S] {
+            let l = Layout::new(&desc(swizzle)).unwrap();
+            assert_eq!(read_from(&l, 0), 0);
+            for first in 1..=l.first_tail_mip.min(8) {
+                let read = read_from(&l, first);
+                assert_eq!(read, first, "{swizzle:?}");
+                assert!(l.bytes_from(read) < l.size);
+                assert_eq!(held_levels_by(1024, 1024, 9, read), first.min(8));
+            }
+            // Past the tail's first level, the tail is read whole.
+            assert!(read_from(&l, 8) <= l.first_tail_mip);
+            // Slices each hold their chain: read whole.
+            let array = Layout::new(&Desc { depth: 2, ..desc(swizzle) }).unwrap();
+            assert_eq!(read_from(&array, 3), 0);
+        }
+        // Whole 4-texel blocks and a level left, as the levels dropped.
+        assert_eq!(held_levels_by(256, 256, 9, 2), 2);
+        assert_eq!(held_levels_by(300, 300, 9, 2), 0, "300 is not halved into whole blocks");
+        assert_eq!(held_levels_by(1024, 1024, 2, 5), 1, "a level is left");
+        assert_eq!(held_levels_by(64, 64, 7, 6), 4);
+        // DROP_MIPS=1 under views from level 3: the copy leaves out 3, the
+        // larger count (`hosted`: drop + held levels above it).
+        let (floor, held) = (1u32, held_levels_by(2048, 2048, 12, 3));
+        assert_eq!(floor + held.saturating_sub(floor), 3);
+        // Under views from level 0 it leaves out the floor alone.
+        let held = held_levels_by(2048, 2048, 12, 0);
+        assert_eq!(floor + held.saturating_sub(floor), 1);
+    }
+
+    /// Held levels: a later view of a lower level remakes the copy with
+    /// more levels; one of the same or a higher level keeps it. A copy the
+    /// card wrote is never remade (its contents are the host's alone, and a
+    /// texture the host wrote is not uploaded again from title memory), and
+    /// the card's first write, which asks for level 0 before the copy is
+    /// asked for (`card_will_write`), finds a held copy remade whole first:
+    /// so no remade copy ever drops what the card wrote. Copies held for no
+    /// view (whole, or short by `VICTORY_TEXTURE_DROP_MIPS` or of room)
+    /// stay as they are.
+    #[test]
+    fn a_later_view_of_a_lower_level_remakes_the_copy_with_more_levels() {
+        // 256x256 in 9 levels, held from level 2 (7 levels on the host).
+        let held = held_levels_by(256, 256, 9, 2);
+        assert_eq!(held, 2);
+        assert!(!grows(held, held, held_levels_by(256, 256, 9, 5), false), "a view of level 5");
+        assert!(!grows(held, held, held_levels_by(256, 256, 9, 2), false), "a view of level 2");
+        let asked = held_levels_by(256, 256, 9, 0);
+        assert!(grows(held, held, asked, false), "a view of level 0");
+        assert!(9 - asked > 9 - held, "the copy that takes its place has more levels");
+        assert!(grows(held, held, held_levels_by(256, 256, 9, 1), false), "a view of level 1");
+        // The card's first write asks for level 0 while not yet written.
+        assert!(grows(held, held, 0, false));
+        // Once written, never remade.
+        assert!(!grows(held, held, 0, true));
+        // Not held: whole, or short by DROP_MIPS alone.
+        assert!(!grows(0, 0, 0, false));
+        assert!(!grows(1, 0, 0, false));
+        // DROP_MIPS=1 and held from 3 (4 left out): a view of level 0 asks
+        // for the floor, 1, and is remade down to it, not below.
+        assert!(grows(4, 3, 1, false));
+        assert!(!grows(1, 0, 1, false));
+    }
+
+    /// Held levels: views of one texture from different levels are all
+    /// valid on one copy at once, held from the lowest level any of them
+    /// (or a view asked for before the copy was made) starts at.
+    #[test]
+    fn views_from_several_levels_share_a_copy_from_the_lowest() {
+        assert_eq!(held_first([u32::MAX, u32::MAX]), None);
+        assert_eq!(held_first([4, u32::MAX]), Some(4));
+        assert_eq!(held_first([4, 2]), Some(2));
+        assert_eq!(held_first([1, 3]), Some(1));
+        // 1024x1024 in 11 levels: views from 2 and from 4; the copy leaves
+        // out 2 and has 9 levels.
+        let drop = held_levels_by(1024, 1024, 11, held_first([4, 2]).unwrap());
+        assert_eq!(drop, 2);
+        let host_levels = 11 - drop;
+        let shown = |first: u32, levels: u32| {
+            let (mut f, mut l, mut c) = (first, levels, 0.0f32);
+            shift_levels(drop, &mut f, &mut l, &mut c);
+            (f, l)
+        };
+        for (first, levels) in [(2, 9), (4, 7), (4, u32::MAX), (2, 1)] {
+            let (f, l) = shown(first, levels);
+            assert!(f < host_levels, "view from {first}: host level {f} of {host_levels}");
+            assert!(l == u32::MAX || f + l <= host_levels, "view from {first}: {l} levels from {f}");
+        }
+        // Each shows its own texels: title level 4 is host level 2.
+        assert_eq!(shown(4, 7), (2, 7));
+        assert_eq!(shown(2, 9), (0, 9));
+        // A later view from level 3 needs no other copy; one from 1 does.
+        assert!(!grows(drop, drop, held_levels_by(1024, 1024, 11, 3), false));
+        assert!(grows(drop, drop, held_levels_by(1024, 1024, 11, 1), false));
+    }
+
+    /// Held levels on the host (`VICTORY_HELD_LEVELS=1` and a host GPU, or
+    /// nothing is checked): a placed texture viewed from level 2 has a host
+    /// copy of that level and the smaller ones; a view of level 5 keeps it,
+    /// a view of level 0 replaces it with one of every level, and the card's
+    /// writes keep it whole. After edsuuu/VI-BR-PORT 8bb5142d.
+    #[cfg(windows)]
+    #[test]
+    fn a_placed_texture_is_kept_from_the_level_viewed() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() || !held_only() {
+            return;
+        }
+        // 256x256 BC7, nine levels, 4 KiB blocks.
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap();
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let texture = texture_at(at as u64, &desc).unwrap();
+        assert!(!want_level(texture, 2), "no copy yet: noted");
+        let copy = host_copy(texture).unwrap();
+        // SAFETY: a live texture.
+        let d = unsafe { copy.texture.GetDesc() };
+        assert_eq!((d.Width, d.Height, d.MipLevels), (64, 64, 7));
+        assert_eq!((dropped(texture), copy_dropped(texture, &copy.texture)), (2, 2));
+        assert!(!want_level(texture, 5));
+        assert!(std::sync::Arc::ptr_eq(&host_copy(texture).unwrap(), &copy));
+        assert!(want_level(texture, 0));
+        let more = host_copy(texture).unwrap();
+        // SAFETY: as above.
+        let d = unsafe { more.texture.GetDesc() };
+        assert_eq!((d.Width, d.MipLevels), (256, 9));
+        assert!(!std::sync::Arc::ptr_eq(&more, &copy));
+        // The old copy is still whole for whoever holds it, and still says
+        // what its views shift by.
+        assert_eq!(copy_dropped(texture, &copy.texture), 2);
+        assert_eq!(copy_dropped(texture, &more.texture), 0);
+        // Written by the card: whole, and no view makes it held again.
+        assert!(!card_will_write(texture));
+        assert!(!want_level(texture, 3));
+        assert!(std::sync::Arc::ptr_eq(&host_copy(texture).unwrap(), &more));
+    }
+
+    /// Held levels on the host (`VICTORY_HELD_LEVELS=1` and a host GPU, or
+    /// nothing is checked): a slot made with the old copy (its `Kept`, a
+    /// reference to the copy's texture) still has it, alive and as it was
+    /// uploaded, after a view of a lower level replaced the copy
+    /// (`want_level`: into `REPLACED`) and after `let_go_idle` let
+    /// `REPLACED` go (a second and four frames later): only the slot's
+    /// letting go frees it.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_slot_keeps_the_old_held_copy_after_it_is_replaced_and_let_go() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !held_only() {
+            return;
+        }
+        // 256x256 BC7, nine levels, 4 KiB blocks; every byte 0x5a, so that
+        // each level the host holds reads 0x5a whatever its tiling.
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap();
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        // SAFETY: the `whole` bytes just committed.
+        unsafe { std::ptr::write_bytes(at.cast::<u8>(), 0x5a, whole as usize) };
+        let texture = texture_at(at as u64, &desc).unwrap();
+        assert!(!want_level(texture, 2), "no copy yet: noted");
+        let copy = host_copy(texture).unwrap();
+        // SAFETY: a live texture.
+        assert_eq!(unsafe { copy.texture.GetDesc() }.MipLevels, 7);
+        // The first row of blocks of a read back's first level.
+        let first_row = |readback: &ID3D12Resource, rows: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            let len = rows.Footprint.Width as usize / 4 * 16;
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: a finished copy of at least one row of blocks.
+            unsafe {
+                readback.Map(0, None, Some(&mut mapped)).unwrap();
+                let row = std::slice::from_raw_parts(mapped.cast::<u8>().add(rows.Offset as usize), len).to_vec();
+                readback.Unmap(0, None);
+                row
+            }
+        };
+        // Uploaded and read back while it is the texture's copy.
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, texture, &copy.texture);
+        crate::list::ensure_state(&list, texture, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, &copy.texture).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        drop(list);
+        let uploaded = first_row(&readback, &rows);
+        assert!(uploaded.iter().all(|&b| b == 0x5a), "title level 2 as host level 0");
+        // The slot made with it: its `Kept`.
+        let kept: ID3D12Resource = copy.texture.clone();
+        let state = copy.state.load(Relaxed);
+        let old = std::sync::Arc::downgrade(&copy);
+        drop(copy);
+        let replaced = |old: &std::sync::Weak<HostTexture>| {
+            REPLACED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(_, (host, _))| std::ptr::eq(std::sync::Arc::as_ptr(host), old.as_ptr()))
+        };
+        // A view of level 0: the copy is replaced, the old one waits.
+        assert!(want_level(texture, 0));
+        assert!(replaced(&old), "the old copy waits in REPLACED");
+        let more = host_copy(texture).unwrap();
+        // SAFETY: a live texture.
+        assert_eq!(unsafe { more.texture.GetDesc() }.MipLevels, 9);
+        assert_eq!(copy_dropped(texture, &kept), 2, "the slot's views still shift by 2");
+        // A second and four frames on, the sweep lets REPLACED go.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        crate::frame::begin_frames(4);
+        let_go_idle();
+        assert!(!replaced(&old), "let go by let_go_idle");
+        if old.upgrade().is_none() {
+            // Retired at once (no submission was running): the slot alone.
+            assert_eq!(crate::host::references(&kept), 1);
+        }
+        // SAFETY: a live texture.
+        let d = unsafe { kept.GetDesc() };
+        assert_eq!((d.Width, d.Height, d.MipLevels), (64, 64, 7));
+        // Still readable, and as it was uploaded.
+        let list = host.new_list().unwrap();
+        let from = crate::host::legal_state(&kept, state);
+        let to = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        if from != to {
+            let barrier = crate::host::transition(&kept, D3D12_RESOURCE_STATES(from as i32), D3D12_RESOURCE_STATES(to as i32));
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, &kept).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        drop(list);
+        assert_eq!(first_row(&readback, &rows), uploaded, "the kept copy reads as uploaded");
+        // The slot lets go: nothing else held it.
+        drop(kept);
+        drop(more);
     }
 }

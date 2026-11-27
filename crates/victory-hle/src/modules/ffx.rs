@@ -7,7 +7,9 @@
 //! translate: its output stayed black. `ffxDispatch` alone is taken here:
 //! an upscale dispatch becomes a plain stretch of the colour input
 //! (`victory_gpu::list::upscale_stretch`); anything else, and an upscale we
-//! could not stretch, goes to the title's DLL.
+//! could not stretch, goes to the title's DLL. With `VICTORY_FIDELITYFX_DIR`
+//! naming the host's PC upscaler, the whole DLL is served by it instead
+//! ([`super::fidelityfx`]) and nothing here is bound.
 //!
 //! The structures are the public FidelityFX API's (`ffx_api.h`,
 //! `ffx_upscale.h`): a header of a type and a next pointer, and resources of

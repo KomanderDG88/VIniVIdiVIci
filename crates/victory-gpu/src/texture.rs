@@ -289,6 +289,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
+    // Every level is copied: a placed copy held from a later level is
+    // made whole first (`crate::resource::card_will_write`), and filled
+    // once all the same: that upload makes the slots that show the old
+    // copy again (`crate::resource::take_grown`).
+    if crate::resource::card_will_write(placed) {
+        fill_before_card_write(list, placed);
+    }
     // Host copies with other levels than each other's: filled from title
     // memory instead (`crate::resource::drop_levels`).
     if crate::resource::dropped(placed) != crate::resource::dropped(source) {
@@ -954,6 +961,16 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+    // A host copy that took the place of one with fewer levels
+    // (`crate::resource::want_level`): the slots that show the old one are
+    // made again by the texture pass once this upload is submitted
+    // (`crate::descriptor::host::levels_changed`; with
+    // `VICTORY_VIEWS_REMADE_QUIET=1` only while no submission is in
+    // flight). Until then they show the old copy, which they hold.
+    if crate::resource::take_grown(resource, texture) {
+        let start = staging.memory as u64;
+        list.defer_host(move || crate::descriptor::host::levels_changed(start));
+    }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
@@ -993,7 +1010,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// step. A list that is reset without having been submitted gives the
 /// claim up, or the next list that writes those levels would send no zeros
 /// and what its write does not cover would be what the tiles' last owner
-/// left.
+/// left. It also holds the texture's levels from being taken back
+/// (`crate::tiles::Tiled::pend`) until the step has run or the list is
+/// reset.
 struct Claimed {
     on_demand: crate::resource::OnDemand,
     fresh: u32,
@@ -1002,11 +1021,14 @@ struct Claimed {
 
 impl Drop for Claimed {
     fn drop(&mut self) {
-        if self.fresh != 0
-            && !*self.ran.get_mut()
-            && let Some(tiled) = self.on_demand.tiled()
-        {
-            tiled.unclaim(self.fresh);
+        if *self.ran.get_mut() {
+            return;
+        }
+        if let Some(tiled) = self.on_demand.tiled() {
+            if self.fresh != 0 {
+                tiled.unclaim(self.fresh);
+            }
+            tiled.unpend();
         }
     }
 }
@@ -1036,6 +1058,10 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     if levels == 0 {
         return;
     }
+    // Before the claim: no level of the texture is taken back
+    // (`VICTORY_RESIDENCY`) while this list is recorded and not submitted,
+    // for it sends no zeros into a level that has tiles now.
+    tiled.pend();
     let fresh = tiled.claim(levels);
     // Of them, the ones whose zeros could not be recorded.
     let mut unzeroed = if host().is_none() { fresh } else { 0 };
@@ -1088,6 +1114,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     }
     let levels = levels & !unzeroed;
     if levels == 0 {
+        tiled.unpend();
         return;
     }
     let memory = crate::resource::texture_memory(resource).map_or(0, |(memory, _)| memory as u64);
@@ -1099,6 +1126,9 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     list.defer_host(move || {
         step.ran.store(true, std::sync::atomic::Ordering::Relaxed);
         step.on_demand.card_wrote(levels, memory);
+        if let Some(tiled) = step.on_demand.tiled() {
+            tiled.unpend();
+        }
     });
 }
 
@@ -1519,6 +1549,24 @@ impl Staging {
     }
 }
 
+/// The host copy of `resource` was made whole in place of a held one just
+/// before the card writes it (`crate::resource::card_will_write`): filled
+/// from title memory first, in this list and ahead of the card's write, so
+/// that the levels the write leaves alone hold what the held copy held
+/// (and the ones it did not), and so that the slots that show the old copy
+/// are made again after it ([`upload`]). A list that already brought the
+/// old copy up to date uploads the new one all the same.
+pub(crate) fn fill_before_card_write(list: &HostList, resource: This) {
+    let Some(texture) = crate::resource::host_resource(resource) else {
+        return;
+    };
+    if !title_written(texture) {
+        return;
+    }
+    list.use_again(resource as usize);
+    upload(list, resource, texture);
+}
+
 /// Lets go of a title texture's staging buffer (lists that recorded an
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
@@ -1794,9 +1842,18 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
+    // Held levels (`crate::resource::held_only`): the levels of the copy in
+    // hand. Another copy may have taken the place of the one a kept
+    // staging state was made for (`crate::resource::want_level`); that
+    // state is kept only for a copy of as many levels.
+    let held = crate::resource::held_only();
+    // SAFETY: a live resource.
+    let own_mips = held.then(|| u32::from(unsafe { texture.GetDesc() }.MipLevels));
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
+    if let Some(s) = map.get(&(resource as usize))
+        && own_mips.is_none_or(|mips| mips == s.mips)
+    {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -1850,7 +1907,14 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // The levels its host copy leaves out: that copy's own count, which for
     // a copy made short of room (`crate::resource::ShortOfRoom`) is not the
     // description's alone. (Takes no lock.)
-    let (layout, first_mip) = staging_layout(layout, crate::resource::dropped(resource));
+    // With held levels, by the copy's own level count: what the views made
+    // of it shift by as well.
+    let drop = if held {
+        crate::resource::copy_dropped(resource, texture)
+    } else {
+        crate::resource::dropped(resource)
+    };
+    let (layout, first_mip) = staging_layout(layout, drop);
     let s = Arc::new(Staging {
         mem: Mutex::new(Some((buffer, data as usize, pooled))),
         #[cfg(feature = "diagnostics")]
@@ -1875,6 +1939,54 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod held_levels_tests {
+    use super::staging_layout;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+
+    /// Held levels (`VICTORY_HELD_LEVELS`): a texture viewed from level `N`
+    /// is read from the start of its memory up to what levels `N` on take
+    /// (the rest is another texture's, here 0xee), and its host levels
+    /// `0..` are title levels `N..`, texel for texel the whole texture's.
+    #[test]
+    fn a_copy_held_from_a_level_reads_those_levels_as_the_whole_texture() {
+        for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_64KB_S] {
+            let whole = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 1024,
+                height: 1024,
+                depth: 1,
+                mips: 9,
+                element_bytes: 8,
+                block: 4,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap();
+            let tiled: Vec<u8> = (0..whole.size).map(|i| ((i * 7) >> 3) as u8).collect();
+            for first in 1..=whole.first_tail_mip.min(8) {
+                let read = crate::resource::read_from(&whole, first);
+                let (held, rest) = staging_layout(whole.clone(), read);
+                assert_eq!(rest, 0);
+                assert_eq!(held.desc.mips, 9 - read);
+                assert_eq!(held.mips.len() as u32, 9 - read);
+                assert!(whole.bytes_from(read) <= held.size && held.size < whole.size, "{swizzle:?} from {read}");
+                let mut memory = tiled.clone();
+                memory[held.size as usize..].fill(0xee);
+                for mip in 0..9 - read {
+                    let m = held.mips[mip as usize];
+                    let pitch = m.width as usize * 8;
+                    let len = pitch * m.height as usize;
+                    let (mut ours, mut title) = (vec![0u8; len], vec![0u8; len]);
+                    held.detile(&memory[..held.size as usize], mip, 0, &mut ours, pitch, len).unwrap();
+                    whole.detile(&tiled, mip + read, 0, &mut title, pitch, len).unwrap();
+                    assert!(ours == title, "{swizzle:?} held from {read}: host level {mip}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

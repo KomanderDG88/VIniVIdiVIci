@@ -73,6 +73,7 @@ pub(crate) fn enabled() -> bool {
             return false;
         }
         victory_gpu::use_recorded_pages(host_pages);
+        victory_gpu::recorded::use_untouched_pages(untouched_pages);
         tracing::info!(
             "page-mapping copies into the title's placeholder reservations are recorded, and a page is mapped only \
              when the processor touches it (VICTORY_LAZY_REMAP=1)"
@@ -114,6 +115,42 @@ struct Record {
     /// addresses recorded. A release or reuse of part of one ends that
     /// part.
     extents: BTreeMap<usize, usize>,
+    /// The write generations of the section pages recorded pages show
+    /// ([`Gens`]).
+    gens: Gens,
+}
+
+/// The next write generation: one number for the whole process, so that two
+/// section pages, or one before and after a touch, never share one.
+static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// By section page ([`Entry::key`]), a number that changes whenever the
+/// page's bytes may have been stored to with no fault of a recorded page's:
+/// a recorded page showing it was given a view ([`map_one`]: the processor
+/// touched it, or a system call was to write it). While a recorded page has
+/// no view, any access to it faults; so a host copy that took it at one
+/// generation needs nothing again while the generation stands, and the GPU
+/// side's guards count it clean (`victory_gpu::watch`, [`untouched_pages`]).
+/// Writes that never fault here (through other views, the runtime's own,
+/// the stable view) are told to the guards by their own paths.
+#[derive(Default)]
+struct Gens(HashMap<(usize, usize), u64>);
+
+impl Gens {
+    /// The generation of section page `key`, a new one if none was given.
+    fn of(&mut self, key: (usize, usize)) -> u64 {
+        *self.0.entry(key).or_insert_with(|| NEXT_GEN.fetch_add(1, Relaxed))
+    }
+
+    /// Section page `key` may be stored to from now on: a new generation.
+    fn touched(&mut self, key: (usize, usize)) {
+        self.0.insert(key, NEXT_GEN.fetch_add(1, Relaxed));
+    }
+
+    /// No recorded page shows `key` any more.
+    fn forget(&mut self, key: (usize, usize)) {
+        self.0.remove(&key);
+    }
 }
 
 static RECORD: LazyLock<Mutex<Record>> = LazyLock::new(Mutex::default);
@@ -250,6 +287,7 @@ fn take(r: &mut Record, page: usize) -> Option<Entry> {
         at.retain(|&a| a != page);
         if at.is_empty() {
             r.shown.remove(&key);
+            r.gens.forget(key);
         }
     }
     Some(entry)
@@ -364,6 +402,12 @@ fn map_one(r: &mut Record, page: usize) -> bool {
     }
     if let Some(entry) = r.pages.get_mut(&page) {
         entry.viewed = true;
+        // Its section page can be stored to through this view from now on
+        // with no fault: the copies that took it untouched take it again
+        // (before the faulting store goes on, under the record's lock). The
+        // page's other addresses the caller tells once the lock is let go
+        // ([`tell_viewed`]).
+        r.gens.touched(entry.key());
     }
     count(C::TouchViews, 1);
     count(C::Us, started.elapsed().as_micros() as u64);
@@ -392,7 +436,27 @@ fn touch(at: usize, write: bool) -> Touch {
         // made read-only is the guard's.
         return if allowed(at, write) { Touch::Allowed } else { Touch::No };
     }
-    if map_one(&mut r, page) { Touch::Mapped } else { Touch::No }
+    let mapped = map_one(&mut r, page);
+    drop(r);
+    if !mapped {
+        return Touch::No;
+    }
+    tell_viewed(&[page]);
+    Touch::Mapped
+}
+
+/// Recorded pages [`map_one`] has just given views, for the GPU side's
+/// guards, before the store that faulted (or the system call's write) goes
+/// on: their section pages can be stored to through those views now with
+/// no fault of ours, so every other address of each (a guarded view
+/// counted clean, a recorded page counted untouched) is told written
+/// (`victory_gpu::title_memory_viewed`). The [`Gens`] bump alone reached
+/// the untouched recorded pages only. Called with the record's lock let go:
+/// the guards' lock comes before it.
+fn tell_viewed(pages: &[usize]) {
+    for &page in pages {
+        victory_gpu::title_memory_viewed(page, PAGE);
+    }
 }
 
 /// Whether the memory at `at` allows the access now.
@@ -525,7 +589,17 @@ pub(crate) fn materialize(at: usize, len: usize) -> bool {
     let (first, end) = (at & !(PAGE - 1), at.saturating_add(len));
     let mut r = record();
     let due: Vec<usize> = r.pages.range(first..end).filter(|(_, e)| !e.viewed).map(|(&p, _)| p).collect();
-    due.into_iter().all(|page| map_one(&mut r, page))
+    let mut viewed = Vec::with_capacity(due.len());
+    let all = due.into_iter().all(|page| {
+        let mapped = map_one(&mut r, page);
+        if mapped {
+            viewed.push(page);
+        }
+        mapped
+    });
+    drop(r);
+    tell_viewed(&viewed);
+    all
 }
 
 /// The section page `at` shows, eager view or recorded page.
@@ -798,6 +872,20 @@ fn host_pages(at: usize, len: usize) -> Vec<victory_gpu::HostPage> {
             Some(victory_gpu::HostPage { at: page, ptr, keep: section })
         })
         .collect()
+}
+
+/// For the GPU side's guards (`victory_gpu::recorded::untouched`): the
+/// recorded pages under `[at, at + len)` that have no view, with the write
+/// generation of the section page each shows ([`Gens`]), in address order.
+fn untouched_pages(at: usize, len: usize) -> Vec<(usize, u64)> {
+    if !maybe_recorded(at, len) {
+        return Vec::new();
+    }
+    let (first, end) = (at & !(PAGE - 1), at.saturating_add(len));
+    let mut r = record();
+    let found: Vec<(usize, (usize, usize))> =
+        r.pages.range(first..end).filter(|(_, e)| !e.viewed).map(|(&page, e)| (page, e.key())).collect();
+    found.into_iter().map(|(page, key)| (page, r.gens.of(key))).collect()
 }
 
 /// What a query of `address` would answer on the eager path, from the

@@ -142,7 +142,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -924,6 +924,12 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        // A source that flights in the air write: also on the card, behind
+        // them, so that the submission need not settle them to read it
+        // (`VICTORY_CARD_READ_COPY=1`).
+        if list.copy_after_flights(to, from, len as usize) {
+            return;
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -970,6 +976,15 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         };
         // A copy on the card may write a buffer: no indirect draw after it joins a window before it.
         crate::indirect::end_window(list);
+        // Held levels (`VICTORY_HELD_LEVELS=1`): every level is read and
+        // written, so both host copies hold every level. A destination
+        // made whole in place of a held copy is filled first all the same
+        // (once): its upload is what makes the slots that show the old copy
+        // again.
+        if crate::resource::card_will_write(dst) {
+            crate::texture::fill_before_card_write(list, dst);
+        }
+        crate::resource::card_will_read(src, None);
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1114,6 +1129,16 @@ extern "system" fn copy_texture_region(
         // A copy on the card (textures, or texels read back into a buffer of ours): no indirect draw after it joins
         // a window before it (conservative: none of these writes an argument buffer).
         crate::indirect::end_window(list);
+        // Held levels (`VICTORY_HELD_LEVELS=1`): a destination texture is
+        // written by the card, so its host copy holds every level, filled
+        // first where it was held (the copy writes one subresource); the
+        // source's copy holds the level read.
+        if dst.kind != FOOTPRINT && crate::resource::card_will_write(dst.resource) {
+            crate::texture::fill_before_card_write(list, dst.resource);
+        }
+        if src.kind != FOOTPRINT {
+            crate::resource::card_will_read(src.resource, Some(src.footprint.offset as u32));
+        }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1364,6 +1389,17 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    // Held levels (`VICTORY_HELD_LEVELS=1`): as for a copy, before the
+    // host copies are asked for.
+    #[cfg(windows)]
+    if crate::resource::held_only()
+        && let Some(list) = host_list(this)
+    {
+        if crate::resource::card_will_write(dst) {
+            crate::texture::fill_before_card_write(list, dst);
+        }
+        crate::resource::card_will_read(src, Some(src_sub));
+    }
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (

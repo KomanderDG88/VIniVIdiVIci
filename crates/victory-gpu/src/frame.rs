@@ -94,6 +94,29 @@ pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
+/// Taken by tests that begin frames or count them: frames begun by one
+/// ([`begin_frames`]) would break the count another checks.
+#[cfg(test)]
+pub(crate) static COUNTING: Mutex<()> = Mutex::new(());
+
+/// For tests: begins `n` frames at once, as an origin poll that times out
+/// and starts its frame does (what is idle for some frames, `crate::host::long_ago`).
+#[cfg(all(test, windows, feature = "diagnostics"))]
+pub(crate) fn begin_frames(n: u64) {
+    let _counting = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
+    let null = std::ptr::null();
+    for _ in 0..n {
+        let _ = wait(
+            null,
+            ORIGIN,
+            0,
+            std::ptr::null(),
+            TOKEN_ON_TIMEOUT,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
 /// Per event kind (origin, vblank, flip and later kinds): the last tick a
 /// wait for it ended on.
 static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -217,6 +240,7 @@ mod tests {
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _counting = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;

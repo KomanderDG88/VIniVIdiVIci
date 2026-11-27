@@ -1007,29 +1007,48 @@ fn defrag_class(bytes: &[u8]) -> u8 {
     }
 }
 
-/// Whether a value of `VICTORY_SKIP_DEFRAG` turns it on: `1` only.
+/// What a value of `VICTORY_SKIP_DEFRAG` leaves out: 0 nothing, 1 the
+/// relocation planning (`1`), 2 every program of the defragmenter (`all`).
 #[cfg(windows)]
-fn skip_defrag_value(value: Option<&str>) -> bool {
-    value.map(str::trim) == Some("1")
+fn skip_defrag_value(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("all") => 2,
+        _ => 0,
+    }
 }
 
-/// `VICTORY_SKIP_DEFRAG=1` ([`DEFRAG_FAMILY`]), read once and said in the
-/// log then (with the first compute program the title makes).
+/// `VICTORY_SKIP_DEFRAG` ([`DEFRAG_FAMILY`], [`skip_defrag_value`]), read
+/// once and said in the log then (with the first compute program the title
+/// makes). `all`: with the planner left out alone the rest of the family
+/// still ran, 8-10 dispatches a frame, and faces still went dark (lab run
+/// 061441), so every program of it can be left out for one test.
 #[cfg(windows)]
-fn skip_defrag() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = skip_defrag_value(std::env::var("VICTORY_SKIP_DEFRAG").ok().as_deref());
-        if on {
+fn skip_defrag_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = skip_defrag_value(std::env::var("VICTORY_SKIP_DEFRAG").ok().as_deref());
+        let on = mode > 0;
+        if mode == 2 {
+            tracing::info!(
+                "VICTORY_SKIP_DEFRAG=all: dispatches of every program of the title's card-memory defragmenter are left out, direct and indirect"
+            );
+        } else if on {
             tracing::info!(
                 "VICTORY_SKIP_DEFRAG=1: dispatches of the relocation planning of the title's card-memory defragmenter are left out, direct and indirect"
             );
             tracing::warn!(
-                "VICTORY_SKIP_DEFRAG=1 changes the title's management of its card memory (an experiment only): without defragmenting, its card heap may fragment and run out of room in a long session"
+                "VICTORY_SKIP_DEFRAG changes the title's management of its card memory (an experiment only): without defragmenting, its card heap may fragment and run out of room in a long session"
             );
         }
-        on
+        mode
     })
+}
+
+/// Whether `VICTORY_SKIP_DEFRAG` is set to anything that leaves dispatches out.
+#[cfg(windows)]
+fn skip_defrag() -> bool {
+    skip_defrag_mode() > 0
 }
 
 /// Whether compute containers are looked at for the defragmenter: in
@@ -1074,7 +1093,11 @@ pub(crate) fn skips_defrag(this: This, indirect: bool) -> bool {
     if class == 0 {
         return false;
     }
-    let left = class == 1 && skip_defrag();
+    let left = match skip_defrag_mode() {
+        2 => true,
+        1 => class == 1,
+        _ => false,
+    };
     #[cfg(feature = "diagnostics")]
     DEFRAG_DISPATCHES[usize::from(class - 1)][if left { 2 } else { usize::from(indirect) }]
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1660,6 +1683,8 @@ pub(crate) mod host;
 pub mod known;
 #[cfg(windows)]
 mod library;
+#[cfg(windows)]
+mod samplers;
 
 /// Host pipelines created and loaded from the library since the start
 /// (`crate::framelog`).
@@ -1787,10 +1812,12 @@ mod tests {
         assert_eq!(defrag_class(b"CS_Defrag\0Heap_ComputeRelocations"), 0);
         assert_eq!(defrag_class(b"defragheap_computerelocations"), 0);
         assert_eq!(defrag_class(b""), 0);
-        assert!(skip_defrag_value(Some("1")));
-        assert!(skip_defrag_value(Some(" 1 ")));
-        for off in [None, Some(""), Some("0"), Some("alt"), Some("skip"), Some("clear"), Some("true"), Some("11")] {
-            assert!(!skip_defrag_value(off), "{off:?}");
+        assert_eq!(skip_defrag_value(Some("1")), 1);
+        assert_eq!(skip_defrag_value(Some(" 1 ")), 1);
+        assert_eq!(skip_defrag_value(Some("all")), 2);
+        assert_eq!(skip_defrag_value(Some(" all ")), 2);
+        for off in [None, Some(""), Some("0"), Some("alt"), Some("skip"), Some("clear"), Some("true"), Some("11"), Some("ALL")] {
+            assert_eq!(skip_defrag_value(off), 0, "{off:?}");
         }
     }
 
