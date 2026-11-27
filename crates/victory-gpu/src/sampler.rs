@@ -27,7 +27,9 @@ struct Fields {
 }
 
 impl Fields {
-    fn host(&self) -> D3D12_SAMPLER_DESC {
+    /// `aniso_point_mip`: the host filters anisotropically with point mips
+    /// ([`aniso_point_mip`]).
+    fn host(&self, aniso_point_mip: bool) -> D3D12_SAMPLER_DESC {
         let linear = |f: u32| u32::from(f == 1 || f == 3);
         let aniso = self.mag >= 2 || self.min >= 2;
         // The console compares when the instruction says so, with the
@@ -43,7 +45,10 @@ impl Fields {
             _ => u32::from(compares),
         };
         let filter = if aniso {
-            0x55
+            // Anisotropic with point mips where the host has it; else with
+            // linear mips, the nearest. (This tree's static samplers,
+            // `victory_shader::emit::StaticSampler`, stay on linear mips.)
+            0x54 | u32::from(self.mip == 2 || !aniso_point_mip)
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
@@ -71,11 +76,44 @@ impl Fields {
     }
 }
 
+/// What a heap sampler goes by ([`console`]): [`aniso_point_mip`] only with
+/// `VICTORY_HEAP_ANISO_POINT_MIP=1`; unset, every anisotropic heap sampler
+/// stays on linear mips (0x55), as before. Off by default: on the lab's
+/// NVIDIA card the runtime says it can filter so (`D3D12_OPTIONS19`), yet
+/// making one such sampler (0x54) in a heap of ours removed the device
+/// (`the_host_takes_its_anisotropic_samplers`, run alone, 26 November).
+pub(crate) fn heap_aniso_point_mip(device: &ID3D12Device) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_ANISO_POINT_MIP").is_some_and(|v| v == "1"))
+        && aniso_point_mip(device)
+}
+
+/// Whether the host GPU filters anisotropically with point mips
+/// (`D3D12_OPTIONS19`, optional): asked once. Older runtimes do not know
+/// the query, which means no.
+pub(crate) fn aniso_point_mip(device: &ID3D12Device) -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool()
+    })
+}
+
 /// The console's sampler description (27 words): flags, magnification,
 /// minification, mip and depth filters, filter mode, three address modes,
 /// minimum and maximum LOD, LOD bias, secondary bias, anisotropy, its bias
 /// and threshold, comparison, border color, then tuning words.
-pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
+/// `aniso_point_mip`: as [`aniso_point_mip`] says.
+pub(crate) fn console(words: &[u32; 27], aniso_point_mip: bool) -> D3D12_SAMPLER_DESC {
     let f = |i: usize| f32::from_bits(words[i]);
     Fields {
         mag: words[1],
@@ -90,7 +128,7 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
         compare: words[16],
         border: [f(17), f(18), f(19), f(20)],
     }
-    .host()
+    .host(aniso_point_mip)
 }
 
 #[cfg(test)]
@@ -105,15 +143,91 @@ mod tests {
         w[3] = 2; // linear mips
         w[6..9].copy_from_slice(&[3, 3, 3]);
         w[10] = 1000.0f32.to_bits();
-        let d = console(&w);
+        let d = console(&w, true);
         assert_eq!(d.Filter.0, 0x5, "min point, mag and mip linear");
         assert_eq!(d.AddressW, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
         assert_eq!(d.MaxLOD, 1000.0);
         // A less-or-equal test makes a comparison sampler; never does not.
         w[16] = 4;
-        assert_eq!(console(&w).Filter.0, 0x85);
-        assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
+        assert_eq!(console(&w, true).Filter.0, 0x85);
+        assert_eq!(
+            console(&w, true).ComparisonFunc,
+            D3D12_COMPARISON_FUNC_LESS_EQUAL
+        );
         w[16] = 1;
-        assert_eq!(console(&w).Filter.0, 0x5);
+        assert_eq!(console(&w, true).Filter.0, 0x5);
+    }
+
+    /// Anisotropic samplers keep their mip filter: point mips where the
+    /// host has anisotropic point-mip filtering (as static samplers do),
+    /// linear mips where it has not; comparison and min/max reduction
+    /// stay.
+    #[test]
+    fn anisotropic_samplers_keep_point_mips_where_the_host_can() {
+        let mut w = [0u32; 27];
+        w[1] = 3; // anisotropic bilinear magnification
+        w[2] = 3; // and minification
+        w[13] = 8;
+        for (mip, supported, filter) in [
+            (1, true, 0x54),
+            (1, false, 0x55),
+            (2, true, 0x55),
+            (2, false, 0x55),
+            (0, true, 0x54),
+        ] {
+            w[3] = mip;
+            let d = console(&w, supported);
+            assert_eq!(
+                d.Filter.0, filter,
+                "mip filter {mip}, point-mip support {supported}"
+            );
+            assert_eq!(d.MaxAnisotropy, 8);
+        }
+        w[3] = 1;
+        w[16] = 4; // less or equal: a comparison sampler
+        assert_eq!(console(&w, true).Filter.0, 0xd4);
+        assert_eq!(console(&w, false).Filter.0, 0xd5);
+        w[16] = 0;
+        w[5] = 2; // maximum reduction
+        assert_eq!(console(&w, true).Filter.0, 0x1d4);
+        assert_eq!(console(&w, false).Filter.0, 0x1d5);
+        w[5] = 1; // minimum reduction
+        assert_eq!(console(&w, true).Filter.0, 0x154);
+        assert_eq!(console(&w, false).Filter.0, 0x155);
+    }
+
+    /// The host takes the anisotropic samplers it says it can filter: a
+    /// point-mip one where it has the feature, made in a sampler heap of
+    /// ours, leaves the device as it was. It says which it made (a run
+    /// without a device says it was skipped).
+    #[test]
+    #[ignore = "removes the device on the lab's NVIDIA card (point-mip anisotropic sampler, 0x54); run by hand"]
+    fn the_host_takes_its_anisotropic_samplers() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU here");
+            return;
+        };
+        let supported = aniso_point_mip(&host.device);
+        let mut w = [0u32; 27];
+        (w[1], w[2], w[3], w[13]) = (3, 3, 1, 16);
+        let desc = console(&w, supported);
+        assert_eq!(desc.Filter.0, if supported { 0x54 } else { 0x55 });
+        let heap_desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+            NumDescriptors: 1,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+            NodeMask: 0,
+        };
+        // SAFETY: plain creation; the slot is the heap's first.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&heap_desc).unwrap();
+            host.device
+                .CreateSampler(&desc, heap.GetCPUDescriptorHandleForHeapStart());
+            assert!(
+                host.device.GetDeviceRemovedReason().is_ok(),
+                "point-mip support {supported}"
+            );
+        }
+        eprintln!("made an anisotropic sampler, filter {:#x}", desc.Filter.0);
     }
 }

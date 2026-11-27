@@ -20,6 +20,13 @@
 //!
 //! From Belobug's VIctory-Belobug-AMD (`crates/victory-gpu/src/ambient.rs`
 //! there, where it is on by default), fitted to this tree.
+//!
+//! The air of a room is lit by the same probes: without rays they hold the
+//! sky's light indoors too, a brown veil at sunset, orange clouds in the
+//! prison's cells. `VICTORY_AMBIENT_AIR=<multiple>` (with the ambient light
+//! on; unset or 0: what the title has) bounds what the air scatters by a
+//! multiple of the light around. From edsuuu/VI-BR-PORT 7da523a9 / 557d2f03
+//! (GPL-3.0), fitted to the constant here ([`bound_air`]).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -41,6 +48,25 @@ pub(crate) const LIGHT: (u8, u32) = (1, 176);
 /// Whether the container `bytes` is one of the programs.
 pub(crate) fn resolves(bytes: &[u8]) -> bool {
     bytes.windows(PROGRAM.len()).any(|w| w == PROGRAM)
+}
+
+/// The program that adds the lamps' light to what the air scatters (the
+/// last that writes that volume before it is summed up along the view), by
+/// the start of its name, and where it writes the volume (R11G11B10 floats):
+/// root parameter and place in its table, in dwords.
+pub(crate) const AIR_PROGRAM: &[u8] = b"CS_AccumulateLocalLightInscatteringVolume";
+pub(crate) const AIR: (u8, u32) = (1, 32);
+
+/// The most the air scatters, as a multiple of the light around
+/// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
+pub(crate) fn air() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| air_of(&std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default()))
+}
+
+/// The multiple `set` asks for: a positive finite number, else 0.
+fn air_of(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
 }
 
 /// The level (`VICTORY_AMBIENT`); `None` if off.
@@ -566,8 +592,220 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
     true
 }
 
+/// The bound on the air ([`bound_air`]): what the air scatters, no more
+/// than `cap` in luminance, whatever the volume's size.
+const AIR_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(UAV(u0))"
+cbuffer Air : register(b0) {
+    float cap; float unused0; float unused1; float unused2;
+};
+RWTexture3D<float3> scattered : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 2)]
+void main(uint3 at : SV_DispatchThreadID) {
+    uint w, h, d;
+    scattered.GetDimensions(w, h, d);
+    if (at.x >= w || at.y >= h || at.z >= d) return;
+    const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+    float3 c = scattered[at];
+    float has = dot(c, LUMA);
+    if (has > cap) scattered[at] = c * (cap / has);
+}
+"#;
+
+/// The air's pass: its own pipeline and views, used in turn.
+struct AirPass {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    views: ID3D12DescriptorHeap,
+    step: u32,
+    next: AtomicU32,
+}
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for AirPass {}
+// SAFETY: as above.
+unsafe impl Sync for AirPass {}
+
+fn make_air(device: &ID3D12Device) -> windows::core::Result<AirPass> {
+    let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: the source and names live through the call; out pointers ours.
+    let compiled = unsafe {
+        D3DCompile(
+            AIR_SOURCE.as_ptr().cast(),
+            AIR_SOURCE.len(),
+            s!("ambient_air"),
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    let text = |b: &ID3DBlob| {
+        // SAFETY: the blob's own bytes.
+        unsafe { std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize()) }.to_vec()
+    };
+    if let Err(e) = compiled {
+        if let Some(errors) = errors {
+            tracing::warn!("the bound on the air does not compile: {}", String::from_utf8_lossy(&text(&errors)));
+        }
+        return Err(e);
+    }
+    let code = text(&code.ok_or_else(windows::core::Error::empty)?);
+    // SAFETY: the root signature is inside the shader; plain creations.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
+        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
+            },
+            ..Default::default()
+        })?;
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        let views = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: SLOTS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })?;
+        Ok(AirPass {
+            root,
+            pso,
+            views,
+            step: device.GetDescriptorHandleIncrementSize(kind),
+            next: AtomicU32::new(0),
+        })
+    }
+}
+
+/// Bounds what the air scatters in `volume`, in `list`, after the program
+/// that wrote it last ([`AIR_PROGRAM`]): no brighter than [`air`] times the
+/// light around. Whether it recorded anything (the list's bindings are then
+/// ours).
+///
+/// edsuuu/VI-BR-PORT 7da523a9 / 557d2f03 bound it by the light the room's
+/// surfaces sent out over the last seconds, towards the surface seen in each
+/// direction farther away, both gathered by their estimate of the indirect
+/// light. Here the light around is the constant (with its tint and the live
+/// level), the same everywhere and at every depth.
+pub(crate) fn bound_air(list: &HostList, volume: This) -> bool {
+    let multiple = air();
+    let (Some(level), Some(host)) = (level(), host()) else {
+        return false;
+    };
+    if multiple <= 0.0 {
+        return false;
+    }
+    let Some(volume) = crate::resource::host_resource(volume) else {
+        return false;
+    };
+    static PASS: OnceLock<Option<AirPass>> = OnceLock::new();
+    let Some(pass) = PASS
+        .get_or_init(|| {
+            make_air(&host.device)
+                .inspect_err(|e| tracing::warn!(error = %e, "no bound on the air (VICTORY_AMBIENT_AIR)"))
+                .ok()
+        })
+        .as_ref()
+    else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { volume.GetDesc() };
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if d.Format != DXGI_FORMAT_R11G11B10_FLOAT || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        ONCE.call_once(|| {
+            tracing::warn!(format = d.Format.0, "no bound on the air (VICTORY_AMBIENT_AIR): its volume is of another kind")
+        });
+        return false;
+    }
+    let level = live_level().unwrap_or(level);
+    let [r, g, b] = tint();
+    let cap = multiple * level * (0.2126 * r + 0.7152 * g + 0.0722 * b);
+    ONCE.call_once(|| {
+        tracing::info!(
+            multiple,
+            cap,
+            width = d.Width,
+            height = d.Height,
+            slices = d.DepthOrArraySize,
+            "what the air scatters is bounded (VICTORY_AMBIENT_AIR)"
+        );
+    });
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
+    list.keep(volume);
+    let l = &list.list;
+    uav_barrier(l);
+    // SAFETY: an open list; a live texture the list keeps, in the
+    // unordered-access state as the program before left it; a view in a slot
+    // no list in flight reads.
+    unsafe {
+        let cpu = pass.views.GetCPUDescriptorHandleForHeapStart();
+        let gpu = pass.views.GetGPUDescriptorHandleForHeapStart();
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: cpu.ptr + (slot * pass.step) as usize,
+        };
+        let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R11G11B10_FLOAT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_UAV {
+                    MipSlice: 0,
+                    FirstWSlice: 0,
+                    WSize: u32::from(d.DepthOrArraySize),
+                },
+            },
+        };
+        host.device
+            .CreateUnorderedAccessView(volume, None::<&ID3D12Resource>, Some(&view), at);
+        l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetPipelineState(&pass.pso);
+        let constants = [cap, 0.0, 0.0, 0.0];
+        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(
+            1,
+            D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu.ptr + u64::from(slot * pass.step),
+            },
+        );
+        l.Dispatch(
+            (d.Width as u32).div_ceil(8),
+            d.Height.div_ceil(8),
+            u32::from(d.DepthOrArraySize).div_ceil(2),
+        );
+    }
+    uav_barrier(l);
+    true
+}
+
 #[cfg(test)]
 mod tests {
+    /// The air is bounded only when a positive multiple is asked for.
+    #[test]
+    fn the_air_multiple_is_asked_for() {
+        assert_eq!(super::air_of(""), 0.0);
+        assert_eq!(super::air_of("0"), 0.0);
+        assert_eq!(super::air_of("-1"), 0.0);
+        assert_eq!(super::air_of("inf"), 0.0);
+        assert_eq!(super::air_of(" 0.8 "), 0.8);
+    }
+
+    /// The air's pass compiles with the system's compiler and the host takes it.
+    #[test]
+    fn air_pass_builds() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        super::make_air(&host.device).expect("the air's pass");
+    }
+
     /// Off unless a positive level is asked for.
     #[test]
     fn the_level_is_asked_for() {

@@ -62,6 +62,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+mod port;
+#[cfg(windows)]
 mod launch;
 pub mod list;
 pub mod object;
@@ -74,6 +76,8 @@ mod primitive;
 mod profile;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+pub mod recorded;
 #[cfg(windows)]
 mod queue2;
 mod ram_trim;
@@ -109,6 +113,8 @@ mod texback;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use census::title_memory_reserved;
+#[cfg(windows)]
+pub use recorded::{HostPage, use_recorded_pages};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_closed, title_memory_view};
 #[cfg(windows)]

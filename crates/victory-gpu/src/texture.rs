@@ -1680,10 +1680,16 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        if n == 0 {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        let next = (info.BaseAddress as usize + info.RegionSize).min(end);
+        // Recorded pages (`VICTORY_LAZY_REMAP=1`) are there although the
+        // system reports them reserved.
+        if info.State != MEM_COMMIT && crate::recorded::present_bytes(p, next - p) != (next - p) as u64 {
+            return false;
+        }
+        p = next;
     }
     true
 }
@@ -1743,6 +1749,10 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         }
         if info.State == MEM_COMMIT {
             there += (next - p) as u64;
+        } else {
+            // Recorded pages (`VICTORY_LAZY_REMAP=1`): there, though
+            // reserved to the system.
+            there += crate::recorded::present_bytes(p, next - p);
         }
         p = next;
     }

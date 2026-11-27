@@ -429,7 +429,7 @@ impl HostList {
         let Some(plane) = &twin.plane else { return };
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
-        record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        record_plane_pass(self, &depth.texture, &plane.texture);
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -1086,8 +1086,23 @@ impl HostList {
     /// reset.
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// (With [`card_steps`]' stage 2 they are: a buffer of the upload's size
+    /// class, kept in [`SHARED_SPARE`] between lists; it may be larger than
+    /// `size`.)
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
+        if card_steps::stage() > 1
+            && let Some(class) = shared_class(size)
+        {
+            let held = take_shared(host, class)?;
+            let kept = held.kept.as_ref()?;
+            let (buffer, data) = (kept.buffer.clone(), kept.data as *mut u8);
+            name_frame(&buffer, || format!("list upload {size:#x} (shared, {class:#x})"));
+            let mut deferred = self.deferred();
+            deferred.hold_upload(buffer.clone(), class);
+            deferred.shared.push(held);
+            return Some((buffer, data));
+        }
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name_frame(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
@@ -1345,6 +1360,18 @@ impl HostList {
         self.window_check.get_or_init(crate::indirect::WindowCheck::new).as_ref()
     }
 
+    /// The shader-visible descriptor heaps the list keeps (tests).
+    #[cfg(test)]
+    pub(crate) fn kept_shader_heaps(&self) -> Vec<ID3D12DescriptorHeap> {
+        self.deferred().kept.iter()
+            .filter_map(|object| object.cast::<ID3D12DescriptorHeap>().ok())
+            .filter(|heap| {
+                // SAFETY: a live descriptor heap.
+                unsafe { heap.GetDesc() }.Flags == D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+            })
+            .collect()
+    }
+
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
@@ -1476,6 +1503,7 @@ impl HostList {
                     fill_check::copy_runs(dst, src, len);
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -1490,6 +1518,7 @@ impl HostList {
                     }
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
+                    crate::port::filled(src, len);
                     copy_fill(dst as *mut u8, src as *const u8, len);
                     len
                 }

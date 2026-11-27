@@ -1047,6 +1047,38 @@ mod tests {
         assert!(holder(&writers, 104, 120).is_err());
     }
 
+    /// Title memory in place (renderer port 1's `VICTORY_PORT_CONSTANTS`,
+    /// or `VICTORY_INPLACE`) is no host copy a step on the card could read
+    /// or write: the holder refuses it, and the step stays on the CPU.
+    #[test]
+    fn warp_a_holder_in_place_is_refused() {
+        let _one = crate::inplace::tests::one_warp_at_a_time();
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        if windows::core::Interface::cast::<windows::Win32::Graphics::Direct3D12::ID3D12Device13>(&device).is_err() {
+            return;
+        }
+        const K: usize = 64 << 10;
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            use windows_sys::Win32::System::Memory as mem;
+            let base = mem::VirtualAlloc(std::ptr::null(), 2 * K, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let (start, len) = (base as u64 + 0x100, 0x1000u64);
+            let placed = crate::inplace::place_part(&device, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            // As `crate::port::place_for` counts it, so that its drop
+            // takes it off again.
+            crate::inplace::counted(false, len);
+            let shadow = Arc::new(Shadow::placed_for_tests(placed, start, len, false));
+            assert!(shadow.in_place());
+            let (from, to) = (start as usize + 0x10, start as usize + 0x50);
+            let writers = [Writer { shadow: Some(shadow.clone()), from, to, copy: false }];
+            assert!(matches!(holder(&writers, from, to), Err("no host copy holds all of it")));
+            drop((writers, shadow));
+            // Fails harmlessly while the runtime still holds the heap.
+            mem::VirtualFree(base as *mut core::ffi::c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
     /// Reads are all before writes, between two buffers and within one, and
     /// the buffers are usable in the lists that follow in the same call.
     #[test]

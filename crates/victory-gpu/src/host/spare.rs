@@ -36,3 +36,24 @@ fn trim_releases_only_cold_items_past_warm_ceiling() {
     assert_eq!(spare.bytes, 8);
     assert_eq!(spare.take(8), Some(30));
 }
+
+/// Shared upload buffers come in powers of two from 64 KiB to 16 MiB,
+/// each at least the size asked; larger ones are not kept.
+#[test]
+fn shared_upload_classes_are_powers_of_two_that_hold_the_size() {
+    use super::{SHARED_CLASS_LEAST, SHARED_CLASS_MOST, shared_class};
+    assert_eq!(shared_class(0), Some(64 << 10));
+    assert_eq!(shared_class(1), Some(64 << 10));
+    assert_eq!(shared_class(64 << 10), Some(64 << 10));
+    assert_eq!(shared_class((64 << 10) + 1), Some(128 << 10));
+    assert_eq!(shared_class(3 << 20), Some(4 << 20));
+    assert_eq!(shared_class(16 << 20), Some(16 << 20));
+    assert_eq!(shared_class((16 << 20) + 1), None);
+    assert_eq!(shared_class(u64::MAX), None);
+    for size in [1u64, 255, 4096, 65_537, 1 << 20, (1 << 20) + 3, 9_999_999] {
+        let class = shared_class(size).unwrap();
+        assert!(class >= size && class.is_power_of_two());
+        assert!((SHARED_CLASS_LEAST..=SHARED_CLASS_MOST).contains(&class));
+        assert!(class == SHARED_CLASS_LEAST || class < 2 * size, "no larger than needed");
+    }
+}

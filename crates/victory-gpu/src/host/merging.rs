@@ -414,7 +414,7 @@ impl Host {
         self.send_late(lists, order, &joins);
         let mut direct = false;
         for (fence, value) in signals {
-            if !late_signal(fence, value) {
+            if !late_signal(fence as crate::object::This, value) {
                 crate::fence::set(fence as crate::object::This, value);
                 direct = true;
             }

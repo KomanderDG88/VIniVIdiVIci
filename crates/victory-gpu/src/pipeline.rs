@@ -148,6 +148,11 @@ pub(crate) struct Shader {
     /// ([`crate::ambient::REFLECTED`]).
     #[cfg(windows)]
     pub(crate) ends_reflections: bool,
+    /// It adds the lamps' light to what the air scatters, the last program
+    /// that writes that volume ([`crate::ambient::AIR_PROGRAM`]); only while
+    /// the air is bounded (`VICTORY_AMBIENT_AIR`).
+    #[cfg(windows)]
+    pub(crate) scatters_air: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -158,6 +163,11 @@ pub(crate) struct Shader {
     /// ([`RtWork`], [`rt_work_of`]; compute only).
     #[cfg(windows)]
     rt_work: u8,
+    /// Which program of the title's card-memory defragmenter it is
+    /// ([`defrag_class`]; compute only, looked for only while
+    /// [`defrag_watched`]).
+    #[cfg(windows)]
+    defrag: u8,
     /// Cached [`of_builder`] flag so raw containers can be compressed safely.
     #[cfg(windows)]
     builder_spilled: OnceLock<bool>,
@@ -240,6 +250,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                         .windows(crate::ambient::REFLECTED.len())
                         .any(|w| w == crate::ambient::REFLECTED),
                 #[cfg(windows)]
+                scatters_air: ambient
+                    && stage == "compute"
+                    && crate::ambient::air() > 0.0
+                    && holds(bytes, crate::ambient::AIR_PROGRAM),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
@@ -253,6 +268,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 } else {
                     0
                 },
+                #[cfg(windows)]
+                defrag: if stage == "compute" && defrag_watched() { defrag_class(bytes) } else { 0 },
                 #[cfg(windows)]
                 builder_spilled: OnceLock::new(),
                 #[cfg(windows)]
@@ -713,11 +730,27 @@ fn holds(bytes: &[u8], name: &[u8]) -> bool {
 ///   for the structures (8 % of the card's time in the opening cutscene
 ///   there).
 ///
-/// The last three adapted from edsuuu/VI-BR-PORT f1e5e454 / 24f8d2ed
-/// (GPL-3.0; from codec-d/cool_fox `make.rs`). Their rules for the tracing
-/// itself (`CS_RaytraceVBuffer*`, `CS_ScreenProbes_TraceRays*_BVH*`) are
-/// not taken: `VICTORY_BVH_HOLD` holds back exactly the programs whose code
-/// walks the structures.
+/// - `VICTORY_RT_TRACE_SKIP`: the tracing itself against the structures,
+///   the screen probes' `CS_ScreenProbes_TraceRays*_BVH*` and the
+///   reflections' `CS_RaytraceVBuffer*` (with the hair's geometry, 8 % of
+///   the card's time in the opening cutscene there). Their `Fallback` and
+///   `Voxels` forms march through the title's voxels, not the structures,
+///   and light the picture: they are not of the kind. Meant with
+///   `VICTORY_BVH_NO_HIT=1`, under which every ray misses anyway;
+///   `VICTORY_BVH_HOLD` already holds back the programs whose code walks
+///   the structures.
+/// - `VICTORY_SKIP_RT_SHADOW`: the ray-traced sun and light shadows,
+///   `CS_GenerateShadowMasks_Raytraced*`, `CS_RTShadowTrace*` and
+///   `CS_RaytraceShadows*`, which trace the shadows of the screen tiles the
+///   title marks for rays (the edges of the cascades' shadows, hair). With
+///   every ray a miss those tiles come out lit: stair-stepped sun patches on
+///   walls and clothes, hair glowing in the sun. From edsuuu/VI-BR-PORT
+///   a04f6012 (GPL-3.0), opt-in there too.
+///
+/// The four before adapted from edsuuu/VI-BR-PORT f1e5e454 / 24f8d2ed
+/// (GPL-3.0; from codec-d/cool_fox `make.rs`), where the tracing is left
+/// out by default with every ray a miss (`VICTORY_RT_TRACE=1` runs it);
+/// here, as every kind, only with its switch.
 ///
 /// None of the kinds ever takes a program [`crate::ambient`] follows
 /// ([`ambient_follows`]), whatever its name holds besides.
@@ -726,7 +759,8 @@ struct RtWork {
     switch: &'static str,
     /// What a dispatch left out is, as the log says it (no program names).
     what: &'static str,
-    name: &'static [u8],
+    /// Whether a compute container is of the kind, by the names it holds.
+    is: fn(&[u8]) -> bool,
     turn: crate::AltTurn,
     /// Pipelines of the kind known so far.
     #[cfg(feature = "diagnostics")]
@@ -739,11 +773,11 @@ struct RtWork {
 
 #[cfg(windows)]
 impl RtWork {
-    const fn new(switch: &'static str, what: &'static str, name: &'static [u8]) -> Self {
+    const fn new(switch: &'static str, what: &'static str, is: fn(&[u8]) -> bool) -> Self {
         Self {
             switch,
             what,
-            name,
+            is,
             turn: crate::AltTurn::new(),
             #[cfg(feature = "diagnostics")]
             pipelines: std::sync::atomic::AtomicU64::new(0),
@@ -756,37 +790,54 @@ impl RtWork {
 /// The kinds ([`RtWork`]); bit `i` of [`Shader::rt_work`] and
 /// [`Pipeline::rt_work`] is `RT_WORK[i]`.
 #[cfg(windows)]
-static RT_WORK: [RtWork; 4] = [
+static RT_WORK: [RtWork; RT_KINDS] = [
     RtWork::new(
         "VICTORY_RT_SKIN_SKIP",
         "dispatches of skinning only for the ray-tracing structures are left out",
-        b"bvh_skinning",
+        |b| holds(b, b"bvh_skinning"),
     ),
     RtWork::new(
         "VICTORY_RT_RESOLVE_SKIP",
         "dispatches of programs that shade what rays hit are left out",
-        b"CS_RaytracingResolve",
+        |b| holds(b, b"CS_RaytracingResolve"),
     ),
     RtWork::new(
         "VICTORY_ACTIVATE_RAYS_SKIP",
         "dispatches of programs that pick the screen probes casting rays are left out",
-        b"CS_ScreenProbes_ActivateRays",
+        |b| holds(b, b"CS_ScreenProbes_ActivateRays"),
     ),
     RtWork::new(
         "VICTORY_HAIR_VB_SKIP",
         "dispatches of programs that make hair geometry for the ray-tracing structures are left out",
-        b"CSGenerateHairVB",
+        |b| holds(b, b"CSGenerateHairVB"),
+    ),
+    RtWork::new(
+        "VICTORY_RT_TRACE_SKIP",
+        "dispatches of programs that trace rays through the ray-tracing structures are left out",
+        |b| {
+            (holds(b, b"CS_ScreenProbes_TraceRays") && holds(b, b"_BVH"))
+                || (holds(b, b"CS_RaytraceVBuffer") && !holds(b, b"Voxels"))
+        },
+    ),
+    RtWork::new(
+        "VICTORY_SKIP_RT_SHADOW",
+        "dispatches of programs that trace the shadows of the tiles marked for rays are left out",
+        |b| holds(b, b"CS_GenerateShadowMasks_Raytraced") || holds(b, b"CS_RTShadowTrace") || holds(b, b"CS_RaytraceShadows"),
     ),
 ];
+
+/// How many kinds of [`RtWork`] there are (bits of a `u8`).
+#[cfg(windows)]
+const RT_KINDS: usize = 6;
 
 /// Each kind's switch ([`RtWork`]): 0 off (or the builder may run), 1 on,
 /// 2 in turn.
 #[cfg(windows)]
-fn rt_skip_modes() -> [u8; 4] {
-    static MODES: OnceLock<[u8; 4]> = OnceLock::new();
+fn rt_skip_modes() -> [u8; RT_KINDS] {
+    static MODES: OnceLock<[u8; RT_KINDS]> = OnceLock::new();
     *MODES.get_or_init(|| {
         if builder_allowed() {
-            return [0; 4];
+            return [0; RT_KINDS];
         }
         RT_WORK.each_ref().map(|k| match std::env::var(k.switch).as_deref() {
             Ok("1") => 1,
@@ -816,14 +867,14 @@ fn ambient_follows(bytes: &[u8]) -> bool {
 #[cfg(windows)]
 fn rt_work_of(bytes: &[u8]) -> u8 {
     let modes = rt_skip_modes();
-    if modes == [0; 4] || ambient_follows(bytes) {
+    if modes == [0; RT_KINDS] || ambient_follows(bytes) {
         return 0;
     }
     RT_WORK
         .iter()
         .zip(modes)
         .enumerate()
-        .filter(|(_, (k, mode))| *mode != 0 && holds(bytes, k.name))
+        .filter(|(_, (k, mode))| *mode != 0 && (k.is)(bytes))
         .fold(0, |work, (i, _)| work | (1 << i))
 }
 
@@ -903,6 +954,154 @@ pub(crate) fn rt_work_line(frames: f64) {
         let [a, b, c] = census;
         tracing::info!("ray census of compute containers (pipeline.rs RT_CENSUS): {a} {b} {c}");
     }
+}
+
+/// The title's card-memory defragmenter: compute programs whose container
+/// holds [`DEFRAG_FAMILY`] in their names; the one that plans the moves
+/// holds [`DEFRAG_PLANNER`]. Idea from the commit message of
+/// voidopcode/vilocity 29111fec6 (no licence: no code taken): there the
+/// planner took some 230 ms of the card's time a frame in some launches,
+/// which ran at 3 to 5 fps with black faces, a dark bald head and red
+/// jumpsuits; with its outputs cleared it planned no moves and those
+/// launches were fast with the picture intact. Here faces come out black
+/// or multicoloured, differently from session to session.
+///
+/// Diagnostics builds count its dispatches by class in the frame line
+/// ([`defrag_line`]) and say, once per program, which unordered access
+/// views its first dispatch writes through (`draw.rs` `defrag_report`);
+/// nothing changes for it there. Its card time is in the per-pipeline
+/// table of `VICTORY_CARD_METER_PIPELINES=1`, by name.
+///
+/// `VICTORY_SKIP_DEFRAG=1` (read once; anything else: off, the default)
+/// leaves out every dispatch, direct or indirect, of the planner; the rest
+/// of the family runs. What it would have written stays as it was: if the
+/// title does not reset its plan before the planner runs, a plan of an
+/// earlier frame may be carried out again (clearing its outputs, as there,
+/// needs to know which of them is the plan: see [`skips_defrag`]). No
+/// `alt`: what a turn changes in the title's heap outlasts it. The risks:
+/// the title's management of its card memory changes; without
+/// defragmenting, its card heap may fragment and run out of room in a long
+/// session; resources it moved before stay where they went.
+#[cfg(windows)]
+const DEFRAG_FAMILY: &[u8] = b"DefragHeap";
+/// The defragmenter's program that plans the moves ([`DEFRAG_FAMILY`]).
+#[cfg(windows)]
+const DEFRAG_PLANNER: &[u8] = b"DefragHeap_ComputeRelocations";
+
+/// The defragmenter's classes as the log says them (no program names), in
+/// the order of [`defrag_class`] from 1.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) const DEFRAG_CLASSES: [&str; 2] = ["relocation planning", "rest of the family"];
+
+/// Which program of the defragmenter the compute container `bytes` is: 1
+/// the planner ([`DEFRAG_PLANNER`]), 2 another of [`DEFRAG_FAMILY`], 0
+/// none.
+#[cfg(windows)]
+fn defrag_class(bytes: &[u8]) -> u8 {
+    if holds(bytes, DEFRAG_PLANNER) {
+        1
+    } else if holds(bytes, DEFRAG_FAMILY) {
+        2
+    } else {
+        0
+    }
+}
+
+/// Whether a value of `VICTORY_SKIP_DEFRAG` turns it on: `1` only.
+#[cfg(windows)]
+fn skip_defrag_value(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// `VICTORY_SKIP_DEFRAG=1` ([`DEFRAG_FAMILY`]), read once and said in the
+/// log then (with the first compute program the title makes).
+#[cfg(windows)]
+fn skip_defrag() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = skip_defrag_value(std::env::var("VICTORY_SKIP_DEFRAG").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_SKIP_DEFRAG=1: dispatches of the relocation planning of the title's card-memory defragmenter are left out, direct and indirect"
+            );
+            tracing::warn!(
+                "VICTORY_SKIP_DEFRAG=1 changes the title's management of its card memory (an experiment only): without defragmenting, its card heap may fragment and run out of room in a long session"
+            );
+        }
+        on
+    })
+}
+
+/// Whether compute containers are looked at for the defragmenter: in
+/// diagnostics builds, to count it, and with its switch.
+#[cfg(windows)]
+fn defrag_watched() -> bool {
+    cfg!(feature = "diagnostics") || skip_defrag()
+}
+
+/// Defragmenter pipelines known so far, by class ([`DEFRAG_CLASSES`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+static DEFRAG_PIPELINES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Defragmenter dispatches since the last frame line, by class: run
+/// direct, run indirect, left out.
+#[cfg(all(windows, feature = "diagnostics"))]
+static DEFRAG_DISPATCHES: [[std::sync::atomic::AtomicU64; 3]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 2];
+
+/// Which program of the defragmenter the title's pipeline `this` is
+/// ([`defrag_class`]): 0 none.
+#[cfg(windows)]
+pub(crate) fn defrag_class_of(this: This) -> u8 {
+    if this.is_null() { 0 } else { pipeline(this).defrag }
+}
+
+/// Whether a dispatch with the title's pipeline `this` is left out as the
+/// defragmenter's planner under `VICTORY_SKIP_DEFRAG=1`; counted by class
+/// either way (diagnostics).
+///
+/// Not cleared instead: zeroing the planner's outputs (so that the title
+/// reads "no moves planned") needs to know which of the views it writes
+/// through is the plan and how far each reaches. A root view is an address
+/// with no size; a table's view names its range, but whether the program
+/// writes only the plan there (and not, say, the heap's own allocation
+/// records, whose zeroing would lose every allocation) is in its code, not
+/// looked at here. `draw.rs` `defrag_report` says what it binds, for that
+/// choice.
+#[cfg(windows)]
+pub(crate) fn skips_defrag(this: This, indirect: bool) -> bool {
+    let class = defrag_class_of(this);
+    if class == 0 {
+        return false;
+    }
+    let left = class == 1 && skip_defrag();
+    #[cfg(feature = "diagnostics")]
+    DEFRAG_DISPATCHES[usize::from(class - 1)][if left { 2 } else { usize::from(indirect) }]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = indirect;
+    left
+}
+
+/// The frame line's part of [`skips_defrag`], per frame over `frames`,
+/// once a program of the defragmenter is known.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn defrag_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [planner, rest] =
+        DEFRAG_DISPATCHES.each_ref().map(|c| c.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames.max(1.0)));
+    let [planners, others] = DEFRAG_PIPELINES.each_ref().map(|n| n.load(Relaxed));
+    if planners + others == 0 {
+        return;
+    }
+    tracing::info!(
+        "the title's card-memory defragmenter, dispatches per frame: relocation planning run {:.1} direct, {:.1} indirect, left out {:.1} (VICTORY_SKIP_DEFRAG); rest of the family run {:.1} direct, {:.1} indirect; pipelines known: {planners} relocation planning, {others} rest",
+        planner[0],
+        planner[1],
+        planner[2],
+        rest[0],
+        rest[1]
+    );
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -1051,6 +1250,10 @@ struct Pipeline {
     /// [`RT_WORK`]`[i]`.
     #[cfg(windows)]
     rt_work: u8,
+    /// Which program of the title's card-memory defragmenter its compute
+    /// stage is ([`defrag_class`]): 0 none.
+    #[cfg(windows)]
+    defrag: u8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -1217,6 +1420,8 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
+    known::note(host.key(), &shaders, host.graphics.as_deref());
+    #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
@@ -1254,6 +1459,22 @@ fn hand_out(
                 }
             }
             work
+        },
+        #[cfg(windows)]
+        defrag: {
+            let class = shaders.iter().map(|s| s.defrag).max().unwrap_or(0);
+            #[cfg(feature = "diagnostics")]
+            if class != 0 {
+                let n = DEFRAG_PIPELINES[usize::from(class - 1)].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let hash = shaders.iter().find(|s| s.stage == "compute").map_or("", |s| s.hash.as_str());
+                tracing::info!(
+                    shader = hash,
+                    class = DEFRAG_CLASSES[usize::from(class - 1)],
+                    so_far = n,
+                    "a program of the title's card-memory defragmenter known"
+                );
+            }
+            class
         },
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
@@ -1436,6 +1657,8 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+pub mod known;
+#[cfg(windows)]
 mod library;
 
 /// Host pipelines created and loaded from the library since the start
@@ -1527,7 +1750,7 @@ mod tests {
             if ambient_follows(bytes) {
                 return 0;
             }
-            RT_WORK.iter().enumerate().filter(|(_, k)| holds(bytes, k.name)).fold(0, |w, (i, _)| w | (1 << i))
+            RT_WORK.iter().enumerate().filter(|(_, k)| (k.is)(bytes)).fold(0, |w, (i, _)| w | (1 << i))
         };
         assert_eq!(kinds(b"..\0bvh_skinningCSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."), 0b0001);
         assert_eq!(kinds(b"bvh_skinningCS"), 0b0001);
@@ -1538,9 +1761,37 @@ mod tests {
         assert_eq!(kinds(b"..\0CS_ScreenProbes_ActivateRays_0_Wrapped\0.."), 0b0100);
         assert_eq!(kinds(b"bvh_skinning_smh\0CSGenerateHairVB_c88a8f19_Wrapped\0.."), 0b1001);
         assert_eq!(kinds(b"..\0CS_ScreenProbes_TemporalResolve_Wave64\0.."), 0);
+        assert_eq!(kinds(b"..\0CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed\0.."), 0b1_0000);
+        assert_eq!(kinds(b"..\0CS_ScreenProbes_TraceRays_Voxels\0.."), 0);
+        assert_eq!(kinds(b"..\0CS_ScreenProbes_TraceRays_Fallback\0.."), 0);
+        assert_eq!(kinds(b"..\0CS_RaytraceVBuffer_ShaderBinning_WithFar\0.."), 0b1_0000);
+        assert_eq!(kinds(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."), 0);
+        assert_eq!(kinds(b"..\0CS_GenerateShadowMasks_Raytraced_Hair\0.."), 0b10_0000);
+        assert_eq!(kinds(b"..\0CS_RTShadowTrace_0\0.."), 0b10_0000);
+        assert_eq!(kinds(b"..\0CS_RaytraceShadows_Local\0.."), 0b10_0000);
+        assert_eq!(kinds(b"..\0CS_GenerateShadowMasks_Cascades\0.."), 0);
         assert_eq!(kinds(b"CS_RaytracingResolve\0CS_ScreenProbes_TemporalResolve\0"), 0);
         assert_eq!(kinds(b"CS_RaytracingResolve\0CS_UpdateHistory\0"), 0);
         assert_eq!(kinds(b""), 0);
+    }
+
+    /// The defragmenter's programs are known by the names in their
+    /// container, the planner apart; only `1` turns its switch on.
+    #[cfg(windows)]
+    #[test]
+    fn defrag_programs_are_known_by_name() {
+        assert_eq!(defrag_class(b"..\0CS_DefragHeap_ComputeRelocations_0_Wrapped\0.."), 1);
+        assert_eq!(defrag_class(b"DefragHeap_ComputeRelocations"), 1);
+        assert_eq!(defrag_class(b"..\0CS_DefragHeap_Move_Wrapped\0.."), 2);
+        assert_eq!(defrag_class(b"DefragHeap_ComputeRelocation"), 2);
+        assert_eq!(defrag_class(b"CS_Defrag\0Heap_ComputeRelocations"), 0);
+        assert_eq!(defrag_class(b"defragheap_computerelocations"), 0);
+        assert_eq!(defrag_class(b""), 0);
+        assert!(skip_defrag_value(Some("1")));
+        assert!(skip_defrag_value(Some(" 1 ")));
+        for off in [None, Some(""), Some("0"), Some("alt"), Some("skip"), Some("clear"), Some("true"), Some("11")] {
+            assert!(!skip_defrag_value(off), "{off:?}");
+        }
     }
 
     /// Which stores give title-memory copies as written: a vector store

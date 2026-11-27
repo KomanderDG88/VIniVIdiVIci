@@ -2204,6 +2204,13 @@ fn uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
+    // A recorded page (`VICTORY_LAZY_REMAP=1`) is reserved to the system
+    // and there to us: never noted absent. It cannot be made read-only, and
+    // stores reach it through other views, so it is written at every asking
+    // (its contents are taken again) rather than trusted to the guards.
+    if crate::recorded::present_bytes(block * BLOCK, BLOCK) != 0 {
+        return block;
+    }
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.

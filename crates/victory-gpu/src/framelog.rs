@@ -162,6 +162,18 @@ pub enum T {
     RemapAliasPages,
     RemapAliasRunPages,
     RemapAliasSamePages,
+    /// Page mappings recorded without the system (`VICTORY_LAZY_REMAP=1`,
+    /// `crate::recorded`): pages recorded, the system's mapping calls made
+    /// all the same, the calls the eager path would have made for them,
+    /// one-page views made on a first touch, faults served, microseconds
+    /// recording, and bytes our copies moved through stable views.
+    LazyPages,
+    LazyKernelOps,
+    LazyEagerOps,
+    LazyTouchViews,
+    LazyFaults,
+    LazyUs,
+    LazyHostBytes,
     /// The title's own mapping calls (`XMemMapPhysicalPages`, and each page
     /// of `XMemMapPhysicalPagesScatter`): calls, microseconds, pages.
     RemapDirectCalls,
@@ -625,6 +637,25 @@ fn remap_meter(f: &Frame) -> String {
         t(T::RemapDirectPages),
         t(T::DiskViews),
         ms(T::DiskViewUs),
+    ) + &lazy_meter(f)
+}
+
+/// The recording's part of a frame's line (`VICTORY_LAZY_REMAP=1`; nothing
+/// without the switch, so the line reads as before).
+fn lazy_meter(f: &Frame) -> String {
+    if !crate::recorded::on() {
+        return String::new();
+    }
+    let t = |x: T| f.t[x as usize];
+    format!(
+        "; recorded without the system {:.0} pages, {:.0} system mapping calls made ({:.0} the eager path would make),          {:.0} one-page views on a first touch, {:.0} faults served, {:.1} ms, {:.1} MB through stable views",
+        t(T::LazyPages),
+        t(T::LazyKernelOps),
+        t(T::LazyEagerOps),
+        t(T::LazyTouchViews),
+        t(T::LazyFaults),
+        t(T::LazyUs) / 1e3,
+        t(T::LazyHostBytes) / 1e6,
     )
 }
 
