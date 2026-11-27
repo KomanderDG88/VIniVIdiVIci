@@ -2614,6 +2614,14 @@ impl OnDemand {
         if waiting {
             crate::tiles::STATS[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // `VICTORY_RESIDENCY=1`: levels let go of with tiles are taken back
+        // by a later submission ([`give_back_loose`]).
+        if crate::residency::on() && tiled.loose() != 0 {
+            LOOSE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(std::sync::Arc::as_ptr(&self.0) as usize, Loose(std::sync::Arc::downgrade(&self.0)));
+        }
         waiting
     }
 
@@ -2623,6 +2631,77 @@ impl OnDemand {
             && tiled.card_wrote(&self.0.texture, levels)
         {
             crate::descriptor::host::levels_changed(memory);
+        }
+    }
+}
+
+/// Diagnostics (`crate::residency`): the host copy of title texture `this`,
+/// if it is made and filled from title memory: its address (a key) and the
+/// card's bytes it holds now (the tiles given, for one made level by level).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn card_copy(this: This) -> Option<(usize, u64)> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, _) = hosted(this, false)?;
+    if !host.filled {
+        return None;
+    }
+    let bytes = host.tiled.as_ref().map_or(host.bytes, crate::tiles::Tiled::given_bytes);
+    Some((std::sync::Arc::as_ptr(&host) as usize, bytes))
+}
+
+/// A host copy made level by level with levels let go of that still have
+/// tiles ([`give_back_loose`]); it does not keep the copy alive.
+#[cfg(windows)]
+struct Loose(std::sync::Weak<HostTexture>);
+
+// SAFETY: as for `OnDemand`: the host texture is named only in queue calls,
+// which any thread may make, and what it has been given is behind a lock.
+#[cfg(windows)]
+unsafe impl Send for Loose {}
+
+/// `VICTORY_RESIDENCY=1`: the host copies whose last upload found levels
+/// with tiles let go of, by address.
+#[cfg(windows)]
+static LOOSE: std::sync::Mutex<std::collections::BTreeMap<usize, Loose>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// `VICTORY_RESIDENCY=1`, on the submitting thread as a submission starts,
+/// ahead of its lists: the tiles of the levels the title let go of are
+/// taken away on `queue` (`crate::tiles::Tiled::take_back_on`, at most
+/// [`crate::residency::CALLS_A_PASS`] calls), and retired: they go back to
+/// the pool once that submission has finished. Copies whose levels wait
+/// (their upload has not finished, a write of the card's is recorded) stay
+/// for the next pass.
+#[cfg(windows)]
+pub(crate) fn give_back_loose(queue: &windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue) {
+    let entries = std::mem::take(&mut *LOOSE.lock().unwrap_or_else(|e| e.into_inner()));
+    if entries.is_empty() {
+        return;
+    }
+    let finished = crate::host::submissions_finished();
+    let mut calls = crate::residency::CALLS_A_PASS;
+    let mut later = Vec::new();
+    for (key, loose) in entries {
+        let Some(host) = loose.0.upgrade() else {
+            continue;
+        };
+        let Some(tiled) = &host.tiled else {
+            continue;
+        };
+        let (left, returned) = tiled.take_back_on(queue, &host.texture, true, finished, &mut calls);
+        if let Some(returned) = returned {
+            crate::host::retire(returned);
+        }
+        if left == crate::tiles::TakeBack::Later {
+            later.push((key, loose));
+        }
+    }
+    if !later.is_empty() {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, loose) in later {
+            map.entry(key).or_insert(loose);
         }
     }
 }

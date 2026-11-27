@@ -96,6 +96,8 @@ mod merge;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod null_samples;
 #[cfg(windows)]
+mod residency;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod tiles;

@@ -99,6 +99,17 @@ pub(crate) fn submissions_in_flight() -> u64 {
     STARTED.load(Ordering::Relaxed).saturating_sub(FINISHED.load(Ordering::Relaxed))
 }
 
+/// Submissions started so far: in a list's submission-time step, the
+/// number of the submission the list goes in.
+pub(crate) fn submissions_started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// Submissions finished (waited for) so far.
+pub(crate) fn submissions_finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -7161,6 +7172,13 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        // Levels on demand with `VICTORY_RESIDENCY=1`: the tiles of levels
+        // the title let go of are taken away on the queue ahead of this
+        // submission's lists, and go back to the pool once it has finished
+        // (`crate::resource::give_back_loose`).
+        if crate::residency::on() && crate::tiles::wanted() {
+            crate::resource::give_back_loose(&self.queue);
+        }
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;

@@ -42,6 +42,15 @@
 //!   the title lets go of, or that turns out to be the next texture's,
 //!   keeps its tiles; it is hidden by the views and written with zeros at
 //!   the next upload. Its tiles go back when the host copy does.
+//!   With `VICTORY_RESIDENCY=1` (off by default) they go back sooner
+//!   ([`Tiled::take_back_on`]): once the submission of the upload that
+//!   found the level let go of (and wrote it with zeros) has finished, and
+//!   while no recorded list holds a write of the card's into the texture,
+//!   the level's tiles are mapped to nothing on the queue, ahead of the
+//!   next submission's lists, and go back to the pool when that submission
+//!   has finished (`crate::host::retire`). The level read zeros before and
+//!   reads zeros after; a level the title holds again gets tiles anew from
+//!   the upload that writes it.
 //!
 //! Only for a texture the title places in memory and fills, two-dimensional,
 //! one layer, more than one level, of [`floor`] bytes or more, whose memory
@@ -55,6 +64,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::host;
+use crate::residency::RETURNED;
 
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
@@ -270,8 +280,41 @@ struct Given {
     levels: Vec<bool>,
     /// Whether the small levels the card packs together have theirs.
     packed: bool,
-    /// The runs taken: the heap's place, first tile, tiles.
+    /// The runs taken: the subresource they were given to (the first
+    /// packed level for the packed ones), the heap's place, first tile,
+    /// tiles.
+    runs: Vec<(u32, usize, u32, u32)>,
+}
+
+/// Tiles taken away from a texture's levels ([`Tiled::take_back_on`]):
+/// they go back to the pool when this is dropped, which is to be once the
+/// queue has run past the call that took them away (`crate::host::retire`).
+pub(crate) struct Returned {
+    /// The heap's place, first tile, tiles.
     runs: Vec<(usize, u32, u32)>,
+}
+
+impl Drop for Returned {
+    fn drop(&mut self) {
+        let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
+        for &(index, start, tiles) in &self.runs {
+            by_heap.entry(index).or_default().push((start, tiles));
+        }
+        for (index, runs) in by_heap {
+            give_back(index, &runs);
+        }
+    }
+}
+
+/// What [`Tiled::take_back_on`] left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TakeBack {
+    /// No level is let go of with tiles any more (or the switch is off).
+    Done,
+    /// Some are, and wait: for the upload that let them go to finish, for
+    /// a recorded write of the card's to be submitted, or for the next
+    /// pass (this one made its calls).
+    Later,
 }
 
 /// A host texture made without memory, and the tiles its levels have been
@@ -298,6 +341,16 @@ pub(crate) struct Tiled {
     /// The levels a recorded list of the card's own writes has already
     /// written with zeros first ([`Tiled::claim`]).
     claimed: AtomicU32,
+    /// The levels with tiles that were neither held nor the card's at the
+    /// last upload (the title let go of them; [`Tiled::take_back_on`]).
+    loose: AtomicU32,
+    /// The submission of that upload (0: none).
+    loose_at: AtomicU64,
+    /// Lists recorded with a write of the card's into the texture whose
+    /// submission-time step has not run (`texture.rs` `card_writes`): no
+    /// level is taken back meanwhile, for such a list sends no zeros into
+    /// a level that had tiles when it was recorded.
+    pending: AtomicU32,
 }
 
 impl Tiled {
@@ -367,6 +420,9 @@ impl Tiled {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            loose: AtomicU32::new(0),
+            loose_at: AtomicU64::new(0),
+            pending: AtomicU32::new(0),
         })
     }
 
@@ -401,6 +457,21 @@ impl Tiled {
         held: u32,
         room: bool,
     ) -> (bool, bool) {
+        self.uploaded_at(queue, device, texture, held, room, crate::host::submissions_started())
+    }
+
+    /// [`Tiled::uploaded_on`] in submission `submission` (the one the
+    /// uploading list goes in): the levels with tiles it finds neither held
+    /// nor the card's are noted as let go of ([`Tiled::loose`]).
+    pub(crate) fn uploaded_at(
+        &self,
+        queue: &ID3D12CommandQueue,
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        held: u32,
+        room: bool,
+        submission: u64,
+    ) -> (bool, bool) {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
@@ -417,6 +488,10 @@ impl Tiled {
         let changed =
             self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card | small });
         let missing = self.without_locked(&given, named) != 0;
+        // This list writes every level, the ones let go of with zeros.
+        let loose = self.given_locked(&given) & !named;
+        self.loose.store(loose, Ordering::SeqCst);
+        self.loose_at.store(if loose != 0 { submission } else { 0 }, Ordering::SeqCst);
         (changed, missing)
     }
 
@@ -535,6 +610,163 @@ impl Tiled {
         self.claimed.fetch_and(!levels, Ordering::Relaxed);
     }
 
+    /// The levels that have tiles now, a bit a level.
+    fn given_locked(&self, given: &Given) -> u32 {
+        self.every_level() & !self.without_locked(given, u32::MAX)
+    }
+
+    /// The bits of the levels the card packs together (0: none).
+    fn packed_bits(&self) -> u32 {
+        if self.packed == 0 {
+            return 0;
+        }
+        let first_packed = self.standard.len() as u32;
+        self.every_level() & !((1u32 << first_packed) - 1)
+    }
+
+    /// The levels with tiles the last upload found let go of (a bit a
+    /// level; [`Tiled::take_back_on`] gives their tiles back).
+    pub(crate) fn loose(&self) -> u32 {
+        self.loose.load(Ordering::SeqCst)
+    }
+
+    /// A list is being recorded with a write of the card's into the
+    /// texture (`texture.rs` `card_writes`), before it claims levels: until
+    /// [`Tiled::unpend`], no level is taken back.
+    pub(crate) fn pend(&self) {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// That list's submission-time step has run, or the list was reset
+    /// without being submitted.
+    pub(crate) fn unpend(&self) {
+        let _ = self.pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+    }
+
+    /// `VICTORY_RESIDENCY=1` (`on`): takes the tiles of the levels the
+    /// title let go of ([`Tiled::loose`], [`crate::residency::returnable`])
+    /// away from `texture` on `queue`, in at most `calls` calls of
+    /// `UpdateTileMappings` (counted down), with `finished` submissions
+    /// finished. To be called on the submitting thread, ahead of a
+    /// submission's lists: what was submitted before runs before the call
+    /// on the queue, and those levels read zeros either way (the upload
+    /// that let them go wrote zeros there, and has finished). The tiles
+    /// are handed to the caller to retire: they go back to the pool when
+    /// the [`Returned`] is dropped.
+    pub(crate) fn take_back_on(
+        &self,
+        queue: &ID3D12CommandQueue,
+        texture: &ID3D12Resource,
+        on: bool,
+        finished: u64,
+        calls: &mut u32,
+    ) -> (TakeBack, Option<Returned>) {
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = self.loose.load(Ordering::SeqCst);
+        if !on || loose == 0 {
+            return (TakeBack::Done, None);
+        }
+        let named = self.held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
+        let packed_bits = self.packed_bits();
+        let has = self.given_locked(&given);
+        // What could go at all, and what goes now.
+        let ever = crate::residency::returnable(true, has, named, loose, 1, 1, 0, packed_bits);
+        if ever == 0 {
+            self.loose.store(0, Ordering::SeqCst);
+            return (TakeBack::Done, None);
+        }
+        let pending = self.pending.load(Ordering::SeqCst);
+        let loose_at = self.loose_at.load(Ordering::SeqCst);
+        let back = crate::residency::returnable(true, has, named, loose, loose_at, finished, pending, packed_bits);
+        if back == 0 || *calls == 0 {
+            if pending != 0 {
+                RETURNED[3].fetch_add(1, Ordering::Relaxed);
+            }
+            return (TakeBack::Later, None);
+        }
+        let first_packed = self.standard.len() as u32;
+        // (subresource, its tiles, the bits of the levels on them)
+        let mut groups: Vec<(u32, u32, u32)> = (0..first_packed)
+            .filter(|&level| back & (1 << level) != 0)
+            .map(|level| (level, self.standard[level as usize], 1 << level))
+            .collect();
+        if packed_bits != 0 && back & packed_bits == packed_bits {
+            groups.push((first_packed, self.packed, packed_bits));
+        }
+        let mut taken = Vec::new();
+        let mut gone = 0u32;
+        for (subresource, tiles, bits) in groups {
+            if *calls == 0 {
+                break;
+            }
+            let runs: Vec<(u32, usize, u32, u32)> =
+                given.runs.iter().copied().filter(|run| run.0 == subresource).collect();
+            // The heap its tiles are in (no range of the call reads it).
+            let heap = runs.first().and_then(|run| {
+                let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+                pool.get(run.1).and_then(|h| h.as_ref().map(|h| h.heap.clone()))
+            });
+            let at = D3D12_TILED_RESOURCE_COORDINATE {
+                X: 0,
+                Y: 0,
+                Z: 0,
+                Subresource: subresource,
+            };
+            let size = D3D12_TILE_REGION_SIZE {
+                NumTiles: tiles,
+                ..Default::default()
+            };
+            let flags = [D3D12_TILE_RANGE_FLAG_NULL];
+            let starts = [0u32];
+            let counts = [tiles];
+            let began = std::time::Instant::now();
+            // SAFETY: a live reserved texture; one region of the
+            // subresource's `tiles` tiles from its first, mapped to nothing
+            // by one range of as many tiles (whose heap offset is not
+            // read), in arrays that live through the call.
+            unsafe {
+                queue.UpdateTileMappings(
+                    texture,
+                    1,
+                    Some(&raw const at),
+                    Some(&raw const size),
+                    heap.as_ref(),
+                    1,
+                    Some(flags.as_ptr()),
+                    Some(starts.as_ptr()),
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+            *calls -= 1;
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            if subresource < first_packed {
+                given.levels[subresource as usize] = false;
+            } else {
+                given.packed = false;
+            }
+            given.runs.retain(|run| run.0 != subresource);
+            let bytes: u64 = runs.iter().map(|run| u64::from(run.3) * TILE).sum();
+            taken.extend(runs.iter().map(|run| (run.1, run.2, run.3)));
+            gone |= bits;
+            STATS[2].fetch_sub(bytes, Ordering::Relaxed);
+            RETURNED[0].fetch_add(u64::from(bits.count_ones()), Ordering::Relaxed);
+            RETURNED[1].fetch_add(bytes, Ordering::Relaxed);
+            RETURNED[2].fetch_add(1, Ordering::Relaxed);
+        }
+        // A level taken back is new again to a write of the card's: the
+        // next one sends its zeros first.
+        self.claimed.fetch_and(!gone, Ordering::Relaxed);
+        let left = loose & !gone;
+        let still = crate::residency::returnable(true, self.given_locked(&given), named, left, 1, 1, 0, packed_bits);
+        self.loose.store(if still == 0 { 0 } else { left }, Ordering::SeqCst);
+        // (No level taken back is named: the first level a view may show
+        // stays where it was, and no slot is made again.)
+        let returned = (!taken.is_empty()).then_some(Returned { runs: taken });
+        (if still == 0 { TakeBack::Done } else { TakeBack::Later }, returned)
+    }
+
     /// Of `levels` (a bit a level), the ones that have no tiles now.
     pub(crate) fn without(&self, levels: u32) -> u32 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
@@ -645,7 +877,7 @@ impl Tiled {
                 None => given.packed = true,
             }
             for &(start, count) in &runs {
-                given.runs.push((index, start, count));
+                given.runs.push((subresource, index, start, count));
             }
             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
@@ -711,7 +943,7 @@ impl Tiled {
     /// The bytes of the tiles it has now.
     pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
+        given.runs.iter().map(|run| u64::from(run.3) * TILE).sum()
     }
 }
 
@@ -720,7 +952,7 @@ impl Drop for Tiled {
         let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
         let mut bytes = 0;
         let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
-        for &(index, start, tiles) in &given.runs {
+        for &(_, index, start, tiles) in &given.runs {
             by_heap.entry(index).or_default().push((start, tiles));
             bytes += u64::from(tiles) * TILE;
         }
@@ -813,6 +1045,27 @@ pub(crate) fn status() {
         small_when_full_mb(),
         blank[2],
     );
+    if crate::residency::on() {
+        static RETURNED_BEFORE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+        let r: Vec<u64> = RETURNED.iter().map(|r| r.load(Ordering::Relaxed)).collect();
+        let frame = crate::frame::current();
+        let levels = r[0] - RETURNED_BEFORE[0].swap(r[0], Ordering::Relaxed);
+        let bytes = r[1] - RETURNED_BEFORE[1].swap(r[1], Ordering::Relaxed);
+        let frames = frame.saturating_sub(RETURNED_BEFORE[2].swap(frame, Ordering::Relaxed)).max(1);
+        tracing::info!(
+            "texture levels the title let go of, their tiles given back while the host copy lives (VICTORY_RESIDENCY=1): since the \
+             line before {} levels, {} MB in {} frames ({} KB a frame); in all {} levels, {} MB, {} calls of UpdateTileMappings, \
+             {} times put off for a write of the card's recorded and not submitted",
+            levels,
+            bytes >> 20,
+            frames,
+            (bytes / frames) >> 10,
+            r[0],
+            r[1] >> 20,
+            r[2],
+            r[3],
+        );
+    }
 }
 
 /// On the card, without the title: what levels on demand relies on, with
@@ -1533,6 +1786,99 @@ void look() {
         assert_eq!(tiled.claim(small), small);
     }
 
+    /// Whether tiles `start..start + count` of the pool's heap at `index`
+    /// are free.
+    fn pool_free(index: usize, start: u32, count: u32) -> bool {
+        let pool = POOL.lock().unwrap();
+        pool.get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|h| h.free.iter().any(|&(from, tiles)| from <= start && start + count <= from + tiles))
+    }
+
+    /// (viii) `VICTORY_RESIDENCY=1`: the levels the title let go of give
+    /// their tiles back only once the upload that let them go (and wrote
+    /// them with zeros) has finished, never while a write of the card's is
+    /// recorded, and the tiles reach the pool only when what took them away
+    /// is dropped, after the fence; a level still held keeps its tiles and
+    /// its bytes; with the switch off nothing changes; a level held again
+    /// gets tiles anew from the upload that writes it.
+    fn let_go_levels_give_tiles_back_after_the_fence(rig: &mut Rig) {
+        rig.step = "step 8, levels the title let go of give their tiles back";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let (texture, tiled) = rig.reserved(&desc);
+        let layout = rig.footprints(&desc);
+        let upload = rig.filled(&layout, |level| level as u8 + 1);
+        // Held from level 1, given and written.
+        let (changed, waiting) = tiled.uploaded_at(&rig.queue, &rig.device, &texture, from_level(1), true, rig.submitted + 1);
+        rig.check("held from level 1");
+        assert!(changed && !waiting);
+        rig.round_trip(&texture, &layout, Some(&upload));
+        assert_eq!(tiled.loose(), 0, "nothing let go of yet");
+        let before = tiled.given_bytes();
+        // The title lets go of levels 1 and 2: the upload finds them so and
+        // writes zeros there.
+        let at = rig.submitted + 1;
+        let (changed, _) = tiled.uploaded_at(&rig.queue, &rig.device, &texture, from_level(3), true, at);
+        rig.check("held from level 3");
+        assert!(changed, "the first level a view may show moved");
+        assert_eq!(tiled.first_shown(), Some(3));
+        assert_eq!(tiled.loose(), 0b110);
+        let mut calls = 32;
+        // Before that upload's submission has finished: nothing goes.
+        let (left, returned) = tiled.take_back_on(&rig.queue, &texture, true, at - 1, &mut calls);
+        assert!(left == TakeBack::Later && returned.is_none() && calls == 32);
+        // With the switch off: nothing, whatever has finished.
+        let (left, returned) = tiled.take_back_on(&rig.queue, &texture, false, at, &mut calls);
+        assert!(left == TakeBack::Done && returned.is_none() && calls == 32);
+        // A write of the card's recorded and not submitted: nothing.
+        tiled.pend();
+        let (left, returned) = tiled.take_back_on(&rig.queue, &texture, true, at, &mut calls);
+        assert!(left == TakeBack::Later && returned.is_none() && calls == 32);
+        tiled.unpend();
+        assert_eq!(tiled.given_bytes(), before);
+        assert!(tiled.has_tiles(1) && tiled.has_tiles(2));
+        let zeros = rig.filled(&layout, |level| if level >= 3 { level as u8 + 1 } else { 0 });
+        rig.round_trip(&texture, &layout, Some(&zeros));
+        assert_eq!(rig.submitted, at);
+        // Finished: levels 1 and 2 go, in a call each, ahead of what is
+        // submitted next.
+        let (left, returned) = tiled.take_back_on(&rig.queue, &texture, true, rig.submitted, &mut calls);
+        rig.check("levels taken back");
+        let returned = returned.expect("tiles taken back");
+        assert_eq!(left, TakeBack::Done);
+        assert_eq!(calls, 30);
+        assert!(!tiled.has_tiles(1) && !tiled.has_tiles(2) && (3..u32::from(LEVELS)).all(|l| tiled.has_tiles(l)));
+        assert_eq!(tiled.first_shown(), Some(3), "no level shown was taken back");
+        assert_eq!(tiled.loose(), 0);
+        let tiles = u64::from(tiled.standard[1] + tiled.standard[2]);
+        assert_eq!(tiled.given_bytes(), before - tiles * TILE);
+        assert_eq!(returned.runs.iter().map(|r| u64::from(r.2)).sum::<u64>(), tiles);
+        // Not in the pool before the queue has run past the call.
+        let runs = returned.runs.clone();
+        assert!(runs.iter().all(|&(i, s, n)| !pool_free(i, s, n)), "taken back tiles were free before the fence");
+        // (The submission waits for the card: past the fence.) The levels
+        // taken back read zeros, the held ones their bytes.
+        let read = rig.round_trip(&texture, &layout, None);
+        for (level, bytes) in read.iter().enumerate() {
+            let want = if level >= 3 { level as u8 + 1 } else { 0 };
+            assert!(all(bytes, want), "after the take back: level {level} reads {bytes:?}, wanted {want}");
+        }
+        drop(returned);
+        assert!(runs.iter().all(|&(i, s, n)| pool_free(i, s, n)), "taken back tiles not in the pool after the drop");
+        // Nothing more to take: done at once, no call.
+        let (left, returned) = tiled.take_back_on(&rig.queue, &texture, true, rig.submitted, &mut calls);
+        assert!(left == TakeBack::Done && returned.is_none() && calls == 30);
+        // Held again: tiles anew from the upload that writes them.
+        let (changed, waiting) = tiled.uploaded_at(&rig.queue, &rig.device, &texture, from_level(1), true, rig.submitted + 1);
+        rig.check("held from level 1 again");
+        assert!(changed && !waiting && tiled.loose() == 0);
+        let read = rig.round_trip(&texture, &layout, Some(&upload));
+        for (level, bytes) in read.iter().enumerate() {
+            let want = if level >= 1 { level as u8 + 1 } else { 0 };
+            assert!(all(bytes, want), "held again: level {level} reads {bytes:?}, wanted {want}");
+        }
+    }
+
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
@@ -1549,6 +1895,7 @@ void look() {
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
+        let_go_levels_give_tiles_back_after_the_fence(&mut rig);
         for (min_lod, expected) in [(0.0, [32, 0]), (3.0, [64, 64])] {
             let Some(read) = sample_resident_views(&mut rig, min_lod) else {
                 eprintln!("the view test's shader or objects could not be made; that part was skipped");
@@ -1671,6 +2018,9 @@ void look() {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            loose: AtomicU32::new(0),
+            loose_at: AtomicU64::new(0),
+            pending: AtomicU32::new(0),
         };
         assert_eq!(tiled.claim(1 << 0), 1 << 0);
         let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);

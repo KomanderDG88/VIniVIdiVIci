@@ -2347,6 +2347,12 @@ impl State {
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
+        // A shader that picks views by a computed index draws in this frame
+        // (`VICTORY_RESIDENCY_STATS=1`: the census's possibly sampled).
+        #[cfg(feature = "diagnostics")]
+        if crate::residency::stats_on() {
+            crate::residency::picked_by_index(crate::frame::current());
+        }
         // One key per list, as textures have: no title resource is there.
         const ONCE: usize = usize::MAX - 0x5e;
         if !list.first_use(ONCE) {
@@ -2737,6 +2743,58 @@ impl State {
         if crate::null_samples::on() {
             self.null_samples(p);
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::residency::stats_on() {
+            self.residency_samples(p);
+        }
+    }
+
+    /// `VICTORY_RESIDENCY_STATS=1` (`crate::residency`): the slots this
+    /// draw's pixel shader picks by an index from its root constants, or
+    /// from a skin bake's records, are stamped as sampled in this frame
+    /// (`HostHeap::slot_sampled`). Found as [`State::null_samples`] finds
+    /// them, without asking the queue or the slots (no lock): a store per
+    /// slot whose stamp changes.
+    #[cfg(feature = "diagnostics")]
+    fn residency_samples(&self, p: &HostPipeline) {
+        let Some(stage) = p.stages.iter().find(|s| s.shader.stage == "pixel") else {
+            return;
+        };
+        let t = stage.translated();
+        let tables = bake_tables(p);
+        if tables.is_none() && t.host.root_indexed_views.is_empty() {
+            return;
+        }
+        if let Some(tables) = tables
+            && let Some(heap) = self
+                .heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .map(|&h| crate::descriptor::heap(h as This))
+                .find(|h| !h.samplers())
+            && let Some(host) = heap.host()
+            && let Some((_, textures)) = self.bake_textures(tables, heap)
+        {
+            for (index, _) in textures {
+                host.slot_sampled(index, crate::residency::BAKE);
+            }
+        }
+        for index in &t.host.root_indexed_views {
+            let slot = index.table_slot;
+            let fresh = t.used.iter().any(|u| u.root == RootType::Table && u.slot == slot && u.kind == ResourceType::Cbv)
+                || t.host.half_views.iter().any(|h| h.0 == slot);
+            let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(slot)).filter(|_| !fresh) else {
+                continue;
+            };
+            let constant = self.user_value(false, index.constant_slot, RootType::Constants, index.constant_dword);
+            let handle = table + u64::from(index.byte_offset.wrapping_add(constant << index.shift) / 32) * 32;
+            if let Some(heap) = self.heap_of(table)
+                && let Some(at) = heap.index(handle)
+                && let Some(host) = heap.host()
+            {
+                host.slot_sampled(at, crate::residency::ROOT);
+            }
+        }
     }
 
     /// `VICTORY_NULL_SAMPLES=count` ([`crate::null_samples`]): after the
@@ -2939,6 +2997,32 @@ impl State {
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
     ) -> Option<BakeSources> {
+        let (records, textures) = self.bake_textures(tables, heap)?;
+        let mut sources = BakeSources { records, ..Default::default() };
+        let indices: Vec<u32> = textures.iter().map(|t| t.0).collect();
+        sources.queued = host.texture_slots_queued(&indices).into_iter().map(|q| q.0).collect();
+        sources.textures = textures;
+        for &(index, handle) in &sources.textures {
+            if sources.queued.contains(&index) {
+                continue;
+            }
+            if host.texture_slot_made_from(index, handle) {
+                sources.ready += 1;
+            } else if placed_there(handle) {
+                sources.unmade.push(index);
+            } else {
+                sources.other += 1;
+            }
+        }
+        Some(sources)
+    }
+
+    /// The slots that hold a texture view among those a draw of the
+    /// title's skin bake samples ([`BakeTables`]), read from its own
+    /// constants and records, with their handles; and the records it walks
+    /// and how many were read. No lock is taken. `None` as for
+    /// [`State::bake_sources`].
+    fn bake_textures(&self, tables: BakeTables, heap: &crate::descriptor::Heap) -> Option<((u32, u32), Vec<(u32, u64)>)> {
         let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(tables.slot)) else {
             return None;
         };
@@ -2958,7 +3042,6 @@ impl State {
             let mut record = [0u8; 0x44];
             crate::host::read_into((address + u64::from(i) * BAKE_RECORD) as *const u8, &mut record).then_some(record)
         });
-        let mut sources = BakeSources { records, ..Default::default() };
         let mut textures = Vec::new();
         for index in named {
             let Some(handle) = heap.handle(index) else {
@@ -2968,22 +3051,7 @@ impl State {
                 textures.push((index, handle));
             }
         }
-        let indices: Vec<u32> = textures.iter().map(|t| t.0).collect();
-        sources.queued = host.texture_slots_queued(&indices).into_iter().map(|q| q.0).collect();
-        sources.textures = textures;
-        for &(index, handle) in &sources.textures {
-            if sources.queued.contains(&index) {
-                continue;
-            }
-            if host.texture_slot_made_from(index, handle) {
-                sources.ready += 1;
-            } else if placed_there(handle) {
-                sources.unmade.push(index);
-            } else {
-                sources.other += 1;
-            }
-        }
-        Some(sources)
+        Some((records, textures))
     }
 
     /// Of a bake draw's textures, the ones the draw samples wrong: placed
@@ -3242,6 +3310,9 @@ impl State {
                 // What the slots shaders pick by index show, every five seconds.
                 #[cfg(feature = "diagnostics")]
                 host.placed_slot_census();
+                // What draws sample, every 16 frames (`VICTORY_RESIDENCY_STATS=1`).
+                #[cfg(feature = "diagnostics")]
+                host.residency_census(frame);
                 HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
                 for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
                     count.store(now, Ordering::Relaxed);

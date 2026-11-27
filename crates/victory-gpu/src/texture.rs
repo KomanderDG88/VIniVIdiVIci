@@ -993,7 +993,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// step. A list that is reset without having been submitted gives the
 /// claim up, or the next list that writes those levels would send no zeros
 /// and what its write does not cover would be what the tiles' last owner
-/// left.
+/// left. It also holds the texture's levels from being taken back
+/// (`crate::tiles::Tiled::pend`) until the step has run or the list is
+/// reset.
 struct Claimed {
     on_demand: crate::resource::OnDemand,
     fresh: u32,
@@ -1002,11 +1004,14 @@ struct Claimed {
 
 impl Drop for Claimed {
     fn drop(&mut self) {
-        if self.fresh != 0
-            && !*self.ran.get_mut()
-            && let Some(tiled) = self.on_demand.tiled()
-        {
-            tiled.unclaim(self.fresh);
+        if *self.ran.get_mut() {
+            return;
+        }
+        if let Some(tiled) = self.on_demand.tiled() {
+            if self.fresh != 0 {
+                tiled.unclaim(self.fresh);
+            }
+            tiled.unpend();
         }
     }
 }
@@ -1036,6 +1041,10 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     if levels == 0 {
         return;
     }
+    // Before the claim: no level of the texture is taken back
+    // (`VICTORY_RESIDENCY`) while this list is recorded and not submitted,
+    // for it sends no zeros into a level that has tiles now.
+    tiled.pend();
     let fresh = tiled.claim(levels);
     // Of them, the ones whose zeros could not be recorded.
     let mut unzeroed = if host().is_none() { fresh } else { 0 };
@@ -1088,6 +1097,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     }
     let levels = levels & !unzeroed;
     if levels == 0 {
+        tiled.unpend();
         return;
     }
     let memory = crate::resource::texture_memory(resource).map_or(0, |(memory, _)| memory as u64);
@@ -1099,6 +1109,9 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     list.defer_host(move || {
         step.ran.store(true, std::sync::atomic::Ordering::Relaxed);
         step.on_demand.card_wrote(levels, memory);
+        if let Some(tiled) = step.on_demand.tiled() {
+            tiled.unpend();
+        }
     });
 }
 

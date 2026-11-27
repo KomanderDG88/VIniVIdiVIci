@@ -264,6 +264,11 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// Diagnostics, `VICTORY_RESIDENCY_STATS=1`: per title slot, the frame a
+    /// draw last sampled it and how that is known
+    /// (`crate::residency::stamp`; 0: never). Empty with the switch off.
+    #[cfg(feature = "diagnostics")]
+    sampled: Vec<std::sync::atomic::AtomicU32>,
     /// Per title slot, bits saying which sets the slot may be in without
     /// taking their lock to ask ([`SLOT_IN_TEXTURES`],
     /// [`SLOT_IN_PLACED`], [`SLOT_IN_BUFFERS`]): `note_buffer_into` runs
@@ -1697,6 +1702,10 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            #[cfg(feature = "diagnostics")]
+            sampled: (0..if sampler || !crate::residency::stats_on() { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
             slot_flags: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
@@ -2488,6 +2497,8 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
+            #[cfg(feature = "diagnostics")]
+            self.slot_sampled_in(index, frame, crate::residency::TABLE);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.slots.remove(&index).is_some() {
@@ -2504,6 +2515,27 @@ impl HostHeap {
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+    }
+
+    /// Diagnostics, `VICTORY_RESIDENCY_STATS=1`: a draw samples title slot
+    /// `index` in this frame, as `source` says (`crate::residency::ROOT`,
+    /// `crate::residency::BAKE`). A store when the stamp changes; no lock.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn slot_sampled(&self, index: u32, source: u32) {
+        self.slot_sampled_in(index, crate::frame::current(), source);
+    }
+
+    /// [`HostHeap::slot_sampled`] in frame `frame`.
+    #[cfg(feature = "diagnostics")]
+    fn slot_sampled_in(&self, index: u32, frame: u64, source: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(at) = self.sampled.get(index as usize) else {
+            return;
+        };
+        let stamp = crate::residency::stamp(frame, source);
+        if at.load(Relaxed) != stamp {
+            at.store(stamp, Relaxed);
+        }
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -3590,6 +3622,75 @@ impl HostHeap {
             REASKED[0].load(Relaxed),
             REASKED[1].load(Relaxed),
         );
+    }
+
+    /// Diagnostics, `VICTORY_RESIDENCY_STATS=1`, every
+    /// `crate::residency::EVERY` frames: the host copies of textures the
+    /// title fills that the placed slots show, by whether a draw sampled
+    /// one of their slots in the last `crate::residency::WINDOW` frames
+    /// (exactly: [`HostHeap::slot_sampled`] and the table-read stamp;
+    /// possibly: a slot that is not a table's lately, in a window in which
+    /// a shader picked views by a computed index), and the slots held for
+    /// room by the same classes; one line (`crate::residency::log`). Each
+    /// lock is taken alone, as by [`HostHeap::placed_slot_census`].
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn residency_census(&self, frame: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.sampler || self.sampled.is_empty() || !crate::residency::due(frame) {
+            return;
+        }
+        let began = std::time::Instant::now();
+        let window = crate::residency::WINDOW;
+        let picked = crate::residency::picked_lately(frame, window);
+        let slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            placed.by_slot.keys().copied().collect()
+        };
+        let keys: Vec<u64> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            slots.iter().map(|&slot| made.get(slot as usize).copied().unwrap_or(0)).collect()
+        };
+        let held: Vec<u32> = {
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            textures.held.keys().copied().collect()
+        };
+        let stamp_of = |slot: u32| self.sampled.get(slot as usize).map_or(0, |s| s.load(Relaxed));
+        let possible = |slot: u32| picked && !self.tabled_lately(slot, frame);
+        // Per host copy: its bytes, the newest stamp of its slots, whether
+        // one of them is possibly sampled.
+        let mut by_copy: std::collections::HashMap<usize, (u64, u32, bool)> = std::collections::HashMap::new();
+        // The copy each key's view shows, found once.
+        let mut copies: std::collections::HashMap<u64, Option<(usize, u64)>> = std::collections::HashMap::new();
+        for (&slot, &key) in slots.iter().zip(&keys) {
+            if key == 0 {
+                continue;
+            }
+            let copy = *copies.entry(key).or_insert_with(|| {
+                view_at(key as u32, (key >> 32) as u32)
+                    .and_then(|view| match view {
+                        View::Placed(false, resource, desc) => crate::resource::texture_at_made(
+                            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                            &resource,
+                        ),
+                        View::Shader(texture, _) => Some(texture as crate::object::This),
+                        _ => None,
+                    })
+                    .and_then(crate::resource::card_copy)
+            });
+            let Some((id, bytes)) = copy else {
+                continue;
+            };
+            let entry = by_copy.entry(id).or_insert((bytes, 0, false));
+            entry.1 = crate::residency::newer(entry.1, stamp_of(slot), frame);
+            entry.2 |= possible(slot);
+        }
+        let summary = crate::residency::aggregate(
+            frame,
+            window,
+            by_copy.into_values(),
+            held.iter().map(|&slot| (stamp_of(slot), possible(slot))),
+        );
+        crate::residency::log(frame, &summary, slots.len() as u64, began.elapsed().as_micros() as u64);
     }
 
     /// The view host slot `index` was made from, in a few words, with the
