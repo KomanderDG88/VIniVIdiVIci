@@ -1916,6 +1916,44 @@ impl HostHeap {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).queued(indices)
     }
 
+    /// Of the slots `indices` (each once), the ones whose host slot shows
+    /// nothing and that wait in the queue otherwise: not held for room, not
+    /// waiting for their memory to be mapped, not uploaded whole and
+    /// waiting for another look (the slot census's "in the queue
+    /// otherwise", `HostHeap::placed_slot_census`). For a draw that uploads
+    /// such slots before it samples them
+    /// (`crate::draw::State::draw_sources_pass`). Takes the queue, then
+    /// `made` and pieces of `kept` (as `mirror` takes them), in turn.
+    pub(crate) fn texture_slots_null_queued(&self, indices: &[u32]) -> Vec<u32> {
+        let mut out: Vec<u32> = {
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            indices
+                .iter()
+                .copied()
+                .filter(|index| {
+                    textures.slots.get(index).is_some_and(|w| {
+                        w.checked.2 == 0 && !(w.looks > 0 && w.mapped == 0) && !textures.held.contains_key(index)
+                    })
+                })
+                .collect()
+        };
+        if out.is_empty() {
+            return out;
+        }
+        out.sort_unstable();
+        out.dedup();
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        out.retain(|&index| {
+            made.get(index as usize).is_none_or(|&key| key == 0)
+                || !self.kept[(index % KEPT_PIECES) as usize]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get((index / KEPT_PIECES) as usize)
+                    .is_some_and(Option::is_some)
+        });
+        out
+    }
+
     /// Every title slot of the queue that is due at `frame`, and whether
     /// it was uploaded before (in part, or whole and waiting for another
     /// look): for the card accounting line

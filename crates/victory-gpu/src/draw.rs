@@ -81,6 +81,15 @@ thread_local! {
     /// their memory is not mapped, and left because no more of their
     /// memory is mapped than at their last upload.
     static PASS_SOURCED: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+    /// For such a run made for any draw's own (`State::draw_sources_pass`,
+    /// `VICTORY_DRAW_SOURCES=1`) in place of a skin bake's: the bytes it
+    /// may upload and the instant it ends by (none: no time of its own).
+    /// Unset: the bake's (`VICTORY_BAKE_SOURCES_MB`).
+    static PASS_SOURCES_LIMIT: std::cell::Cell<Option<(u64, Option<std::time::Instant>)>> =
+        const { std::cell::Cell::new(None) };
+    /// The slots such a run left behind when it stopped at its bytes or
+    /// its time.
+    static PASS_LEFT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// The tables a pixel shader reads as a skin bake does
     /// ([`bake_tables`]), by the shader's hash.
     static BAKE_TABLES: std::cell::RefCell<std::collections::HashMap<String, Option<BakeTables>>> =
@@ -240,6 +249,83 @@ fn bake_sources_mode() -> (BakeMode, u64) {
         (mode, mb << 20)
     })
 }
+
+/// What `VICTORY_DRAW_SOURCES=1` allows (off when unset or anything else):
+/// before any draw, the textures its pixel shader samples whose host slot
+/// shows nothing while they wait in the queue of textures picked by index
+/// (`HostHeap::texture_slots_null_queued`) are uploaded first, on the
+/// thread that records the draw, by the run of the texture pass a skin
+/// bake's own get (`State::draw_sources_pass`), only while the card has
+/// room (`resource::room`), as `VICTORY_BAKE_SOURCES=1` does for a bake.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DrawSources {
+    /// Bytes one draw's run may upload (`VICTORY_DRAW_SOURCES_MB`, 8).
+    draw_bytes: u64,
+    /// Bytes the runs of a frame may upload together
+    /// (`VICTORY_DRAW_SOURCES_FRAME_MB`, 64; 0: no such limit).
+    frame_bytes: u64,
+    /// Milliseconds the runs of a frame may take together
+    /// (`VICTORY_DRAW_SOURCES_FRAME_MS`, 12; 0: no such limit).
+    frame_ms: u64,
+}
+
+/// [`DrawSources`] from the variables `get` reads; `None`: off.
+fn draw_sources_parse(get: impl Fn(&str) -> Option<String>) -> Option<DrawSources> {
+    if get("VICTORY_DRAW_SOURCES").as_deref().map(str::trim) != Some("1") {
+        return None;
+    }
+    let number = |name: &str, default: u64| get(name).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default);
+    Some(DrawSources {
+        draw_bytes: number("VICTORY_DRAW_SOURCES_MB", 8).saturating_mul(1 << 20),
+        frame_bytes: number("VICTORY_DRAW_SOURCES_FRAME_MB", 64).saturating_mul(1 << 20),
+        frame_ms: number("VICTORY_DRAW_SOURCES_FRAME_MS", 12),
+    })
+}
+
+/// [`draw_sources_parse`] of the environment, read once.
+fn draw_sources_mode() -> Option<DrawSources> {
+    static MODE: std::sync::OnceLock<Option<DrawSources>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = draw_sources_parse(|name| std::env::var(name).ok());
+        if let Some(m) = mode {
+            tracing::info!(
+                mode = "1",
+                megabytes_a_draw = m.draw_bytes >> 20,
+                megabytes_a_frame = m.frame_bytes >> 20,
+                ms_a_frame = m.frame_ms,
+                "textures a draw samples that still wait in the queue are uploaded before the draw, while the card has room (VICTORY_DRAW_SOURCES; 0 a frame: no such limit)"
+            );
+        }
+        mode
+    })
+}
+
+/// What one draw's run may take ([`DrawSources`]), the runs of its frame
+/// having uploaded `spent_bytes` and taken `spent_us` microseconds so far:
+/// its bytes, and its microseconds (`None`: no limit of time). `None`: the
+/// frame's budget is spent (or a draw may upload nothing).
+fn draw_sources_allowance(b: DrawSources, spent_bytes: u64, spent_us: u64) -> Option<(u64, Option<u64>)> {
+    let bytes = if b.frame_bytes == 0 {
+        b.draw_bytes
+    } else {
+        b.draw_bytes.min(b.frame_bytes.saturating_sub(spent_bytes))
+    };
+    let us = (b.frame_ms > 0).then(|| b.frame_ms.saturating_mul(1000).saturating_sub(spent_us));
+    if bytes == 0 || us == Some(0) {
+        return None;
+    }
+    Some((bytes, us))
+}
+
+/// This frame's runs of [`State::draw_sources_pass`]: the frame, their
+/// bytes and their microseconds.
+static DRAW_SOURCES_FRAME: [AtomicU64; 3] = [AtomicU64::new(u64::MAX), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Since the last line of [`State::log_draw_sources`]: draws that sampled
+/// textures still in the queue, textures uploaded first, their bytes, the
+/// microseconds that took, textures left for lack of budget and for lack
+/// of room.
+static DRAW_SOURCES_TOTALS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Whether the title slot at `handle` holds a texture the title placed in
 /// memory that is there (some of it mapped).
@@ -2730,7 +2816,8 @@ impl State {
     /// of the draw being bound, as the world's pass records them.
     /// Then, for a draw of the title's skin bake, what
     /// `VICTORY_BAKE_SOURCES` asks for its own textures
-    /// ([`State::bake_sources_pass`]).
+    /// ([`State::bake_sources_pass`]), and for any draw what
+    /// `VICTORY_DRAW_SOURCES` asks ([`State::draw_sources_pass`]).
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         if compute {
             return;
@@ -2738,6 +2825,9 @@ impl State {
         self.early_textures_budgeted(list, p);
         if bake_sources_mode().0 != BakeMode::Off {
             self.bake_sources_pass(list, p);
+        }
+        if let Some(budgets) = draw_sources_mode() {
+            self.draw_sources_pass(list, p, budgets);
         }
         #[cfg(feature = "diagnostics")]
         if crate::null_samples::on() {
@@ -2985,6 +3075,157 @@ impl State {
             }
         }
         Self::log_bake_sources(p, &sources, done, Self::bake_missing(&sources, host), skipped);
+    }
+
+    /// `VICTORY_DRAW_SOURCES=1` ([`DrawSources`]): the texture slots this
+    /// draw's pixel shader samples where the layer can tell which (views
+    /// it picks by an index from its root constants, and a skin bake's
+    /// sources from its records, found as [`State::null_samples`] and
+    /// [`State::residency_samples`] find them) whose host slot shows
+    /// nothing while they wait in the queue are uploaded now, into `list`
+    /// ahead of the draw, by the run [`State::bake_sources_pass`] makes:
+    /// within `VICTORY_DRAW_SOURCES_MB` a draw and what the frame's budget
+    /// has left, and only while the card has room. (Slots the draw reads
+    /// through its tables are brought up to date by the draw itself and
+    /// leave the queue: `HostHeap::texture_slot_tabled`.) Slots of other
+    /// heaps than the one bound for views are left out.
+    fn draw_sources_pass(&self, list: &HostList, p: &HostPipeline, budgets: DrawSources) {
+        let Some(stage) = p.stages.iter().find(|s| s.shader.stage == "pixel") else {
+            return;
+        };
+        let t = stage.translated();
+        let tables = bake_tables(p);
+        if tables.is_none() && t.host.root_indexed_views.is_empty() {
+            return;
+        }
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        let mut indices: Vec<u32> = Vec::new();
+        if let Some(tables) = tables
+            && let Some((_, textures)) = self.bake_textures(tables, heap)
+        {
+            indices.extend(textures.iter().map(|t| t.0));
+        }
+        for index in &t.host.root_indexed_views {
+            let slot = index.table_slot;
+            let fresh = t.used.iter().any(|u| u.root == RootType::Table && u.slot == slot && u.kind == ResourceType::Cbv)
+                || t.host.half_views.iter().any(|h| h.0 == slot);
+            let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(slot)).filter(|_| !fresh) else {
+                continue;
+            };
+            let constant = self.user_value(false, index.constant_slot, RootType::Constants, index.constant_dword);
+            let handle = table + u64::from(index.byte_offset.wrapping_add(constant << index.shift) / 32) * 32;
+            if let Some(of) = self.heap_of(table)
+                && std::ptr::eq(of, heap)
+                && let Some(at) = heap.index(handle)
+                && crate::descriptor::view(handle).is_some_and(|view| crate::descriptor::host::is_texture_view(&view))
+            {
+                indices.push(at);
+            }
+        }
+        if indices.is_empty() {
+            return;
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        let queued = host.texture_slots_null_queued(&indices);
+        if queued.is_empty() {
+            return;
+        }
+        let frame = crate::frame::current();
+        if DRAW_SOURCES_FRAME[0].swap(frame, Ordering::Relaxed) != frame {
+            DRAW_SOURCES_FRAME[1].store(0, Ordering::Relaxed);
+            DRAW_SOURCES_FRAME[2].store(0, Ordering::Relaxed);
+        }
+        let spent = [1, 2].map(|i| DRAW_SOURCES_FRAME[i].load(Ordering::Relaxed));
+        let waiting = queued.len() as u64;
+        // Uploaded, their bytes, microseconds; left for budget, for room.
+        let mut done = [0u64; 3];
+        let (mut no_budget, mut no_room) = (0u64, 0u64);
+        match draw_sources_allowance(budgets, spent[0], spent[1]) {
+            None => no_budget = waiting,
+            Some(_) if !crate::resource::room() => no_room = waiting,
+            Some((bytes, us)) => {
+                let began = std::time::Instant::now();
+                let _pass = crate::heap_worker::on().then(crate::heap_worker::urgent);
+                PASS_SOURCES.set(Some(queued));
+                PASS_SOURCES_LIMIT.set(Some((bytes, us.map(|us| began + std::time::Duration::from_micros(us)))));
+                PASS_SOURCED.set([0; 4]);
+                PASS_LEFT.set(0);
+                // No budget of the frame's: the run serves these slots
+                // alone, within its own bytes and time.
+                PASS_BUDGET.set(Some((0, 0)));
+                Self::heap_textures(Into::List(list), heap, host);
+                PASS_BUDGET.set(None);
+                PASS_SOURCES.set(None);
+                PASS_SOURCES_LIMIT.set(None);
+                let [uploaded, staged, ..] = PASS_SOURCED.get();
+                let took = began.elapsed().as_micros() as u64;
+                done = [uploaded, staged, took];
+                no_budget = PASS_LEFT.get();
+                DRAW_SOURCES_FRAME[1].fetch_add(staged, Ordering::Relaxed);
+                DRAW_SOURCES_FRAME[2].fetch_add(took, Ordering::Relaxed);
+            }
+        }
+        Self::log_draw_sources(&stage.shader.hash, frame, indices.len() as u64, waiting, done, no_budget, no_room);
+    }
+
+    /// The lines of `VICTORY_DRAW_SOURCES`: a WARN for each of the first 32
+    /// draws that sampled textures still in the queue, and while such draws
+    /// come, at most once a second, an INFO with the counts since the last.
+    fn log_draw_sources(
+        pixel: &str,
+        frame: u64,
+        textures: u64,
+        queued: u64,
+        done: [u64; 3],
+        no_budget: u64,
+        no_room: u64,
+    ) {
+        static LINES: AtomicU64 = AtomicU64::new(0);
+        static SAID_MS: AtomicU64 = AtomicU64::new(0);
+        let [uploaded, bytes, us] = done;
+        for (total, now) in DRAW_SOURCES_TOTALS.iter().zip([1, uploaded, bytes, us, no_budget, no_room]) {
+            total.fetch_add(now, Ordering::Relaxed);
+        }
+        if LINES.fetch_add(1, Ordering::Relaxed) < 32 {
+            tracing::warn!(
+                frame,
+                pixel,
+                textures,
+                queued,
+                uploaded,
+                kilobytes = bytes >> 10,
+                us,
+                left_for_budget = no_budget,
+                left_for_room = no_room,
+                "a draw samples textures still in the queue (VICTORY_DRAW_SOURCES)"
+            );
+        }
+        let now = crate::host::now_ms();
+        let said = SAID_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(said) >= 1000
+            && SAID_MS.compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            let [draws, ups, up_bytes, up_us, budget, room] =
+                DRAW_SOURCES_TOTALS.each_ref().map(|t| t.swap(0, Ordering::Relaxed));
+            tracing::info!(
+                frame,
+                "draws that sampled textures still in the queue: {draws} draws, {ups} textures uploaded first ({} MB, {} ms), {budget} left for lack of budget, {room} for lack of room (VICTORY_DRAW_SOURCES)",
+                up_bytes >> 20,
+                up_us / 1000,
+            );
+        }
     }
 
     /// The textures a draw of the title's skin bake samples
@@ -3258,11 +3499,14 @@ impl State {
         // run for them alone, on the thread that records the draw. Nothing
         // of the queue's upkeep is done in it, which a pass of this frame
         // did or will do.
+        // (Or any draw's own, `State::draw_sources_pass`: within the bytes
+        // and the time it was given.)
         let sources = PASS_SOURCES.take();
         let only = sources.is_some();
+        let limit = if only { PASS_SOURCES_LIMIT.take() } else { None };
         // A bake draw's own run with `VICTORY_BAKE_SOURCES=full` goes on
         // as if the card had room, within its own bytes.
-        let forced = only && bake_sources_mode().0 == BakeMode::Full;
+        let forced = only && limit.is_none() && bake_sources_mode().0 == BakeMode::Full;
         let mut room = forced || crate::resource::room();
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
@@ -3324,8 +3568,9 @@ impl State {
                 due
             }
         };
-        // What a run for a bake draw's own may upload.
-        let sourced_at_most = bake_sources_mode().1;
+        // What a run for a bake draw's own may upload (a draw's own: what
+        // it was given), and by when a draw's own ends.
+        let (sourced_at_most, sourced_until) = limit.unwrap_or((bake_sources_mode().1, None));
         let mut sourced_bytes = 0u64;
         // The frames in about four seconds, between 16 and 256: how long a
         // slot with nothing to upload waits at most for its next look. In
@@ -3387,14 +3632,19 @@ impl State {
         if !only {
             BACKLOG_LEFT.store(due.len() >= 4096, Ordering::Relaxed);
         }
+        let mut left = due.len() as u64;
         for (index, write) in due {
             // A run for a bake draw's own ends at its own bytes, not at the
-            // frame's budget or time.
+            // frame's budget or time (a draw's own: also at its time).
             if only {
-                if sourced_bytes >= sourced_at_most {
-                    once!("a skin-bake draw samples more than VICTORY_BAKE_SOURCES_MB of textures not on the card yet: the rest take their turn");
+                if sourced_bytes >= sourced_at_most || sourced_until.is_some_and(|t| std::time::Instant::now() >= t) {
+                    if limit.is_none() {
+                        once!("a skin-bake draw samples more than VICTORY_BAKE_SOURCES_MB of textures not on the card yet: the rest take their turn");
+                    }
+                    PASS_LEFT.set(left);
                     break;
                 }
+                left -= 1;
             } else if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 BACKLOG_LEFT.store(true, Ordering::Relaxed);
                 break;
@@ -6118,5 +6368,49 @@ mod spread_seen_tests {
         assert!(!super::asks_spread(65_535));
         assert!(super::asks_spread(65_536));
         assert!(super::asks_spread(115_200));
+    }
+
+    #[test]
+    fn draw_sources_is_off_unless_one_and_reads_its_budgets() {
+        fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+            move |name| pairs.iter().find(|p| p.0 == name).map(|p| p.1.to_owned())
+        }
+        assert_eq!(draw_sources_parse(env(&[])), None);
+        assert_eq!(draw_sources_parse(env(&[("VICTORY_DRAW_SOURCES", "0")])), None);
+        assert_eq!(draw_sources_parse(env(&[("VICTORY_DRAW_SOURCES", "full")])), None);
+        assert_eq!(
+            draw_sources_parse(env(&[("VICTORY_DRAW_SOURCES", " 1 ")])),
+            Some(DrawSources { draw_bytes: 8 << 20, frame_bytes: 64 << 20, frame_ms: 12 })
+        );
+        assert_eq!(
+            draw_sources_parse(env(&[
+                ("VICTORY_DRAW_SOURCES", "1"),
+                ("VICTORY_DRAW_SOURCES_MB", "16"),
+                ("VICTORY_DRAW_SOURCES_FRAME_MB", "0"),
+                ("VICTORY_DRAW_SOURCES_FRAME_MS", "x"),
+            ])),
+            Some(DrawSources { draw_bytes: 16 << 20, frame_bytes: 0, frame_ms: 12 })
+        );
+        let huge = draw_sources_parse(env(&[("VICTORY_DRAW_SOURCES", "1"), ("VICTORY_DRAW_SOURCES_MB", "18446744073709551615")]));
+        assert_eq!(huge.map(|m| m.draw_bytes), Some(u64::MAX));
+    }
+
+    #[test]
+    fn draw_sources_allowance_keeps_to_the_draw_and_the_frame() {
+        let b = DrawSources { draw_bytes: 8 << 20, frame_bytes: 64 << 20, frame_ms: 12 };
+        // Nothing spent: a draw's bytes, the frame's time.
+        assert_eq!(draw_sources_allowance(b, 0, 0), Some((8 << 20, Some(12_000))));
+        // What the frame has left, when less than a draw's.
+        assert_eq!(draw_sources_allowance(b, 60 << 20, 5_000), Some((4 << 20, Some(7_000))));
+        // Spent, by bytes or by time.
+        assert_eq!(draw_sources_allowance(b, 64 << 20, 0), None);
+        assert_eq!(draw_sources_allowance(b, 70 << 20, 0), None);
+        assert_eq!(draw_sources_allowance(b, 0, 12_000), None);
+        assert_eq!(draw_sources_allowance(b, 0, 20_000), None);
+        // 0 a frame: no such limit.
+        let open = DrawSources { frame_bytes: 0, frame_ms: 0, ..b };
+        assert_eq!(draw_sources_allowance(open, u64::MAX, u64::MAX), Some((8 << 20, None)));
+        // A draw may upload nothing.
+        assert_eq!(draw_sources_allowance(DrawSources { draw_bytes: 0, ..b }, 0, 0), None);
     }
 }
