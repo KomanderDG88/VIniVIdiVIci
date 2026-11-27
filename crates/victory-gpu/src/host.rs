@@ -259,7 +259,10 @@ fn sweep() {
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
+    // (Those the title made and the host has not begun get the next numbers:
+    // the line of `crate::queue::behind`, `VICTORY_SUBMIT_LINE=1`; none
+    // without it.)
+    let started = STARTED.load(Ordering::Acquire) + crate::queue::queued();
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         if retire_lean() && !reaper_on() {
