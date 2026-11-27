@@ -303,6 +303,24 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
 }
 
+/// All idle host lists let go (their command allocators and what they
+/// kept), for `VICTORY_OOM_RECLAIM=1` when the card refused a buffer
+/// (`crate::host`'s `reclaim_for_oom`): each has run and been reset, so
+/// nothing in the air names it. Left alone if [`IDLE`] is held (perhaps by
+/// the thread that asked). How many went.
+#[cfg(windows)]
+pub(crate) fn drain_idle() -> usize {
+    let gone = match crate::host::try_lock_or_skip(&IDLE) {
+        Some(mut idle) => {
+            idle.1 = 0;
+            std::mem::take(&mut idle.0)
+        }
+        None => return 0,
+    };
+    // Let go outside the lock.
+    gone.len()
+}
+
 /// Releases cold idle host lists (and excess spare gather/scratch buffers on
 /// remaining idle lists) above the host's [`TrimPolicy`](crate::ram_trim::TrimPolicy)
 /// warm working set. Called from `host::sweep` when no GPU flights are active.
