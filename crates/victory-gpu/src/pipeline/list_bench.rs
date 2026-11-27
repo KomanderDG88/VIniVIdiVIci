@@ -138,16 +138,20 @@ fn graphics_pipeline(vs: &Arc<Shader>, ps: &Arc<Shader>) -> This {
         topology: [u32; 2],
         dsv: [u32; 2],
     }
+    // (Ours: a shader's container is behind a lock and may be kept
+    // compressed here; its bytes, held while the stream points at them.)
+    let vs_container = vs.container.lock().unwrap_or_else(|e| e.into_inner()).bytes_arc();
+    let ps_container = ps.container.lock().unwrap_or_else(|e| e.into_inner()).bytes_arc();
     let stream = Stream {
         vs_kind: 1,
         vs: Bytecode {
-            code: vs.container.as_ptr(),
-            size: vs.container.len(),
+            code: vs_container.as_ptr(),
+            size: vs_container.len(),
         },
         ps_kind: 2,
         ps: Bytecode {
-            code: ps.container.as_ptr(),
-            size: ps.container.len(),
+            code: ps_container.as_ptr(),
+            size: ps_container.len(),
         },
         depth: Depth1(
             21,
@@ -326,7 +330,7 @@ impl Scene {
         // (Code of its own: a container is shared by its bytes, and with
         // the translation of the first shader of those bytes.)
         let tabled_code = compile("void main(float4 at : SV_Position) {}", s!("ps_5_1"));
-        assert!(ps.iter().all(|p| p.container != tabled_code), "the material shader's container is its own");
+        assert!(ps.iter().all(|p| p.container.lock().unwrap_or_else(|e| e.into_inner()).to_vec() != tabled_code), "the material shader's container is its own");
         let tabled_ps = preset(
             "pixel",
             HwStage::Ps,
