@@ -453,6 +453,11 @@ impl Look {
 /// runs beside the submitting thread's steps, which may write title
 /// memory (memory-to-memory copies); records such a step writes into a
 /// view heap may be mirrored in this submission instead of the next.
+///
+/// avatarmanz/VIctory-7900XTX has the same as `VICTORY_HEAP_SYNC_ASIDE`
+/// (53c5256b), on there by default; that name turns this on too (`=1`). Its
+/// other half, `VICTORY_QUICK_MIRROR` (a slot already made from its record
+/// told without the lock), is our `VICTORY_HEAP_LOCKS` (`HostHeap::made_now`).
 #[cfg(windows)]
 pub(crate) fn sync_beside() -> bool {
     /// 0 off, 1 on, 2 in turn.
@@ -460,6 +465,10 @@ pub(crate) fn sync_beside() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_SYNC_BESIDE").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        // The name avatarmanz's base gives the same thing (53c5256b, on
+        // there unless `=0`): `VICTORY_HEAP_SYNC_ASIDE=1` here, while
+        // `VICTORY_SYNC_BESIDE` is unset.
+        Err(_) if std::env::var_os("VICTORY_HEAP_SYNC_ASIDE").is_some_and(|v| v == "1") => 1,
         _ => 0,
     }) {
         0 => false,
@@ -506,10 +515,22 @@ pub(crate) fn sync_begin() {
                         }
                         *state = 2;
                     }
-                    sync_heaps();
-                    make_waiting();
-                    *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 0;
-                    BESIDE.1.notify_all();
+                    // The round is over however it ends: a panic in the
+                    // pass would leave the thread gone and the submitting
+                    // thread waiting at [`sync_end`] for good (from
+                    // avatarmanz 53c5256b's own thread for the pass).
+                    struct Over;
+                    impl Drop for Over {
+                        fn drop(&mut self) {
+                            *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+                            BESIDE.1.notify_all();
+                        }
+                    }
+                    let _over = Over;
+                    let _ = std::panic::catch_unwind(|| {
+                        sync_heaps();
+                        make_waiting();
+                    });
                 }
             })
             .is_ok()
