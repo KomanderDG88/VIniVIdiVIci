@@ -5004,7 +5004,7 @@ impl Shadow {
     /// (`crate::watch::nothing_new`): the memory is watched, every page of
     /// the range was taken, and none was noted written after it was.
     /// `false` if the refresh would have to ask.
-    fn nothing_new(&self, from: usize, to: usize) -> bool {
+    pub(crate) fn nothing_new(&self, from: usize, to: usize) -> bool {
         if self.watched.load(Ordering::Relaxed) != 1 {
             return false;
         }

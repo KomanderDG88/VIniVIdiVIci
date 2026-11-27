@@ -171,3 +171,30 @@ fn fills_put_off_are_all_done() {
         batch.fill();
     }
 }
+
+/// [`written_spans`] ([`ahead_of_writes`]): only copies given to shaders,
+/// over their refreshes before that, and nothing after a title write
+/// (their test, dc2a3ad4).
+#[test]
+fn what_is_written_is_refreshed_ahead_up_to_its_write_and_to_title_writes() {
+    use Touch::{Nothing, Refresh, Title, Write};
+    let mut found = written_spans(
+        [
+            Refresh(1, 10, 20),
+            Refresh(2, 0, 5),
+            Nothing,
+            Refresh(1, 30, 40),
+            Write(1),
+            Refresh(1, 0, 100),
+            Write(3),
+            Refresh(3, 1, 2),
+            Refresh(4, 7, 9),
+            Write(4),
+            Title,
+            Write(2),
+        ]
+        .into_iter(),
+    );
+    found.sort_unstable();
+    assert_eq!(found, [(1, 10, 40), (4, 7, 9)]);
+}

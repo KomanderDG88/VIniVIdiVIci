@@ -7266,6 +7266,11 @@ impl Host {
             settled += settling.elapsed();
         }
         part = prep_part(0, part);
+        // The copies shaders write, brought up to date together first
+        // ([`ahead_of_writes`]; unset, each at its first write as before).
+        if ahead_of_writes() {
+            batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+        }
         for list in runs {
             list.run_deferred(&mut batch, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
@@ -7985,6 +7990,72 @@ struct Batch {
     /// With [`wide_fills`]: fills not done yet (destination, source, bytes),
     /// done by [`Batch::fill`].
     fills: Vec<(usize, usize, usize)>,
+    /// With [`ahead_of_writes`]: copies (by address) brought up to date
+    /// ahead of the submission's steps, and the range (from, to) that was
+    /// ([`Batch::refresh_ahead`]); a refresh inside it is not done again
+    /// until shaders are given the copy or a step of ours writes title
+    /// memory.
+    ahead: std::collections::HashMap<usize, (usize, usize)>,
+}
+
+/// Whether the copies that a submission's shaders write are brought up to
+/// date together, on several threads, ahead of its steps
+/// (`VICTORY_REFRESH_AHEAD=1`; off by default: each just before the step
+/// that gives it to them, [`Batch::flush_one`], as before). After
+/// avatarmanz's dc2a3ad4, on by default there (`=0` turned it off) and
+/// only with their wide refresh and light refresh on.
+///
+/// 580 copies a frame, one after the other on the submitting thread, 3.4
+/// to 6.5 ms (theirs, session play-1125-0203). What is brought up to date
+/// ahead is, of each copy that shaders are given before the submission's
+/// first write of ours to title memory (a title buffer copy not done on
+/// the card, a `Run`), the span of its refreshes up to that point
+/// ([`written_spans`]). What changes: those bytes are read from title
+/// memory at the start of the steps, not at the copy's first write by
+/// shaders; what the title's other threads write in between is taken by
+/// the next submission, as with `VICTORY_REFRESH_ONCE`.
+fn ahead_of_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_AHEAD").is_some_and(|v| v == "1"))
+}
+
+/// What a step is to the copies' refreshes, for [`written_spans`].
+#[derive(Clone, Copy)]
+enum Touch {
+    /// A refresh of a copy (by address), from, to.
+    Refresh(usize, usize, usize),
+    /// The copy is given to shaders.
+    Write(usize),
+    /// Title memory is written.
+    Title,
+    Nothing,
+}
+
+/// Of `steps`, up to the first that writes title memory: the copies given
+/// to shaders, each with the range its refreshes before that cover.
+fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
+    // (From, to, given to shaders.)
+    let mut spans: std::collections::HashMap<usize, (usize, usize, bool)> =
+        std::collections::HashMap::new();
+    for step in steps {
+        match step {
+            Touch::Refresh(copy, from, to) => {
+                let span = spans.entry(copy).or_insert((from, to, false));
+                if !span.2 {
+                    (span.0, span.1) = (span.0.min(from), span.1.max(to));
+                }
+            }
+            // (Not refreshed before: nothing of it is due.)
+            Touch::Write(copy) => {
+                if let Some(span) = spans.get_mut(&copy) {
+                    span.2 = true;
+                }
+            }
+            Touch::Title => break,
+            Touch::Nothing => {}
+        }
+    }
+    spans.into_iter().filter(|(_, s)| s.2).map(|(copy, (from, to, _))| (copy, from, to)).collect()
 }
 
 /// Whether the fills of a submission's upload memory are done together on
@@ -8050,6 +8121,10 @@ impl Batch {
             }
             return;
         }
+        // Brought up to date ahead of the steps ([`ahead_of_writes`]).
+        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+            return;
+        }
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
@@ -8065,6 +8140,8 @@ impl Batch {
     /// Before shaders are given a range of `shadow`'s copy: its pending
     /// refresh is done, the others stay pending.
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        // From here on it is refreshed around what the shaders write.
+        self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
@@ -8125,6 +8202,7 @@ impl Batch {
         self.texture_spans.clear();
         // Where it writes is not known: no copy counts as up to date.
         self.current.clear();
+        self.ahead.clear();
     }
 
     /// [`Batch::title_written`] for a write of ours whose place is known
@@ -8134,6 +8212,8 @@ impl Batch {
     fn title_wrote(&mut self, at: usize, len: usize) {
         self.check_textures();
         self.flush();
+        // What was brought up to date ahead was so up to the first write.
+        self.ahead.clear();
         self.textures.clear();
         self.texture_spans.clear();
         let end = at + len;
@@ -8166,6 +8246,8 @@ impl Batch {
     fn title_wrote_near(&mut self, at: usize, len: usize, run: bool) -> Vec<(usize, usize)> {
         // Textures due a check read title memory as it is before the write.
         self.check_textures();
+        // What was brought up to date ahead was so up to the first write.
+        self.ahead.clear();
         use std::sync::atomic::Ordering::Relaxed;
         const K64: usize = 1 << 16;
         let end = at.saturating_add(len);
@@ -8279,6 +8361,76 @@ impl Batch {
                 w / 1000
             );
         }
+    }
+
+    /// With [`ahead_of_writes`], before the steps of `runs`: the copies that
+    /// shaders are given before the first write of ours to title memory,
+    /// each over the span of its refreshes before then ([`written_spans`]),
+    /// brought up to date together (`crate::shadow::wide_pieces`, this
+    /// thread among them), with one write-watch asking as [`Batch::flush`]
+    /// makes. Copies and fills that `taken` names are done on the card and
+    /// write no title memory here. The time counted is the time it took,
+    /// not the threads' sum.
+    fn refresh_ahead(&mut self, runs: &[&HostList], taken: impl Fn(&HostList, usize) -> bool) {
+        let mut copies: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>> =
+            std::collections::HashMap::new();
+        let mut touches = Vec::new();
+        'steps: for list in runs {
+            for (i, step) in list.deferred().copies.iter().enumerate() {
+                let touch = match step {
+                    Step::Refresh(shadow, at, len) => {
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        copies.entry(key).or_insert_with(|| shadow.clone());
+                        Touch::Refresh(key, *at, *at + *len)
+                    }
+                    Step::GpuWrite(shadow, ..) => {
+                        Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)
+                    }
+                    Step::Copy(..) if taken(list, i) => Touch::Nothing,
+                    Step::Copy(..) | Step::Run(..) => Touch::Title,
+                    Step::Fill(..) | Step::Host(..) | Step::Texture(_) => Touch::Nothing,
+                };
+                touches.push(touch);
+                if matches!(touch, Touch::Title) {
+                    break 'steps;
+                }
+            }
+        }
+        let due: Vec<_> = written_spans(touches.into_iter())
+            .into_iter()
+            .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        for (shadow, from, to) in &due {
+            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            Self::brought(&mut self.current, shadow, *from, *to);
+        }
+        let started = std::time::Instant::now();
+        let ask = due.len() > 1;
+        if ask {
+            let ranges: Vec<(usize, usize)> =
+                due.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.2)).collect();
+            crate::watch::ask_ahead(&ranges);
+        }
+        let before = PREPARING[0].load(Ordering::Relaxed);
+        crate::shadow::wide_pieces(due.len(), move |i| {
+            let (shadow, from, to) = &due[i];
+            if !shadow.nothing_new(*from, *to) {
+                Self::update(shadow, *from, *to);
+            }
+        });
+        if ask {
+            crate::watch::ask_ahead_done();
+        }
+        let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+        let wall = started.elapsed().as_micros() as u64;
+        let over = summed.saturating_sub(wall);
+        PREPARING[0].fetch_sub(over, Ordering::Relaxed);
+        crate::framelog::sub(crate::framelog::T::CopyUs, over);
+        // The asking, counted as `Batch::flush` counts its own.
+        preparing(0, wall.saturating_sub(summed));
     }
 
     fn flush(&mut self) {
