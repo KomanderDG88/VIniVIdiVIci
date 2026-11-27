@@ -1345,6 +1345,14 @@ pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> 
     make::ready(p)
 }
 
+/// Whether one of the containers of the title pipeline `this` is one `f`
+/// picks (false for none bound). Known at the call, before any host
+/// pipeline is made.
+#[cfg(windows)]
+pub(crate) fn shaders_any(this: This, f: impl Fn(&Shader) -> bool) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| f(s))
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
