@@ -1683,6 +1683,8 @@ pub(crate) mod host;
 pub mod known;
 #[cfg(windows)]
 mod library;
+#[cfg(windows)]
+mod samplers;
 
 /// Host pipelines created and loaded from the library since the start
 /// (`crate::framelog`).
