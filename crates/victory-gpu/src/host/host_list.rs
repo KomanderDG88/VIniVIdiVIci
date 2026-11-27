@@ -1530,7 +1530,7 @@ impl HostList {
                     if wide_fills() {
                         // Done with the others before the next write of
                         // ours or step of ours ([`Batch::fill`]).
-                        batch.fills.push((dst, src, len));
+                        batch.put_off_fill(dst, src, len);
                         preparing(1, len as u64);
                         continue;
                     }

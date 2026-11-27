@@ -7990,6 +7990,9 @@ struct Batch {
     /// With [`wide_fills`]: fills not done yet (destination, source, bytes),
     /// done by [`Batch::fill`].
     fills: Vec<(usize, usize, usize)>,
+    /// The destinations of `fills` (start, end), none overlapping another
+    /// ([`Batch::put_off_fill`]).
+    fill_spans: std::collections::BTreeMap<usize, usize>,
     /// With [`ahead_of_writes`]: copies (by address) brought up to date
     /// ahead of the submission's steps, and the range (from, to) that was
     /// ([`Batch::refresh_ahead`]); a refresh inside it is not done again
@@ -8068,14 +8071,21 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
 /// memory that the card alone reads, when the lists run: none reads what
 /// another writes. They are done before the next step that writes title
 /// memory or runs code of ours (a title buffer copy, a `Run`, a `Host`),
-/// and before the submission goes on from its steps (the last refreshes,
-/// the snapshots, the lists to the card). What changes: a fill reads
+/// before a fill whose destination overlaps one put off (so that the later
+/// one wins, as in steps: [`Batch::put_off_fill`]), and before the
+/// submission goes on from its steps (the last refreshes, the snapshots,
+/// the lists to the card). What changes: a fill reads
 /// title memory a little later in the preparing than its step, never
 /// after a write of ours that came after it. Unset, nothing is put off.
 fn wide_fills() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_FILLS").is_some_and(|v| v == "1"))
 }
+
+/// [`wide_fills`]: fills put off whose destination overlapped one already
+/// put off, so that the ones before were done first, since the last line
+/// that told them; and when that line was (ms, [`now_ms`]).
+static FILLS_OVERLAPPING: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 impl Batch {
     /// With [`wide_fills`]: the fills noted are done, several at a time
@@ -8089,6 +8099,7 @@ impl Batch {
         if self.fills.is_empty() {
             return;
         }
+        self.fill_spans.clear();
         let started = std::time::Instant::now();
         if self.fills.len() < FEW {
             for (dst, src, len) in self.fills.drain(..) {
@@ -8103,6 +8114,42 @@ impl Batch {
             });
         }
         preparing(0, started.elapsed().as_micros() as u64);
+    }
+
+    /// With [`wide_fills`]: a fill noted, done later by [`Batch::fill`].
+    /// Done together, fills land in any order; in steps the later one
+    /// wins where two write the same bytes. So if its destination overlaps
+    /// that of one noted already, those noted are done first ([`Batch::fill`])
+    /// and counted ([`FILLS_OVERLAPPING`], told about once a second).
+    fn put_off_fill(&mut self, dst: usize, src: usize, len: usize) {
+        let end = dst + len;
+        if len != 0 {
+            // The spans do not overlap: only the last that starts before
+            // `end` can reach past `dst`.
+            if self.fill_spans.range(..end).next_back().is_some_and(|(_, &to)| to > dst) {
+                self.fill();
+                Self::overlapped();
+            }
+            self.fill_spans.insert(dst, end);
+        }
+        self.fills.push((dst, src, len));
+    }
+
+    /// One more fill whose destination overlapped one put off; the count
+    /// since the last line, told if that was a second ago or more.
+    fn overlapped() {
+        FILLS_OVERLAPPING[0].fetch_add(1, Ordering::Relaxed);
+        let at = now_ms();
+        let before = FILLS_OVERLAPPING[1].load(Ordering::Relaxed);
+        if at.saturating_sub(before) >= 1000
+            && FILLS_OVERLAPPING[1].compare_exchange(before, at, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            let n = FILLS_OVERLAPPING[0].swap(0, Ordering::Relaxed);
+            tracing::info!(
+                "fills put off (VICTORY_WIDE_FILLS=1) whose destination overlapped one put off before, so that those were done first: \
+                 {n} since the last such line"
+            );
+        }
     }
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
@@ -8434,6 +8481,9 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        // Every fill put off is done before ([`Batch::fill`]): a path that
+        // forgets it would leave them undone or done after what follows.
+        debug_assert!(self.fills.is_empty(), "{} fills put off and not done before a flush", self.fills.len());
         self.check_textures();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
