@@ -42,6 +42,28 @@ pub fn use_recorded_pages(lookup: Lookup) {
     let _ = LOOKUP.set(lookup);
 }
 
+/// The recorded pages under `[at, at + len)` that have no view, each with
+/// the write generation of the section page it shows (`victory-hle` xmem's
+/// `Gens`), in address order.
+pub type Untouched = fn(usize, usize) -> Vec<(usize, u64)>;
+
+static UNTOUCHED: OnceLock<Untouched> = OnceLock::new();
+
+/// The runtime hands the guards (`crate::watch`) its generations: a
+/// recorded page with no view faults at any access, so a copy that took it
+/// needs nothing again while its section page's generation stands.
+pub fn use_untouched_pages(untouched: Untouched) {
+    let _ = UNTOUCHED.set(untouched);
+}
+
+/// [`Untouched`] of the runtime; empty when the switch is off.
+pub(crate) fn untouched(at: usize, len: usize) -> Vec<(usize, u64)> {
+    match UNTOUCHED.get() {
+        Some(untouched) if on() && len > 0 => untouched(at, len),
+        _ => Vec::new(),
+    }
+}
+
 /// Whether the runtime records page mappings.
 pub(crate) fn on() -> bool {
     LOOKUP.get().is_some()
@@ -108,6 +130,12 @@ pub(crate) fn copy(
         return None;
     }
     let whole = copy_through(&from, &to, src, dst, len, host_dst, &plain);
+    if !to.is_empty() {
+        // Written through the stable view, which no guard sees: the guards'
+        // untouched recorded pages there are so no longer, now the bytes
+        // are there (the caller opened them before, `crate::watch::writing`).
+        crate::watch::recorded_written(dst as usize, len);
+    }
     count(C::HostBytes, len as u64);
     Some(whole)
 }
@@ -201,6 +229,8 @@ pub(crate) fn write(dst: *mut u8, src: *const u8, len: usize, mut plain: impl Fn
         }
         done += n;
     }
+    // As in [`copy`]: through the stable view, which no guard sees.
+    crate::watch::recorded_written(dst as usize, len);
     count(C::HostBytes, len as u64);
     true
 }

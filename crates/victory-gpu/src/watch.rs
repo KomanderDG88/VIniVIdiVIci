@@ -916,7 +916,10 @@ fn known_view(start: usize) -> bool {
         return true;
     }
     let g = guards();
-    g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+    g.protected.contains(&first)
+        || g.absent.contains(&first)
+        || (view_known() && g.viewed.contains(&first))
+        || g.untouched.holds(first)
 }
 
 struct Guards {
@@ -954,6 +957,101 @@ struct Guards {
     /// With `VICTORY_GUARD_REST` ([`rest`]): blocks a write fault opened,
     /// and when.
     opened: BTreeMap<usize, std::time::Instant>,
+    /// With `VICTORY_LAZY_REMAP=1`: recorded pages with no view, counted
+    /// clean while their section page's generation stands ([`Untouched`]).
+    untouched: Untouched,
+}
+
+/// With `VICTORY_LAZY_REMAP=1` (`crate::recorded`): blocks that are a
+/// recorded page with no view, noted clean with the write generation their
+/// section page had when an asking took them. Such a page cannot be made
+/// read-only (it is a reservation to the system), and was told written at
+/// every asking, its copies taken again each time (run 93d51be7: 959 failed
+/// askings and some 2,000 refreshes that copied something a frame, against
+/// 203 and 1,000 without the switch). But any access to it faults into the
+/// runtime, which maps a view and gives the section page a new generation:
+/// a block whose generation stands was not stored to there. What stores to
+/// its bytes without that fault takes it out of here, as it opens a guarded
+/// block: a write fault through another view of the page ([`open`], whose
+/// views [`hold_untouched`] has made read-only), our writes and the
+/// kernel's ([`writing`], [`recorded_written`]), the runtime's writes into
+/// physical pages ([`title_memory_written`]), a view of the page mapped
+/// ([`views_mapped`]) and a mapping changed there
+/// ([`title_memory_remapped`]). Without the switch it stays empty, and
+/// every answer is as before.
+struct Untouched(BTreeMap<usize, u64>);
+
+impl Untouched {
+    const fn new() -> Untouched {
+        Untouched(BTreeMap::new())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn holds(&self, block: usize) -> bool {
+        self.0.contains_key(&block)
+    }
+
+    /// `block` is clean at generation `now`.
+    fn note(&mut self, block: usize, now: u64) {
+        self.0.insert(block, now);
+    }
+
+    /// Whether `block` is noted and its generation (`now`; `None`: no
+    /// longer a recorded page without a view) is the one noted. A block
+    /// found otherwise is forgotten.
+    fn still(&mut self, block: usize, now: Option<u64>) -> bool {
+        match self.0.get(&block) {
+            Some(&noted) if now == Some(noted) => true,
+            Some(_) => {
+                self.0.remove(&block);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// The noted blocks of `[first, last)`.
+    fn blocks(&self, first: usize, last: usize) -> Vec<usize> {
+        self.0.range(first..last).map(|(&block, _)| block).collect()
+    }
+
+    /// Blocks `[first, last)` may have been stored to: forgotten.
+    fn forget(&mut self, first: usize, last: usize) {
+        if self.0.is_empty() || first >= last {
+            return;
+        }
+        for block in self.blocks(first, last) {
+            self.0.remove(&block);
+        }
+    }
+}
+
+/// The generation of `block` in an answer of `crate::recorded::untouched`
+/// (address order); `None` if it is not a recorded page without a view.
+fn generation_at(found: &[(usize, u64)], block: usize) -> Option<u64> {
+    found.binary_search_by_key(&(block * BLOCK), |&(at, _)| at).ok().map(|i| found[i].1)
+}
+
+/// The generation of `block` if it is a recorded page without a view
+/// (`VICTORY_LAZY_REMAP=1`); `None` without the switch.
+fn untouched_now(block: usize) -> Option<u64> {
+    if !crate::recorded::on() {
+        return None;
+    }
+    generation_at(&crate::recorded::untouched(block * BLOCK, BLOCK), block)
+}
+
+/// Whether every other title address of `block`'s page (`shown`, the
+/// page's addresses, `block`'s own among them) is `guarded`: not when the
+/// views do not know the page, nor for a page of more than [`MANY_VIEWS`]
+/// addresses, whose views are not guarded together.
+fn aliases_guarded(block: usize, shown: &[usize], guarded: impl FnMut(usize) -> bool) -> bool {
+    !shown.is_empty()
+        && shown.len() <= MANY_VIEWS
+        && shown.iter().map(|&at| at / BLOCK).filter(|&alias| alias != block).all(guarded)
 }
 
 impl Guards {
@@ -1103,6 +1201,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     arming: BTreeSet::new(),
     disturbed: BTreeSet::new(),
     opened: BTreeMap::new(),
+    untouched: Untouched::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1894,7 +1993,10 @@ fn guard_runs_at(
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
         let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+        g.protected.contains(&first)
+            || g.absent.contains(&first)
+            || (view_known() && g.viewed.contains(&first))
+            || g.untouched.holds(first)
     };
     if !known && !is_view(start, end) {
         return None;
@@ -1949,6 +2051,10 @@ fn guard_run(
     // `VICTORY_GUARD_REST` ([`rest`]): blocks just opened by a write fault
     // are told as written and left open (zero: none is).
     let rest = rest();
+    // With `VICTORY_LAZY_REMAP=1`: the generations of the range's recorded
+    // pages without a view, asked once, if a block of it is noted
+    // untouched ([`Untouched`]).
+    let mut generations: Option<Vec<(usize, u64)>> = None;
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
@@ -1982,6 +2088,14 @@ fn guard_run(
                     g.verified.insert(block, now);
                 }
             }
+        }
+        if open && !g.untouched.is_empty() && g.untouched.holds(block) {
+            // A recorded page without a view, its section page's generation
+            // as when it was taken: nothing stored to it since. Else it is
+            // written, and noted again when guarded below.
+            let found = generations
+                .get_or_insert_with(|| crate::recorded::untouched(first * BLOCK, (last - first) * BLOCK));
+            open = !g.untouched.still(block, generation_at(found, block));
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
@@ -2099,6 +2213,13 @@ impl Arming {
             g.clean.remove(&block);
             if !g.disturbed.contains(&block) && block < uncommitted_end(block) {
                 g.absent.insert(block);
+            }
+            // A recorded page of the same section page trusted this view
+            // read-only ([`hold_untouched`]).
+            if !g.untouched.is_empty() {
+                for alias in crate::inplace::pages_of(block * BLOCK) {
+                    g.untouched.forget(alias / BLOCK, alias / BLOCK + 1);
+                }
             }
         }
         for &(from, to) in &runs {
@@ -2284,6 +2405,9 @@ fn is_view(start: usize, end: usize) -> bool {
 fn protect(g: &mut Guards, from: usize, to: usize) {
     protect_here(g, from, to);
     if !view_guard() {
+        // No other view is guarded: a recorded page stays told written at
+        // every asking, as before ([`Untouched`]).
+        g.untouched.forget(from, to);
         return;
     }
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
@@ -2310,6 +2434,32 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
                     g.clean.remove(&block);
                 }
             }
+        }
+    }
+    if !g.untouched.is_empty() {
+        hold_untouched(g, from, to);
+    }
+}
+
+/// With `VICTORY_LAZY_REMAP=1`: the blocks of `[from, to)` [`protect_here`]
+/// has just noted untouched stay so only if every other title address of
+/// their section page is guarded: read-only by our hand (as [`protect`]
+/// has made them where it could), or a recorded page without a view itself
+/// (any access faults, and the generation changes). Those addresses are
+/// noted aliased, so that a write fault at one reaches the block
+/// ([`open`]). Else the block is told written at every asking, as before.
+fn hold_untouched(g: &mut Guards, from: usize, to: usize) {
+    for block in g.untouched.blocks(from, to) {
+        let shown = crate::inplace::pages_of(block * BLOCK);
+        let held = aliases_guarded(block, &shown, |alias| {
+            g.protected.contains(&alias) || untouched_now(alias).is_some()
+        });
+        if !held {
+            g.untouched.forget(block, block + 1);
+            continue;
+        }
+        if shown.len() > 1 {
+            g.aliased.extend(shown.iter().map(|&at| at / BLOCK));
         }
     }
 }
@@ -2424,6 +2574,11 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
+        } else if let Some(now) = untouched_now(block) {
+            // A recorded page without a view (`VICTORY_LAZY_REMAP=1`): not
+            // read-only, but faulting at any access; clean at its section
+            // page's generation now, if [`hold_untouched`] keeps it so.
+            g.untouched.note(block, now);
         } else {
             #[cfg(feature = "diagnostics")]
             let error = std::io::Error::last_os_error();
@@ -2497,6 +2652,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
                 for alias in crate::inplace::pages_of(block * BLOCK) {
                     if alias / BLOCK != block {
                         g.clean.remove(&(alias / BLOCK));
+                        g.untouched.forget(alias / BLOCK, alias / BLOCK + 1);
                     }
                 }
             }
@@ -2525,6 +2681,9 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let range = start / BLOCK..end.div_ceil(BLOCK);
+    // Recorded pages without a view there are untouched no longer
+    // ([`Untouched`]).
+    g.untouched.forget(range.start, range.end);
     let mut blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     if g.arming.range(range.clone()).next().is_some() {
         // Being made read-only by an asking outside the lock ([`Arming`]):
@@ -2560,6 +2719,15 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+}
+
+/// We wrote title memory `[at, at + len)` through a recorded page's stable
+/// view (`crate::recorded`, `VICTORY_LAZY_REMAP=1`), which no guard sees:
+/// told once the bytes are there, as [`writing`] was told before. Its
+/// recorded pages are untouched no longer ([`Untouched`]).
+pub(crate) fn recorded_written(at: usize, len: usize) {
+    let mut g = guards();
+    g.untouched.forget(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
 }
 
 /// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
@@ -2647,6 +2815,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     {
         let mut g = guards();
+        // Whatever the mode: recorded pages without a view there are
+        // untouched no longer ([`Untouched`]; empty without the switch).
+        g.untouched.forget(at / BLOCK, end.div_ceil(BLOCK));
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
@@ -2883,6 +3054,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    // What the range shows is new ([`Untouched`]).
+    g.untouched.forget(range.start, range.end);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
@@ -2991,6 +3164,68 @@ fn writable(at: usize) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Pure: a recorded page without a view is clean while its section
+    /// page's generation stands; a new generation, a view mapped there, or
+    /// any write path that never faults (each forgets its range) makes it
+    /// written; nothing is noted without the switch, and then nothing
+    /// changes.
+    #[test]
+    fn untouched_recorded_pages_stay_clean_until_a_write_path_tells() {
+        let mut u = Untouched::new();
+        // Without the switch: nothing noted, nothing held, every block
+        // answered as before.
+        assert!(u.is_empty() && !u.holds(7) && !u.still(7, Some(1)));
+        u.forget(0, 100);
+        assert!(u.is_empty());
+
+        u.note(7, 5);
+        assert!(u.holds(7));
+        assert!(u.still(7, Some(5)), "untouched: clean, asking after asking");
+        assert!(u.still(7, Some(5)));
+        // The processor touched a page showing it (a view mapped there).
+        assert!(!u.still(7, Some(6)), "a new generation: written");
+        assert!(!u.holds(7), "and forgotten, until noted again");
+        u.note(7, 6);
+        assert!(!u.still(7, None), "a view stands there now: written");
+        // Each path that stores without a fault forgets its blocks: a write
+        // fault through another view or our own write (`open_here`), the
+        // stable view (`recorded_written`), the runtime's physical-page
+        // writes (`title_memory_written`), a remap (`title_memory_remapped`).
+        for (first, last) in [(7, 8), (0, 100), (6, 9)] {
+            u.note(7, 6);
+            u.note(20, 6);
+            u.forget(first, last);
+            assert!(!u.still(7, Some(6)), "forgotten by [{first}, {last})");
+            assert_eq!(u.holds(20), last <= 20, "outside the range: kept");
+            u.forget(0, 100);
+        }
+        assert_eq!(u.blocks(0, 100), Vec::<usize>::new());
+    }
+
+    /// Pure: the lookup of a block's generation in the runtime's answer.
+    #[test]
+    fn generations_are_found_by_block() {
+        let found = [(2 * BLOCK, 11), (5 * BLOCK, 12)];
+        assert_eq!(generation_at(&found, 2), Some(11));
+        assert_eq!(generation_at(&found, 5), Some(12));
+        assert_eq!(generation_at(&found, 3), None);
+        assert_eq!(generation_at(&[], 2), None);
+    }
+
+    /// Pure: a recorded page stays untouched only if every other address of
+    /// its section page is guarded, the views know the page, and it has no
+    /// more than `MANY_VIEWS` addresses.
+    #[test]
+    fn untouched_pages_need_their_other_views_guarded() {
+        let at = |block: usize| block * BLOCK;
+        assert!(!aliases_guarded(3, &[], |_| true), "not known to the views");
+        assert!(aliases_guarded(3, &[at(3)], |_| false), "its own address alone");
+        assert!(aliases_guarded(3, &[at(3), at(9)], |b| b == 9));
+        assert!(!aliases_guarded(3, &[at(3), at(9), at(12)], |b| b == 9), "one view left writable");
+        let many: Vec<usize> = (0..=MANY_VIEWS).map(at).collect();
+        assert!(!aliases_guarded(0, &many, |_| true), "the page of very many views");
+    }
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
