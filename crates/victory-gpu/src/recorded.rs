@@ -63,49 +63,80 @@ fn piece(pages: &[HostPage], at: usize, len: usize, from: usize) -> (usize, Opti
     (n, pages.binary_search_by_key(&page, |p| p.at).ok().map(|i| &pages[i]))
 }
 
+/// [`piece`], except that a piece on no recorded page runs on to the next
+/// recorded page or the end: what lies between recorded pages is one call
+/// of the kernel's copy, not one a page.
+fn run(pages: &[HostPage], at: usize, len: usize, from: usize) -> (usize, Option<&HostPage>) {
+    match piece(pages, at, len, from) {
+        (n, Some(p)) => (n, Some(p)),
+        (_, None) => {
+            // `from` is on no recorded page: those at or below it end
+            // before it, the next one starts a whole page or more after it.
+            let end = at + len;
+            let next = pages.get(pages.partition_point(|p| p.at <= from)).map_or(end, |p| p.at.min(end));
+            (next - from, None)
+        }
+    }
+}
+
 /// A copy of `len` bytes from `src` to `dst` when a recorded page lies
 /// under either; `None` when none does (the caller copies as usual).
 /// Recorded pieces go through the stable view, the rest through `plain`
-/// (the kernel's copy, which fails on a page that is not there). All of the
-/// source is read before any of the destination is written: the two may
-/// show one section page at two addresses.
+/// (the kernel's copy, which fails on a page that is not there).
+///
+/// `host_dst`: the destination is memory of ours, never a title page (a
+/// host copy, an upload buffer). The source is then read straight into it.
+/// Otherwise all of the source is read into a buffer before any of the
+/// destination is written: the two may show one section page at two
+/// addresses. A buffer as long as the copy, made for each (most of what
+/// the refreshes copy, hundreds of megabytes a frame), cost a page fault
+/// for every 4 KiB of it, and the kernel's reads went 64 KiB at a time;
+/// the moves of the frame line took 26 times as long (run 93d51be7).
 pub(crate) fn copy(
     src: *const u8,
     dst: *mut u8,
     len: usize,
+    host_dst: bool,
     plain: impl Fn(*const u8, *mut u8, usize) -> bool,
 ) -> Option<bool> {
     if !on() || len == 0 {
         return None;
     }
-    let (from, to) = (pages(src as usize, len), pages(dst as usize, len));
+    let from = pages(src as usize, len);
+    let to = if host_dst { Vec::new() } else { pages(dst as usize, len) };
     if from.is_empty() && to.is_empty() {
         return None;
     }
+    let whole = copy_through(&from, &to, src, dst, len, host_dst, &plain);
+    count(C::HostBytes, len as u64);
+    Some(whole)
+}
+
+/// [`copy`] with the recorded pages under the source (`from`) and the
+/// destination (`to`, empty when `host_dst`) found.
+fn copy_through(
+    from: &[HostPage],
+    to: &[HostPage],
+    src: *const u8,
+    dst: *mut u8,
+    len: usize,
+    host_dst: bool,
+    plain: &impl Fn(*const u8, *mut u8, usize) -> bool,
+) -> bool {
+    if host_dst {
+        return read_from(from, src, dst, len, plain);
+    }
     let mut bytes = vec![0u8; len];
+    if !read_from(from, src, bytes.as_mut_ptr(), len, plain) {
+        return false;
+    }
+    let mut whole = true;
     let mut done = 0;
     while done < len {
-        let (n, page) = piece(&from, src as usize, len, src as usize + done);
+        let (n, page) = piece(to, dst as usize, len, dst as usize + done);
         match page {
             // SAFETY: the page's view holds `PAGE` bytes, the piece lies in
             // them, and `keep` holds the view.
-            Some(p) => unsafe {
-                std::ptr::copy_nonoverlapping(p.ptr.add(src as usize + done - p.at), bytes.as_mut_ptr().add(done), n)
-            },
-            None => {
-                if !plain(src.wrapping_add(done), bytes[done..].as_mut_ptr(), n) {
-                    return Some(false);
-                }
-            }
-        }
-        done += n;
-    }
-    let mut whole = true;
-    done = 0;
-    while done < len {
-        let (n, page) = piece(&to, dst as usize, len, dst as usize + done);
-        match page {
-            // SAFETY: as above, for the destination.
             Some(p) => unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr().add(done), p.ptr.add(dst as usize + done - p.at), n)
             },
@@ -113,8 +144,38 @@ pub(crate) fn copy(
         }
         done += n;
     }
-    count(C::HostBytes, len as u64);
-    Some(whole)
+    whole
+}
+
+/// Reads `len` bytes of title memory at `src` into `out` (memory of ours):
+/// recorded pages (`from`) through their stable view, each run between them
+/// with one `plain` call. False, with `out` partly written, if a run is not
+/// readable.
+fn read_from(
+    from: &[HostPage],
+    src: *const u8,
+    out: *mut u8,
+    len: usize,
+    plain: &impl Fn(*const u8, *mut u8, usize) -> bool,
+) -> bool {
+    let mut done = 0;
+    while done < len {
+        let (n, page) = run(from, src as usize, len, src as usize + done);
+        match page {
+            // SAFETY: the page's view holds `PAGE` bytes, the piece lies in
+            // them, and `keep` holds the view; `out` holds `len` bytes.
+            Some(p) => unsafe {
+                std::ptr::copy_nonoverlapping(p.ptr.add(src as usize + done - p.at), out.add(done), n)
+            },
+            None => {
+                if !plain(src.wrapping_add(done), out.wrapping_add(done), n) {
+                    return false;
+                }
+            }
+        }
+        done += n;
+    }
+    true
 }
 
 /// A write of `len` bytes from host memory at `src` into title memory at
@@ -255,6 +316,81 @@ mod tests {
         assert!(matches!(piece(&pages, PAGE + 10, 3 * PAGE, 2 * PAGE), (n, Some(p)) if n == PAGE && p.at == 2 * PAGE));
         // Cut at the end of the range.
         assert!(matches!(piece(&pages, 2 * PAGE, 5, 2 * PAGE), (5, Some(_))));
+    }
+
+    #[test]
+    fn runs_reach_from_one_recorded_page_to_the_next() {
+        let keep: Arc<dyn Any + Send + Sync> = Arc::new(());
+        let pages = [2, 5].map(|i| HostPage { at: i * PAGE, ptr: std::ptr::null_mut(), keep: keep.clone() });
+        let (at, len) = (PAGE + 10, 6 * PAGE);
+        assert!(matches!(run(&pages, at, len, at), (n, None) if n == PAGE - 10));
+        assert!(matches!(run(&pages, at, len, 2 * PAGE), (n, Some(p)) if n == PAGE && p.at == 2 * PAGE));
+        // Pages 3 and 4 are one run.
+        assert!(matches!(run(&pages, at, len, 3 * PAGE + 4), (n, None) if n == 2 * PAGE - 4));
+        // After the last recorded page, to the end.
+        assert!(matches!(run(&pages, at, len, 6 * PAGE), (n, None) if n == PAGE + 10));
+        assert!(matches!(run(&[], at, len, at), (n, None) if n == len));
+    }
+
+    /// The bytes the fake kernel copy reads at a title address.
+    fn byte_at(a: usize) -> u8 {
+        (a / 3 % 251) as u8
+    }
+
+    /// Into memory of ours: straight in, one kernel call for each run
+    /// between recorded pages; a run that is not readable fails the copy.
+    /// Into title memory: the source read whole first, so a destination
+    /// showing a source page at another address gets the source's bytes.
+    #[test]
+    fn host_copies_read_straight_in_by_runs_and_title_copies_buffer() {
+        use std::cell::RefCell;
+        let keep: Arc<dyn Any + Send + Sync> = Arc::new(());
+        let pattern: Vec<u8> = (0..PAGE).map(|i| (i % 249) as u8).collect();
+        let mut two = pattern.clone();
+        let mut five: Vec<u8> = pattern.iter().map(|b| b ^ 0x5a).collect();
+        let from = [(2, two.as_mut_ptr()), (5, five.as_mut_ptr())]
+            .map(|(i, ptr)| HostPage { at: i * PAGE, ptr, keep: keep.clone() });
+        let calls = RefCell::new(Vec::new());
+        let unreadable = RefCell::new(usize::MAX);
+        let plain = |s: *const u8, d: *mut u8, n: usize| {
+            calls.borrow_mut().push((s as usize, n));
+            if (s as usize..s as usize + n).contains(&*unreadable.borrow()) {
+                return false;
+            }
+            for i in 0..n {
+                // SAFETY: the test's destinations hold the copy.
+                unsafe { d.add(i).write(byte_at(s as usize + i)) };
+            }
+            true
+        };
+        let (at, len) = (PAGE + 10, 6 * PAGE);
+        let mut out = vec![0u8; len];
+        assert!(copy_through(&from, &[], at as *const u8, out.as_mut_ptr(), len, true, &plain));
+        assert_eq!(*calls.borrow(), [(PAGE + 10, PAGE - 10), (3 * PAGE, 2 * PAGE), (6 * PAGE, PAGE + 10)]);
+        for (i, &b) in out.iter().enumerate() {
+            let a = at + i;
+            let want = match a / PAGE {
+                2 => pattern[a % PAGE],
+                5 => pattern[a % PAGE] ^ 0x5a,
+                _ => byte_at(a),
+            };
+            assert_eq!(b, want, "byte at {a:#x}");
+        }
+        *unreadable.borrow_mut() = 4 * PAGE + 8;
+        assert!(!copy_through(&from, &[], at as *const u8, out.as_mut_ptr(), len, true, &plain));
+
+        // One section page at two title addresses, both recorded: shifted
+        // from the one to the other, nothing through the kernel.
+        calls.borrow_mut().clear();
+        let mut shared = pattern.clone();
+        let ptr = shared.as_mut_ptr();
+        let at_one = |i: usize| HostPage { at: i * PAGE, ptr, keep: keep.clone() };
+        let (src_pages, dst_pages) = ([at_one(1)], [at_one(3)]);
+        let (src, dst) = ((PAGE + 16) as *const u8, (3 * PAGE) as *mut u8);
+        assert!(copy_through(&src_pages, &dst_pages, src, dst, PAGE - 16, false, &plain));
+        assert!(calls.borrow().is_empty());
+        assert_eq!(shared[..PAGE - 16], pattern[16..]);
+        assert_eq!(shared[PAGE - 16..], pattern[PAGE - 16..]);
     }
 
     /// The test's recorded pages: title address and the bytes behind it.

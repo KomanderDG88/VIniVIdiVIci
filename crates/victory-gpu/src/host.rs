@@ -8881,7 +8881,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         && len >= WIDE_READ_MIN
         && crate::shadow::wide_available()
         && !crate::shadow::in_wide_job();
-    let whole = crate::recorded::copy(src, dst, len, read_plain).unwrap_or_else(|| {
+    let whole = crate::recorded::copy(src, dst, len, !title_dst, read_plain).unwrap_or_else(|| {
         (!title_dst && crate::plaincopy::copy(dst, src, len))
             || if wide { read_wide(src, dst, len) } else { read(src, dst, len) }
     });
@@ -8975,7 +8975,7 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     // memory of ours, as in `copy_mapped`.
     // Recorded pages (`VICTORY_LAZY_REMAP=1`) through their stable view.
     let (to, len) = (dst.as_mut_ptr(), dst.len());
-    crate::recorded::copy(src, to, len, read_plain)
+    crate::recorded::copy(src, to, len, true, read_plain)
         .unwrap_or_else(|| crate::plaincopy::copy(to, src, len) || read(src, to, len))
 }
 
@@ -9021,7 +9021,7 @@ fn read_wide(src: *const u8, dst: *mut u8, len: usize) -> bool {
 /// readable; recorded pages (`VICTORY_LAZY_REMAP=1`) on either side go
 /// through their stable view.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    crate::recorded::copy(src, dst, len, read_plain).unwrap_or_else(|| read_plain(src, dst, len))
+    crate::recorded::copy(src, dst, len, false, read_plain).unwrap_or_else(|| read_plain(src, dst, len))
 }
 
 /// [`read`] through the kernel alone.
