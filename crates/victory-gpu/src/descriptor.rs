@@ -206,14 +206,21 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    // With `VICTORY_WIDE_READS=1` the pages are looked at by several threads
+    // ([`Look`]); otherwise one after another on this thread, as before. One
+    // page of bytes for every page looked at, and one list of the slots to
+    // mirror for every page: neither is allocated per page.
+    let wide = crate::shadow::wide_reads();
+    let mut page_bytes = vec![0u8; crate::watch::PAGE];
+    let mut due: Vec<(u32, u64)> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    // The pages to look at, collected first: a heap's journal of written
-    // bytes is walked once, in order, on this thread, and what it says is one
-    // page's worth of work (`Look`). Looking at them is what the pass spends
-    // its time on, and it does not have to: each page's bytes are read and
-    // compared on their own, and the pages can be handed to their host heap
-    // in any order.
+    // With the switch, the pages to look at, collected first: a heap's
+    // journal of written bytes is walked once, in order, on this thread, and
+    // what it says is one page's worth of work (`Look`). Looking at them is
+    // what the pass spends its time on, and it does not have to: each page's
+    // bytes are read and compared on their own, and the pages can be handed
+    // to their host heap in any order.
     let mut work: Vec<Look> = Vec::new();
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -240,14 +247,59 @@ pub(crate) fn sync_heaps() {
         for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
-                work.push(Look {
-                    at,
-                    start,
-                    step,
-                    count: mirrored_count,
-                    from: page.max(range_from),
-                    to: (page + crate::watch::PAGE).min(range_end),
-                });
+                if wide {
+                    work.push(Look {
+                        at,
+                        start,
+                        step,
+                        count: mirrored_count,
+                        from: page.max(range_from),
+                        to: (page + crate::watch::PAGE).min(range_end),
+                    });
+                    page += crate::watch::PAGE;
+                    continue;
+                }
+                let from = page.max(range_from);
+                let to = (page + crate::watch::PAGE).min(range_end);
+                // The page's records are read through the kernel, into a
+                // copy: a page the title unmaps meanwhile fails the read
+                // where 2,048 reads in place would fault.
+                let slice = &mut page_bytes[..to - from];
+                let reading = std::time::Instant::now();
+                let read = crate::host::read_into(from as *const u8, slice);
+                SYNC_PARTS[1].fetch_add(reading.elapsed().as_micros() as u64, Relaxed);
+                if read {
+                    pages += 1;
+                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                    // The page's records in one go, under one lock
+                    // (`HostHeap::mirror_copied_page`); one by one below
+                    // with `VICTORY_HEAP_SYNC_PAGE=0`.
+                    let slots = if page_at_once() {
+                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, slice, &mut due);
+                        looked += seen;
+                        mirrored += made;
+                        0..0
+                    } else {
+                        slots
+                    };
+                    for index in slots {
+                        let handle = start + index * step;
+                        // A record that straddles the range's ends is left
+                        // to the range that holds its first byte.
+                        let Some(at) = (handle as usize).checked_sub(from) else {
+                            continue;
+                        };
+                        let Some(record) = slice.get(at..at + step as usize) else {
+                            continue;
+                        };
+                        looked += 1;
+                        // Only a record that is not the one last seen there
+                        // (`HostHeap::mirror_copied`).
+                        if host.mirror_copied(index as u32, handle, record) {
+                            mirrored += 1;
+                        }
+                    }
+                }
                 page += crate::watch::PAGE;
             }
         }

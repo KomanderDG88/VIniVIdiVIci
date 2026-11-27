@@ -1923,6 +1923,16 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// Whether a long copy of title memory (`crate::host::copy_mapped`) and the
+/// pages of the pass over the view heaps (`crate::descriptor::sync_heaps`)
+/// are read by several threads of [`wide`] at once (`VICTORY_WIDE_READS=1`;
+/// off by default here: fork pull request #1424, a draft not yet measured
+/// in the title). Unset, both run on the calling thread as before.
+pub(crate) fn wide_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_READS").is_some_and(|v| v == "1"))
+}
+
 /// Whether [`wide`] has threads to give work to besides the calling one
 /// (`VICTORY_WIDE_THREADS=1` leaves none).
 pub(crate) fn wide_available() -> bool {

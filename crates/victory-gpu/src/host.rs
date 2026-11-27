@@ -8517,8 +8517,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // first: the system reports them not there.
     // A long copy is read by several threads at once (`read_wide`): it has
     // nothing to do with any other, and one thread's kernel read runs at
-    // some 3 GB/s, which is what the frame line's "copies" are.
-    let wide = !title_dst && len >= WIDE_READ_MIN && crate::shadow::wide_available() && !crate::shadow::in_wide_job();
+    // some 3 GB/s, which is what the frame line's "copies" are. Only with
+    // `VICTORY_WIDE_READS=1` (`crate::shadow::wide_reads`).
+    let wide = crate::shadow::wide_reads()
+        && !title_dst
+        && len >= WIDE_READ_MIN
+        && crate::shadow::wide_available()
+        && !crate::shadow::in_wide_job();
     let whole = crate::recorded::copy(src, dst, len, read_plain).unwrap_or_else(|| {
         (!title_dst && crate::plaincopy::copy(dst, src, len))
             || if wide { read_wide(src, dst, len) } else { read(src, dst, len) }
