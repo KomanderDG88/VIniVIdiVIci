@@ -50,7 +50,7 @@
 //! `Step::CardCopy` is ever recorded, every step is on the CPU, [`decide`]
 //! and [`note_sent`] return at once and the frame line says nothing.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -60,16 +60,83 @@ use super::{HostList, Step, host, line, touches, transition};
 
 /// The level of the switch: 0 off, 1 card copies, 2 also constant buffers
 /// read from the card, 3 also copies of sources flights wrote lately.
+/// Asked for on a device without enhanced barriers (the copies' barriers
+/// are `ID3D12GraphicsCommandList7::Barrier`), it is off, said once. Unset,
+/// the device is not asked.
 fn level() -> u8 {
     static LEVEL: OnceLock<u8> = OnceLock::new();
-    *LEVEL.get_or_init(
-        || match std::env::var("VICTORY_CARD_READ_COPY").as_deref() {
+    *LEVEL.get_or_init(|| {
+        let asked = match std::env::var("VICTORY_CARD_READ_COPY").as_deref() {
             Ok("1") => 1,
             Ok("2") => 2,
             Ok("3") => 3,
             _ => 0,
-        },
-    )
+        };
+        if asked == 0 {
+            return 0;
+        }
+        let level = effective(asked, enhanced_barriers());
+        if level == 0 {
+            say_no_barriers();
+        }
+        level
+    })
+}
+
+/// The level that runs: the one asked for if the device has enhanced
+/// barriers, else off.
+fn effective(asked: u8, enhanced: bool) -> u8 {
+    if enhanced { asked } else { 0 }
+}
+
+/// Whether the host device has enhanced barriers
+/// (`D3D12_FEATURE_D3D12_OPTIONS12`); false without a host device.
+fn enhanced_barriers() -> bool {
+    let Some(host) = host() else {
+        return false;
+    };
+    let mut o12 = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+    // SAFETY: a live device and a structure of the size given.
+    let ok = unsafe {
+        host.device()
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                (&raw mut o12).cast(),
+                size_of_val(&o12) as u32,
+            )
+            .is_ok()
+    };
+    ok && o12.EnhancedBarriersSupported.as_bool()
+}
+
+/// Set when a list did not cast to `ID3D12GraphicsCommandList7`: no card
+/// copy is recorded from then on, the copies are the CPU's as with the
+/// switch off.
+static NO_LIST7: AtomicBool = AtomicBool::new(false);
+
+/// Says once that the switch is off for want of enhanced barriers.
+fn say_no_barriers() {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Relaxed) {
+        tracing::warn!("VICTORY_CARD_READ_COPY asked but the device has no enhanced barriers: off");
+    }
+}
+
+/// Whether card copies are recorded: the switch on and every list so far
+/// cast to `ID3D12GraphicsCommandList7`.
+fn records() -> bool {
+    on() && !NO_LIST7.load(Relaxed)
+}
+
+/// The list as `ID3D12GraphicsCommandList7`; None, and no card copy from
+/// then on (said once), if it is not one.
+fn list7(list: &ID3D12GraphicsCommandList) -> Option<ID3D12GraphicsCommandList7> {
+    let l7 = list.cast::<ID3D12GraphicsCommandList7>().ok();
+    if l7.is_none() {
+        NO_LIST7.store(true, Relaxed);
+        say_no_barriers();
+    }
+    l7
 }
 
 /// Whether the card does these copies (`VICTORY_CARD_READ_COPY=1` to `3`).
@@ -507,7 +574,7 @@ impl HostList {
         else {
             return false;
         };
-        let Ok(l7) = self.list.cast::<ID3D12GraphicsCommandList7>() else {
+        let Some(l7) = list7(&self.list) else {
             return false;
         };
         from.refresh(self, src, len);
@@ -558,7 +625,7 @@ impl HostList {
     /// or if either side has no host copy; the caller then records the copy
     /// as before.
     pub(crate) fn copy_after_flights(&self, dst: *mut u8, src: *const u8, len: usize) -> bool {
-        if !on() {
+        if !records() {
             return false;
         }
         let in_air = flights_write(src as usize, len);
@@ -607,6 +674,7 @@ impl HostList {
         let len = len.min(CONSTANT_MOST);
         let (from, to) = (address as usize, (address + len) as usize);
         if !chain()
+            || !records()
             || !recent_meets(
                 &RECENT.lock().unwrap_or_else(|e| e.into_inner()),
                 from,
@@ -621,7 +689,7 @@ impl HostList {
         if found.is_some() {
             return found;
         }
-        let l7 = self.list.cast::<ID3D12GraphicsCommandList7>().ok()?;
+        let l7 = list7(&self.list)?;
         let shadow = crate::shadow::find(address, len)?;
         let buffer = host()?.uav_buffer(len.next_multiple_of(256))?;
         // The bytes beside the copy's destination come from title memory, as
@@ -721,6 +789,14 @@ mod tests {
 
     fn pin_of(steps: &[Access], written: &[(usize, usize)]) -> Place {
         places(steps, written, false)[0]
+    }
+
+    #[test]
+    fn without_enhanced_barriers_the_switch_is_off() {
+        for asked in 0..=3 {
+            assert_eq!(effective(asked, false), 0);
+            assert_eq!(effective(asked, true), asked);
+        }
     }
 
     #[test]
