@@ -5005,6 +5005,7 @@ impl State {
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let cached = crate::descriptor::host::view_cache::on();
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
@@ -5013,7 +5014,12 @@ impl State {
                 if let Some(title) = title_first {
                     host.table_slot(title + k);
                 }
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                // The view and its record, for the cache of views made.
+                let (found, record) = match crate::descriptor::view_and_key(table + u64::from(k) * 32) {
+                    Some((view, record)) => (Some(view), record),
+                    None => (None, 0),
+                };
+                match found {
                     Some(View::Constant(address, size)) => {
                         // A constant buffer a card copy wrote lately
                         // (`VICTORY_CARD_READ_COPY=2`): copied on the card,
@@ -5038,6 +5044,7 @@ impl State {
                     Some(view) => {
                         match halved(self, slot, k * 8) {
                             Some(shown) => host.make_at(index, &shown),
+                            None if cached => host.make_at_cached(index, &view, record),
                             None => host.make_at(index, &view),
                         }
                         #[cfg(feature = "diagnostics")]
