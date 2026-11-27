@@ -10,9 +10,12 @@
 //!
 //! Ported from Belobug/VIctory-Belobug-AMD cd8dfc06
 //! (crates/victory-gpu/src/external.rs) and adapted to our host: a title
-//! list has its host list from the start (no thin lists to wait for), and
-//! the title's draw state is replayed after the call, as
-//! [`crate::list::upscale_stretch`] does.
+//! list has its host list from the start, and the title's draw state is
+//! replayed after the call, as [`crate::list::upscale_stretch`] does. With
+//! lists written down (`VICTORY_THIN=1`, `crate::list::thin`) a title list
+//! has no host list: the work is written down at its place and done on the
+//! list of ours its calls are translated on ([`later`], [`record_later`]),
+//! with what it reads copied at the call.
 
 use std::ffi::c_void;
 
@@ -83,6 +86,29 @@ impl Recording<'_> {
     pub fn commands(&self) -> *mut c_void {
         self.0.list.as_raw()
     }
+
+    /// The title's colour texture `colour` stretched over `output` from its
+    /// top-left `render` texels, as `crate::list::upscale_stretch` does:
+    /// whether it was recorded.
+    pub fn stretch(&self, colour: *const c_void, output: *const c_void, render: [u32; 2]) -> bool {
+        crate::list::stretch_on(self.0, colour.cast(), output.cast(), render) == Some(true)
+    }
+}
+
+/// Whether work recorded into title list `list` is done later
+/// ([`record_later`]): its calls are written down (`VICTORY_THIN=1`) and
+/// translated by threads of ours, in their order.
+pub fn later(list: *const c_void) -> bool {
+    !list.is_null() && crate::list::thin::on()
+}
+
+/// Has `f` record at this place of title list `list`, when the list's calls
+/// are translated (now, if they are not written down): on a thread of ours,
+/// with the host list there. `f` says whether it recorded into it (then the
+/// title's own state is set again). Whatever `f` reads of the title's must be
+/// copied into it now. False if the list records nowhere (`f` is dropped).
+pub fn record_later(list: *const c_void, f: impl FnOnce(&Recording<'_>) -> bool + Send + 'static) -> bool {
+    crate::list::external(list.cast(), Box::new(move |host: &crate::host::HostList| f(&Recording(host))))
 }
 
 /// The library recorded `resource`'s new contents on the host list: they

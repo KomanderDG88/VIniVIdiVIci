@@ -1315,6 +1315,18 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// As [`host_pipeline`], for a dispatch: the head blend-shape map's waits
+/// for its pipeline up to two seconds once with `VICTORY_HEAD_MAP_WAIT=1`
+/// (`make::ready_dispatch`); without it, exactly [`host_pipeline`].
+/// After TaynanGT/Vice-Tay 3e3fd579.
+#[cfg(windows)]
+pub(crate) fn host_dispatch_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    make::ready_dispatch(&pipeline(this).host)
+}
+
 /// As [`host_pipeline`], for a draw into render target and depth views of
 /// the formats `bound`: if a bound view has another format than the title's
 /// pipeline declares for its slot (`host::formats_differ`), the host
@@ -1331,6 +1343,14 @@ pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> 
         return make::for_formats(p, bound);
     }
     make::ready(p)
+}
+
+/// Whether one of the containers of the title pipeline `this` is one `f`
+/// picks (false for none bound). Known at the call, before any host
+/// pipeline is made.
+#[cfg(windows)]
+pub(crate) fn shaders_any(this: This, f: impl Fn(&Shader) -> bool) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| f(s))
 }
 
 /// Host pipelines queued and not made yet.

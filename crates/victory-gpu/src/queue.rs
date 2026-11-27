@@ -764,17 +764,14 @@ pub(crate) fn before_sync() {
 }
 
 /// Whether submissions go into the one line of a thread of ours
-/// (`VICTORY_SUBMIT_LINE=1`, [`behind`]).
+/// (`VICTORY_SUBMIT_LINE=1` or `VICTORY_THIN=1`, [`behind`]).
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn line_on() -> bool {
     behind::on()
 }
 
-/// Lists in the line may have been translated (`crate::list::thin`, the
-/// next step of the port).
+/// Lists in the line may have been translated (`crate::list::thin`).
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn line_moved() {
     behind::wake();
 }
@@ -782,14 +779,12 @@ pub(crate) fn line_moved() {
 /// Presents put in the line of submissions so far, and those that have gone
 /// ([`behind`]).
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn presents() -> (u64, u64) {
     behind::presents()
 }
 
 /// This thread does work the line waits for: it does not wait for the line.
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn no_drain_here() {
     behind::no_drain_here();
 }
@@ -1579,24 +1574,20 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
             && !plane.resources.is_null()
             // SAFETY: the plane lists `count` resources.
             && let resource = unsafe { *plane.resources }
-            && let Some(texture) = crate::resource::host_resource(resource)
+            && crate::resource::host_resource(resource).is_some()
         {
-            // The states the lists recorded so far leave the planes in: what
-            // our copy finds them in when it runs behind them (looked at,
-            // not changed), as [`send_behind`] does.
-            const COPY_SOURCE: u32 = 0x800;
-            const READABLE: u32 = 0x80;
-            let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
-            crate::resource::host_transition(resource, state);
             // SAFETY: the title passes `planes` plane descriptions.
-            let over = unsafe { second_plane(planes, plane_parameters, resource) }
-                .and_then(|r| Some((r, crate::resource::host_resource(r)?.clone())))
-                .map(|(r, t)| {
-                    let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
-                    crate::resource::host_transition(r, was);
-                    (t, was)
-                });
-            behind::present(this, texture.clone(), state, frame, over);
+            let second = unsafe { second_plane(planes, plane_parameters, resource) };
+            // Lists written down (`crate::list::thin`) are not translated
+            // yet: the states they leave the planes in are looked at when the
+            // present's turn comes, with the textures held till then.
+            if crate::list::thin::on()
+                && let Some(held) = crate::resource::hold(resource)
+            {
+                behind::present_later(this, held, second.and_then(crate::resource::hold), frame);
+            } else if let Some((texture, state, over)) = planes_now(resource, second) {
+                behind::present(this, texture, state, frame, over);
+            }
         }
         return S_OK;
     }
@@ -1640,6 +1631,32 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// The host textures of title textures `resource` and `second` (a second
+/// plane) and the states the lists recorded so far leave them in: what our
+/// copy finds them in when it runs behind them (looked at, not changed), as
+/// [`send_behind`] does. `None` if the first has no host texture.
+#[cfg(windows)]
+pub(crate) fn planes_now(
+    resource: This,
+    second: Option<This>,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    u32,
+    Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+)> {
+    const COPY_SOURCE: u32 = 0x800;
+    const READABLE: u32 = 0x80;
+    let texture = crate::resource::host_resource(resource)?.clone();
+    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    crate::resource::host_transition(resource, state);
+    let over = second.and_then(|r| Some((r, crate::resource::host_resource(r)?.clone()))).map(|(r, t)| {
+        let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
+        crate::resource::host_transition(r, was);
+        (t, was)
+    });
+    Some((texture, state, over))
+}
+
 /// The bytes from one plane's description to the next in a present.
 const PLANE_STRIDE: usize = 0x48;
 

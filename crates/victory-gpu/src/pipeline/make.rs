@@ -78,6 +78,11 @@ pub(crate) struct Pending {
     screen: bool,
     /// When it began to be made (screen passes only: [`given_up`]).
     begun: OnceLock<Instant>,
+    /// The head blend-shape map ([`is_head_map`]) with
+    /// `VICTORY_HEAD_MAP_WAIT=1` ([`head_map_wait`]): queued at its
+    /// creation, ahead of the requested pipelines, and its dispatch waits
+    /// for it up to [`HEAD_MAP_ALLOWANCE`]. Always false without the switch.
+    wait_for_head_map: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -95,9 +100,13 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         let screen = screen_workers() && graphics.as_ref().is_some_and(|g| g.screen_pass());
+        let wait_for_head_map = graphics.is_none()
+            && matches!(&shaders[..], [s] if is_head_map(s.stage, &s.hash))
+            && head_map_wait();
         Pending {
             screen,
             begun: OnceLock::new(),
+            wait_for_head_map,
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             shaders,
@@ -157,6 +166,98 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
+/// The compute program of the title's head blend-shape map: the title
+/// dispatches it once for a head (the skin around the eyes and teeth is
+/// what it leaves; avatarmanz/VIctory-7900XTX#166). Dropped while its
+/// pipeline was being made, the face stays black or frozen.
+const HEAD_MAP_SHADER: &str = "61e54e90adccaf6a";
+
+/// Whether a lone shader of `stage` and `hash` is the head blend-shape
+/// map's ([`HEAD_MAP_SHADER`]).
+fn is_head_map(stage: &str, hash: &str) -> bool {
+    stage == "compute" && hash == HEAD_MAP_SHADER
+}
+
+/// Whether the head blend-shape map's pipeline is queued at its creation
+/// and its dispatch waits for it up to [`HEAD_MAP_ALLOWANCE`] instead of
+/// the frame's budget ([`wait`]): `VICTORY_HEAD_MAP_WAIT=1`. Off unless
+/// set to 1 (Vice-Tay has it on unless 0): unset, no pipeline is marked,
+/// and pipelines are queued, made and waited for exactly as before.
+fn head_map_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = head_map_switch(std::env::var_os("VICTORY_HEAD_MAP_WAIT").as_deref());
+        if on {
+            tracing::info!(
+                allowance_ms = HEAD_MAP_ALLOWANCE.as_millis() as u64,
+                "the head blend-shape map pipeline is queued at its creation and its dispatch waits for it (VICTORY_HEAD_MAP_WAIT=1)"
+            );
+        }
+        on
+    })
+}
+
+/// [`head_map_wait`] from the variable's value: on only for `1`.
+fn head_map_switch(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+/// How long the head blend-shape map's dispatch waits for its pipeline,
+/// over the run (below the title's 30 s watchdog; normally milliseconds,
+/// since it was queued at its creation).
+const HEAD_MAP_ALLOWANCE: Duration = Duration::from_secs(2);
+
+/// Waits until `made` is set, or until `allowance` from `started` is over.
+fn wait_for_made<T>(made: &OnceLock<T>, started: Instant, allowance: Duration) -> Option<&T> {
+    if let Some(result) = made.get() {
+        return Some(result);
+    }
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while made.get().is_none() {
+        let left = allowance.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    made.get()
+}
+
+/// The head blend-shape map's wait ([`head_map_wait`]): one allowance,
+/// shared; once it has run out (said once), later dispatches wait within
+/// the frame's budget as before. A wait that ends with the pipeline made
+/// leaves the allowance for another pipeline of the same shader.
+struct HeadMapWait {
+    allowance: Duration,
+    timed_out: AtomicBool,
+}
+
+impl HeadMapWait {
+    const fn new(allowance: Duration) -> Self {
+        Self { allowance, timed_out: AtomicBool::new(false) }
+    }
+
+    /// `None`: the allowance has run out before, wait as any other
+    /// pipeline; else whether `made` is set now.
+    fn wait<T>(&self, made: &OnceLock<T>, key: &str) -> Option<bool> {
+        if self.timed_out.load(Ordering::Acquire) {
+            return None;
+        }
+        let made = wait_for_made(made, Instant::now(), self.allowance).is_some();
+        if !made && !self.timed_out.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                key,
+                frame = crate::frame::current(),
+                allowance_ms = self.allowance.as_millis() as u64,
+                "head blend-shape map pipeline still pending at its dispatch's deadline; later dispatches wait within the frame's budget (VICTORY_HEAD_MAP_WAIT=1)"
+            );
+        }
+        Some(made)
+    }
+}
+
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
@@ -181,11 +282,29 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    ready_for(p, false)
+}
+
+/// As [`ready`], for a dispatch: the head blend-shape map's with
+/// `VICTORY_HEAD_MAP_WAIT=1` waits for its pipeline up to
+/// [`HEAD_MAP_ALLOWANCE`] (once over the run) instead of the frame's
+/// budget. Any other pipeline, or without the switch: [`ready`].
+pub(crate) fn ready_dispatch(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    ready_for(p, true)
+}
+
+fn ready_for(p: &Arc<Pending>, dispatch: bool) -> Option<&HostPipeline> {
+    static HEAD_MAP: HeadMapWait = HeadMapWait::new(HEAD_MAP_ALLOWANCE);
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
+    // The head map's first dispatch is logged (`VICTORY_HEAD_MAP_WAIT=1`).
+    let head = dispatch && p.wait_for_head_map;
+    static HEAD_REPORTED: AtomicBool = AtomicBool::new(false);
+    let first_head = (head && !HEAD_REPORTED.swap(true, Ordering::Relaxed))
+        .then(|| (crate::frame::current(), p.made.get().is_some(), Instant::now()));
     if p.made.get().is_none() {
         start(p, REQUESTED);
         // A compute pipeline in the first 600 frames (the title's one-shot
@@ -203,9 +322,30 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             if capped && !early {
                 compute_spent(frame, began.elapsed());
             }
+        } else if head && compute_room(frame) {
+            // The head map (`VICTORY_HEAD_MAP_WAIT=1`): its own allowance,
+            // counted to the compute cap when that is set; once that has
+            // run out, the frame's budget as any other.
+            let began = Instant::now();
+            if HEAD_MAP.wait(&p.made, &p.key).is_none() {
+                wait(p, frame);
+            }
+            if capped {
+                compute_spent(frame, began.elapsed());
+            }
         } else {
             wait(p, frame);
         }
+    }
+    if let Some((frame, already_ready, began)) = first_head {
+        tracing::info!(
+            frame,
+            key = p.key,
+            already_ready,
+            host_pipeline = p.made.get().is_some_and(Option::is_some),
+            wait_ms = format_args!("{:.1}", began.elapsed().as_secs_f64() * 1e3),
+            "head blend-shape map pipeline at its first dispatch (VICTORY_HEAD_MAP_WAIT=1)"
+        );
     }
     let made = p.made.get()?.as_ref();
     // The first time the made pipeline goes to a draw or dispatch: noted
@@ -394,6 +534,13 @@ pub(crate) fn ahead(p: &Arc<Pending>) {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    // The head blend-shape map (`VICTORY_HEAD_MAP_WAIT=1`): queued now,
+    // ahead of the requested pipelines, cache or no cache.
+    if p.wait_for_head_map {
+        tracing::info!(key = p.key, "head blend-shape map pipeline queued at its creation (VICTORY_HEAD_MAP_WAIT=1)");
+        ahead(p);
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
@@ -517,7 +664,11 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED && p.screen {
+        if priority == REQUESTED && p.wait_for_head_map {
+            // The head map (`VICTORY_HEAD_MAP_WAIT=1`): before any other
+            // the workers take.
+            self.ahead.push_front(p.clone());
+        } else if priority == REQUESTED && p.screen {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
@@ -535,7 +686,11 @@ impl Queue {
             return None;
         }
         p.queue_state.store(REQUESTED, Ordering::Relaxed);
-        self.ahead.push_back(p.clone());
+        if p.wait_for_head_map {
+            self.ahead.push_front(p.clone());
+        } else {
+            self.ahead.push_back(p.clone());
+        }
         Some(prev == NOT_QUEUED)
     }
 
@@ -862,6 +1017,80 @@ mod tests {
         // Its early entry is not made again.
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
         assert!(queue.pop().is_none());
+    }
+
+    /// Only a lone compute shader of the head map's hash is the head map, and
+    /// the wait is on only for `VICTORY_HEAD_MAP_WAIT=1`: unset or any
+    /// other value (Vice-Tay's `0` among them), as before.
+    #[test]
+    fn the_head_map_wait_is_off_unless_asked_for() {
+        assert!(is_head_map("compute", HEAD_MAP_SHADER));
+        assert!(!is_head_map("pixel", HEAD_MAP_SHADER));
+        assert!(!is_head_map("compute", "0011223344556677"));
+        assert!(!head_map_switch(None));
+        assert!(!head_map_switch(Some("0".as_ref())));
+        assert!(!head_map_switch(Some("true".as_ref())));
+        assert!(head_map_switch(Some("1".as_ref())));
+        // No shaders: never the head map, switch or not.
+        assert!(!Pending::new(Vec::new(), None).wait_for_head_map);
+    }
+
+    /// The head map is the workers' next pipeline, whether queued at its
+    /// creation or by its first dispatch, before those queued ahead.
+    #[test]
+    fn the_head_map_comes_before_the_queued_ahead_and_requested() {
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let first = Arc::new(Pending::new(Vec::new(), None));
+        let head = || {
+            let mut p = Pending::new(Vec::new(), None);
+            p.wait_for_head_map = true;
+            Arc::new(p)
+        };
+        let (at_creation, at_dispatch) = (head(), head());
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
+        assert_eq!(queue.push_ahead(&first), Some(true));
+        assert_eq!(queue.push_ahead(&at_creation), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &at_creation));
+        assert_eq!(queue.push(&at_dispatch, REQUESTED), Some(true));
+        assert_eq!(queue.push(&at_dispatch, REQUESTED), None);
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &at_dispatch));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &first));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
+        assert!(queue.pop().is_none());
+    }
+
+    /// The head map's wait ends when the pipeline is made; once its
+    /// allowance has run out it is spent for every later dispatch (`None`:
+    /// the frame's budget), and a result that came late is still seen.
+    #[test]
+    fn the_head_map_wait_is_bounded_and_spent_once() {
+        let made: OnceLock<Option<u8>> = OnceLock::new();
+        let wait = HeadMapWait::new(Duration::from_secs(5));
+        std::thread::scope(|scope| {
+            let (made, wait) = (&made, &wait);
+            let waiter = scope.spawn(move || wait.wait(made, "test"));
+            std::thread::sleep(Duration::from_millis(20));
+            made.set(None).unwrap();
+            {
+                let (lock, done) = &DONE;
+                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                done.notify_all();
+            }
+            assert_eq!(waiter.join().unwrap(), Some(true));
+        });
+        assert!(!wait.timed_out.load(Ordering::Acquire));
+
+        let short = HeadMapWait::new(Duration::from_millis(20));
+        let pending: OnceLock<Option<u8>> = OnceLock::new();
+        let began = Instant::now();
+        assert_eq!(short.wait(&pending, "test"), Some(false));
+        assert!(began.elapsed() >= Duration::from_millis(20));
+        assert!(short.timed_out.load(Ordering::Acquire));
+        assert_eq!(short.wait(&pending, "test"), None);
+        pending.set(Some(7)).unwrap();
+        assert_eq!(short.wait(&pending, "test"), None);
+        assert_eq!(wait_for_made(&pending, began, Duration::ZERO), Some(&Some(7)));
     }
 
     /// Only a screen pass is given up on, and only once the driver has been

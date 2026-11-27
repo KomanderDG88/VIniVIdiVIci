@@ -17,11 +17,13 @@
 //! `VICTORY_ASYNC_PRESENT` and `VICTORY_JOIN_PARTS` on top). Both stay: this
 //! line has its own switch, and with it on the older one is off (one thread
 //! runs what the queues were given, never two). It is the line
-//! `crate::list::thin` puts its submissions in, once that is ported. What is
-//! left out of upstream's here: parts taken along with one another
-//! (`crate::host::joins`, `two_queues`), the heaps' marks (`heap_marks`), the
-//! switch flipped while the title runs (`crate::ab`), and the submissions whose
-//! lists are being translated (`Job::Lists`, with `list::thin`).
+//! `crate::list::thin` puts its submissions in (`VICTORY_THIN=1` turns it on):
+//! a submission whose lists are being translated stands in it as one entry
+//! (`Job::Lists`) until they are, and a present after them looks at the state
+//! they leave the frame in when its turn comes (`Job::Shown`). What is left
+//! out of upstream's here: parts taken along with one another
+//! (`crate::host::joins`, `two_queues`), the heaps' marks (`heap_marks`), and
+//! the switch flipped while the title runs (`crate::ab`).
 //!
 //! With the switch a submission's lists are taken from the title's lists (as
 //! they are for every flight, `crate::list::detach`) and put in the [`Lane`],
@@ -463,6 +465,8 @@ impl<W: Work> Lane<W> {
     }
 }
 
+type Recordings = std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>;
+
 /// What the title's queues put in the line.
 enum Job {
     /// The queue waits for the fence to reach the value.
@@ -473,6 +477,9 @@ enum Job {
     /// A submission, or a part of one, to the queue (its address): the lists'
     /// host sides and the order they run in.
     Run(usize, Vec<crate::list::Detached>, Vec<usize>),
+    /// A submission whose lists are being translated ([`crate::list::thin`]):
+    /// the parts of it are known when they are.
+    Lists(usize, Recordings),
     /// A signal of the queue's.
     Signal(crate::fence::FenceRef, u64),
     /// A frame is shown: the host texture, the state the title's lists
@@ -484,6 +491,11 @@ enum Job {
         u64,
         Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
     ),
+    /// A frame is shown whose lists were not translated when the title
+    /// presented ([`crate::list::thin`]): the title's textures (the frame and
+    /// a second plane), held, and the frame's number; the states they are
+    /// left in are looked at when its turn comes.
+    Shown(crate::resource::Held, Option<crate::resource::Held>, u64),
 }
 
 // SAFETY: D3D12 objects are free-threaded; a job is touched by whoever put it
@@ -495,6 +507,7 @@ enum Ask {
     /// The fence (its address; the job holds it) and the value.
     Wait(usize, u64),
     Value(crate::list::ValueWait),
+    Lists(Recordings),
 }
 
 impl Work for Job {
@@ -504,7 +517,41 @@ impl Work for Job {
         match self {
             Job::Wait(fence, value) => Some(Ask::Wait(fence.as_this() as usize, *value)),
             Job::Value(_, wait) => Some(Ask::Value(*wait)),
+            Job::Lists(_, lists) => Some(Ask::Lists(lists.clone())),
             _ => None,
+        }
+    }
+
+    fn folded(&self) -> bool {
+        matches!(self, Job::Lists(..))
+    }
+
+    fn unfold(self) -> Vec<Self> {
+        let Job::Lists(queue, recordings) = self else {
+            return vec![self];
+        };
+        let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
+        // A frame shot learns that its frame's lists are being submitted.
+        #[cfg(feature = "diagnostics")]
+        if crate::shot::recording() {
+            for &l in &lists {
+                if let Some(h) = crate::list::host_list(l) {
+                    crate::shot::submitted(h);
+                }
+            }
+        }
+        let jobs = jobs_of(queue as This, &lists);
+        // It stood for one submission not begun.
+        let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
+        QUEUED.fetch_add(runs, Relaxed);
+        QUEUED.fetch_sub(1, Relaxed);
+        STATS[RUNS].fetch_add(runs, Relaxed);
+        jobs
+    }
+
+    fn settle(ask: &Ask) {
+        if let Ask::Lists(recordings) = ask {
+            recordings.iter().for_each(|r| r.wait());
         }
     }
 
@@ -521,15 +568,16 @@ impl Work for Job {
                 met
             }
             Ask::Value(wait) => super::value_met(wait),
+            Ask::Lists(recordings) => recordings.iter().all(|r| r.done()),
         }
     }
 
     fn shows(&self) -> bool {
-        matches!(self, Job::Present(..))
+        matches!(self, Job::Present(..) | Job::Shown(..))
     }
 
     fn runs(&self) -> bool {
-        matches!(self, Job::Run(..))
+        matches!(self, Job::Run(..) | Job::Lists(..))
     }
 
     fn go(self, forced: bool) {
@@ -542,7 +590,8 @@ impl Work for Job {
             ONCE.call_once(|| tracing::warn!("a queue still stood at a wait at a present: it was not met"));
         }
         match self {
-            Job::Wait(..) | Job::Value(..) => {}
+            // (A folded one is unfolded, never done.)
+            Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
             Job::Run(queue, lists, order) => {
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || format!("RUN submission of {} lists (the line's thread)", order.len()));
@@ -564,6 +613,23 @@ impl Work for Job {
                 }
                 QUEUED.fetch_sub(1, Relaxed);
                 PRESENTS_GONE[1].fetch_add(1, Relaxed);
+                // The lists behind it are the ones sent next: none is held
+                // back any more (`crate::list::thin`'s gate).
+                crate::list::thin::moved();
+            }
+            Job::Shown(texture, over, frame) => {
+                crate::host::merge_send(crate::merge::Why::Present);
+                // (Its lists are translated and sent: the states they left
+                // the planes in.)
+                if let Some(host) = crate::host::host()
+                    && let Some((shown, state, over)) =
+                        super::planes_now(texture.get(), over.as_ref().map(crate::resource::Held::get))
+                {
+                    let _ = host.present(&shown, state, frame, over.as_ref().map(|(t, was)| (t, *was)));
+                }
+                QUEUED.fetch_sub(1, Relaxed);
+                PRESENTS_GONE[1].fetch_add(1, Relaxed);
+                crate::list::thin::moved();
             }
         }
         STATS[BUSY].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -582,7 +648,7 @@ static LANE: Lane<Job> = Lane::new();
 
 /// Presents put in the line since the start, and those that have gone: a
 /// submission put in when as many had been put as have gone now has no
-/// present before it in the line (`crate::list::thin`'s gate, next step).
+/// present before it in the line (`crate::list::thin`'s gate).
 static PRESENTS_GONE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// [`PRESENTS_GONE`].
@@ -598,12 +664,12 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// found things in it (the sum of their numbers) and the most; what threads of
 /// the title waited, in microseconds, for room in the line, at a present, and
 /// for a drain, and the drains; what our thread worked; waits not met at a
-/// present; what our thread spent unfolding entries (none yet: `list::thin`).
+/// present; what our thread spent unfolding entries (`list::thin`).
 static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 /// Since the last line, microseconds our thread stood with nothing free to
 /// run: with nothing in the line (the title had not submitted), with a
 /// submission in it whose lists were not all translated (`crate::list::thin`,
-/// next step), and at waits alone. Two clock reads a wait. Not in `BUSY`.
+/// with `VICTORY_THIN=1`), and at waits alone. Two clock reads a wait. Not in `BUSY`.
 static STOOD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
@@ -650,7 +716,9 @@ thread_local! {
 /// nothing of this module runs: no thread, no line, [`queued`] stays 0.
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_LINE").is_some_and(|v| v == "1") && started())
+    *ON.get_or_init(|| {
+        (std::env::var_os("VICTORY_SUBMIT_LINE").is_some_and(|v| v == "1") || crate::list::thin::wanted()) && started()
+    })
 }
 
 /// Starts the thread, once: whether there is one.
@@ -716,6 +784,7 @@ pub(super) fn drain() {
     if OURS.get() {
         return;
     }
+    crate::list::thin::no_wait_here("the line of submissions (a drain)");
     let began = Instant::now();
     LANE.drain();
     STATS[DRAINING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -725,6 +794,18 @@ pub(super) fn drain() {
 /// A submission of `lists` to queue `this`.
 pub(super) fn submit(this: This, lists: &[This]) {
     let queue = this as usize;
+    if crate::list::thin::on() {
+        let recordings = crate::list::thin::submitted(lists);
+        if recordings.is_empty() {
+            return;
+        }
+        let before = QUEUED.fetch_add(1, Relaxed);
+        STATS[DEPTH].fetch_add(before, Relaxed);
+        STATS[DEEPEST].fetch_max(before + 1, Relaxed);
+        LANE.push(queue, [Job::Lists(queue, recordings)]);
+        room(before + 1);
+        return;
+    }
     // A frame shot learns that its frame's lists are being submitted.
     #[cfg(feature = "diagnostics")]
     if crate::shot::recording() {
@@ -747,6 +828,7 @@ pub(super) fn submit(this: This, lists: &[This]) {
 /// Waits for room in the line, with `queued` submissions in it.
 fn room(queued: u64) {
     if queued > runs_most() as u64 {
+        crate::list::thin::no_wait_here("room in the line of submissions");
         let began = Instant::now();
         LANE.wait_runs(runs_most());
         STATS[ROOM].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -815,6 +897,29 @@ pub(super) fn present(
     STATS[PRESENTS].fetch_add(1, Relaxed);
     let put = PRESENTS_GONE[0].fetch_add(1, Relaxed) + 1;
     LANE.push(this as usize, [Job::Present(texture, state, frame, over)]);
+    presented(put);
+}
+
+/// A present on queue `this` of title texture `texture` (and a second plane)
+/// whose lists are written down ([`crate::list::thin`]): the states they leave
+/// the planes in are looked at when its turn comes ([`Job::Shown`]).
+pub(super) fn present_later(
+    this: This,
+    texture: crate::resource::Held,
+    over: Option<crate::resource::Held>,
+    frame: u64,
+) {
+    QUEUED.fetch_add(1, Relaxed);
+    STATS[PRESENTS].fetch_add(1, Relaxed);
+    let put = PRESENTS_GONE[0].fetch_add(1, Relaxed) + 1;
+    LANE.push(this as usize, [Job::Shown(texture, over, frame)]);
+    presented(put);
+}
+
+/// After present number `put` went into the line: waits for the one before
+/// it to be sent.
+fn presented(put: u64) {
+    crate::list::thin::no_wait_here("a present in the line of submissions");
     let began = Instant::now();
     LANE.wait_presents(frames_most());
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -822,6 +927,7 @@ pub(super) fn present(
     const EVERY: u64 = 256;
     if put.is_multiple_of(EVERY) {
         line(EVERY as f64);
+        crate::list::thin::line(EVERY as f64);
     }
 }
 
@@ -875,15 +981,32 @@ mod tests {
         Present(&'static str, Log),
         /// Takes others of its kind, waits that are met, and signals along.
         Group(Vec<&'static str>, Log, Vec<(usize, u64)>),
+        /// A submission whose lists are being translated (`Job::Lists`): it
+        /// stands until the fence has the value (they are translated), then
+        /// its parts take its place.
+        Folded(usize, u64, Vec<&'static str>, Log),
     }
 
     impl Work for T {
         type Ask = (usize, u64);
         fn ask(&self) -> Option<(usize, u64)> {
             match self {
-                &T::Wait(fence, value) => Some((fence, value)),
+                &T::Wait(fence, value) | &T::Folded(fence, value, ..) => Some((fence, value)),
                 _ => None,
             }
+        }
+        fn folded(&self) -> bool {
+            matches!(self, T::Folded(..))
+        }
+        fn unfold(self) -> Vec<T> {
+            match self {
+                T::Folded(_, _, names, log) => names.into_iter().map(|n| T::Run(n, log.clone())).collect(),
+                other => vec![other],
+            }
+        }
+        fn settle(ask: &(usize, u64)) {
+            // (The translation it stands for ends.)
+            crate::fence::set(ask.0 as This, ask.1);
         }
         fn met(ask: &(usize, u64)) -> bool {
             crate::fence::completed(ask.0 as This) >= ask.1
@@ -892,7 +1015,7 @@ mod tests {
             matches!(self, T::Present(..))
         }
         fn runs(&self) -> bool {
-            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..))
+            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..) | T::Folded(..))
         }
         fn take_along(&mut self, next: T) -> Result<bool, T> {
             let T::Group(names, _, signals) = self else {
@@ -913,6 +1036,7 @@ mod tests {
         }
         fn go(self, forced: bool) {
             match self {
+                T::Folded(..) => unreachable!("a folded one is unfolded"),
                 T::Wait(..) => {
                     if forced {
                         FORCED_HERE.with(|f| f.set(f.get() + 1));
@@ -1102,6 +1226,47 @@ mod tests {
     /// With the thread: a fence behind a submission is not reached before the
     /// submission has been done, presents hold the title back a frame later,
     /// and a drain comes back when everything was done.
+    /// (Ours.) A submission whose lists are not translated yet stands, and
+    /// what is behind it in its queue (a present too) with it; other queues
+    /// go on. Once they are, its parts take its place, in order; a drain
+    /// waits for the translation first.
+    #[test]
+    fn a_submission_stands_until_its_lists_are_translated() {
+        let lane: &'static Lane<T> = Box::leak(Box::new(Lane::new()));
+        std::thread::spawn(|| lane.serve());
+        let log: Log = Default::default();
+        let f = fence();
+        lane.push(1, [T::Folded(f, 1, vec!["x", "y"], log.clone()), T::Present("present", log.clone())]);
+        lane.push(2, [T::Run("other", log.clone())]);
+        while log.lock().unwrap().is_empty() {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(*log.lock().unwrap(), ["other"]);
+        crate::fence::set(f as This, 1);
+        lane.wake();
+        while log.lock().unwrap().len() < 4 {
+            std::thread::yield_now();
+        }
+        assert_eq!(*log.lock().unwrap(), ["other", "x", "y", "present"]);
+        // A drain settles one not translated yet, then runs it.
+        let g = fence();
+        lane.push(1, [T::Folded(g, 1, vec!["z"], log.clone())]);
+        lane.drain();
+        assert_eq!(value(g), 1);
+        assert_eq!(log.lock().unwrap().last().map(String::as_str), Some("z"));
+    }
+
+    /// (Ours.) A thread that translates lists never waits for the line: it
+    /// panics, saying so, instead of standing for good (the line waits for
+    /// it).
+    #[test]
+    #[should_panic(expected = "a thread that translates lists would wait")]
+    fn a_translating_thread_never_waits_for_the_line() {
+        crate::list::thin::translating_here();
+        drain();
+    }
+
     #[test]
     fn the_title_goes_on_and_is_told_in_order() {
         let lane: &'static Lane<T> = Box::leak(Box::new(Lane::new()));

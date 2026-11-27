@@ -1617,6 +1617,153 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     u64::from_le_bytes(first) | 1
 }
 
+/// The alias recheck of uploaded textures picked by index whose pages the
+/// title also shows at other addresses (faces, hair: it paints them through
+/// the other view, with nothing to tell of it here, 1, 15 and 41 frames
+/// after their upload and later). [`fingerprint`]'s three 16 KiB windows
+/// missed a part painted elsewhere, and after the fixed schedule nothing
+/// looked again: blocky, stale tiles. Adapted from kitty-core/Kitty6
+/// ae3cce8 (on by default there; off here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AliasRecheck {
+    /// Such a texture up to this many bytes is fingerprinted whole
+    /// ([`fingerprint_texture`]); 0: the three windows for all, as before.
+    pub(crate) full_bytes: usize,
+    /// Frames between looks at such a texture once the fixed schedule is
+    /// through (`crate::draw`); 0: as any other texture, as before.
+    pub(crate) every: u64,
+}
+
+impl AliasRecheck {
+    pub(crate) fn on(self) -> bool {
+        self.full_bytes > 0 || self.every > 0
+    }
+}
+
+/// [`AliasRecheck`] from the switches: `VICTORY_ALIAS_RECHECK=1` turns both
+/// parts on with Kitty6's values (4096 KiB, 30 frames); `VICTORY_FULL_PRINT_KB`
+/// (or Kitty6's `K6_FULL_PRINT_KB`) and `VICTORY_ALIASED_RECHECK_EVERY` (or
+/// `K6_ALIASED_RECHECK_EVERY`) set one part, 0 turning it off. All unset (or
+/// `VICTORY_ALIAS_RECHECK=0`): both 0, exactly as before.
+pub(crate) fn alias_recheck_from(master: Option<&str>, kb: Option<&str>, every: Option<&str>) -> AliasRecheck {
+    let on = master.is_some_and(|v| v.trim() == "1");
+    let number = |v: Option<&str>| v.and_then(|v| v.trim().parse::<u64>().ok());
+    // (At most 64 MiB: a whole read of more is a hitch, not a check.)
+    let kb = number(kb).unwrap_or(if on { 4096 } else { 0 }).min(64 << 10);
+    let every = number(every).unwrap_or(if on { 30 } else { 0 });
+    AliasRecheck { full_bytes: (kb as usize) << 10, every }
+}
+
+/// The alias recheck in force ([`alias_recheck_from`]), read once.
+pub(crate) fn alias_recheck() -> AliasRecheck {
+    static CONFIG: std::sync::OnceLock<AliasRecheck> = std::sync::OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        let var = |names: &[&str]| names.iter().find_map(|n| std::env::var(n).ok());
+        let config = alias_recheck_from(
+            var(&["VICTORY_ALIAS_RECHECK"]).as_deref(),
+            var(&["VICTORY_FULL_PRINT_KB", "K6_FULL_PRINT_KB"]).as_deref(),
+            var(&["VICTORY_ALIASED_RECHECK_EVERY", "K6_ALIASED_RECHECK_EVERY"]).as_deref(),
+        );
+        if config.on() {
+            tracing::info!(
+                full_print_kb = config.full_bytes >> 10,
+                every = config.every,
+                "uploaded textures whose pages are shown at other addresses are read whole and kept looked at (VICTORY_ALIAS_RECHECK)"
+            );
+        }
+        config
+    })
+}
+
+/// Whether an uploaded texture of `len` bytes is one [`fingerprint_texture`]
+/// reads whole when aliased, with at most `most` bytes read whole: not one
+/// [`fingerprint`] reads whole anyway (48 KiB or less), nor a bigger one.
+pub(crate) fn full_print_size(len: u64, most: usize) -> bool {
+    len > 48 << 10 && len <= most as u64
+}
+
+/// Whether the title shows some 64 KiB page of `[at, at + len)` at another
+/// address too (`crate::inplace::has_alias`); its time counted for the
+/// alias recheck's line.
+pub(crate) fn aliased(at: u64, len: u64) -> bool {
+    let began = std::time::Instant::now();
+    let aliased = crate::inplace::has_alias(at as usize, len as usize);
+    ALIAS_STATS[1].fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    aliased
+}
+
+/// The alias recheck's counts since its last line: whole prints, their
+/// cost and that of the alias tests (ns), textures kept looked at past the
+/// schedule for being aliased, changes found by a whole print, changes
+/// found at a look past the schedule.
+pub(crate) static ALIAS_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The fingerprint the texture pass keeps for an uploaded texture at title
+/// memory `[at, at + len)`, and whether it is of all of it: [`fingerprint`]'s,
+/// but of the whole texture for one whose pages are shown at other
+/// addresses too ([`aliased`]), up to [`AliasRecheck::full_bytes`]. The same
+/// memory gives the same print as long as its aliasing stands; a change of
+/// that only costs one upload more. Without the switch, [`fingerprint`] and
+/// nothing else.
+pub(crate) fn fingerprint_texture(at: u64, len: u64) -> (u64, bool) {
+    let most = alias_recheck().full_bytes;
+    if !full_print_size(len, most) || !aliased(at, len) {
+        return (fingerprint(at, len), false);
+    }
+    const WINDOW: usize = 64 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let began = std::time::Instant::now();
+    let n = len as usize;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"victory: aliased texture, whole");
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(WINDOW, 0);
+        let mut from = 0;
+        while from < n {
+            let bytes = WINDOW.min(n - from);
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            hasher.update(&read[..bytes]);
+            from += bytes;
+        }
+    });
+    let hash = hasher.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash.as_bytes()[..8]);
+    use std::sync::atomic::Ordering::Relaxed;
+    ALIAS_STATS[0].fetch_add(1, Relaxed);
+    ALIAS_STATS[1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    (u64::from_le_bytes(first) | 1, true)
+}
+
+/// The alias recheck's line, at most once a second and only with something
+/// to tell (`VICTORY_ALIAS_RECHECK` on).
+pub(crate) fn alias_recheck_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = BASE.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1;
+    let last = LAST_S.load(Relaxed);
+    if now <= last || LAST_S.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let [whole, ns, kept, changed_whole, changed_late] = std::array::from_fn(|i| ALIAS_STATS[i].swap(0, Relaxed));
+    if whole + kept + changed_whole + changed_late == 0 {
+        return;
+    }
+    tracing::info!(
+        whole_prints = whole,
+        aliased_kept = kept,
+        reuploaded_whole = changed_whole,
+        reuploaded_late = changed_late,
+        cost_ms = format_args!("{:.2}", ns as f64 / 1e6),
+        "alias recheck (last second): aliased textures read whole, kept looked at past the schedule, found changed and uploaded again (VICTORY_ALIAS_RECHECK)"
+    );
+}
+
 /// Whether a title texture has a staging buffer: a list recorded its
 /// upload, and the lists that sample it check it at submission.
 /// For the frame listing: whether a list has uploaded `resource`'s staging
@@ -2383,5 +2530,44 @@ mod ram_trim_tests {
             .pool_trimmed_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
         assert!(after_trimmed >= before_trimmed + (2 * MIB as u64));
+    }
+}
+
+#[cfg(test)]
+mod alias_recheck_tests {
+    use super::{AliasRecheck, alias_recheck_from, full_print_size};
+
+    /// Unset, or the master switch at 0: both parts off, exactly as before.
+    /// `=1`: Kitty6's values; a part set alone turns on that part, and 0
+    /// turns one off under the master switch.
+    #[test]
+    fn the_alias_recheck_is_off_unless_asked_for() {
+        let off = AliasRecheck { full_bytes: 0, every: 0 };
+        assert_eq!(alias_recheck_from(None, None, None), off);
+        assert_eq!(alias_recheck_from(Some("0"), None, None), off);
+        assert_eq!(alias_recheck_from(Some("yes"), None, None), off);
+        assert!(!off.on());
+        let on = alias_recheck_from(Some("1"), None, None);
+        assert_eq!(on, AliasRecheck { full_bytes: 4 << 20, every: 30 });
+        assert!(on.on());
+        assert_eq!(alias_recheck_from(Some("1"), Some("0"), None), AliasRecheck { full_bytes: 0, every: 30 });
+        assert_eq!(alias_recheck_from(Some("1"), None, Some("0")), AliasRecheck { full_bytes: 4 << 20, every: 0 });
+        assert_eq!(alias_recheck_from(None, Some("1024"), None), AliasRecheck { full_bytes: 1 << 20, every: 0 });
+        assert_eq!(alias_recheck_from(None, None, Some(" 60 ")), AliasRecheck { full_bytes: 0, every: 60 });
+        // Capped at 64 MiB.
+        assert_eq!(alias_recheck_from(None, Some("999999999"), None).full_bytes, 64 << 20);
+    }
+
+    /// Read whole: only a texture past the three windows (48 KiB) and up to
+    /// the limit; never with the limit at 0.
+    #[test]
+    fn only_mid_sized_textures_are_read_whole() {
+        let most = 4 << 20;
+        assert!(!full_print_size(48 << 10, most));
+        assert!(full_print_size((48 << 10) + 1, most));
+        assert!(full_print_size(512 << 10, most));
+        assert!(full_print_size(4 << 20, most));
+        assert!(!full_print_size((4 << 20) + 1, most));
+        assert!(!full_print_size(512 << 10, 0));
     }
 }

@@ -486,6 +486,33 @@ pub(crate) fn view_census(at: usize, len: usize) -> (usize, usize) {
     (in_views, multi)
 }
 
+/// Whether some 64 KiB page of `[at, at + len)` is a physical page the
+/// title also shows at another address (the census's "more than one
+/// address", [`view_census`], without the sums): what it writes there the
+/// guards and the runtime tell of at that address alone. For the alias
+/// recheck of uploaded textures (`crate::texture::fingerprint_texture`,
+/// `VICTORY_ALIAS_RECHECK`). After kitty-core/Kitty6 ae3cce8.
+pub(crate) fn has_alias(at: usize, len: usize) -> bool {
+    let v = views();
+    if v.views.is_empty() {
+        return false;
+    }
+    let end = at.saturating_add(len);
+    let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at);
+    for (&base, &(vlen, section, offset)) in first.into_iter().chain(v.views.range(at.saturating_add(1)..end)) {
+        let (lo, hi) = (base.max(at), (base + vlen).min(end));
+        if lo >= hi {
+            continue;
+        }
+        for k in (lo - base) / K64..(hi - base).div_ceil(K64) {
+            if v.pages.get(&(section, offset + (k * K64) as u64)).is_some_and(|l| l.len() > 1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
