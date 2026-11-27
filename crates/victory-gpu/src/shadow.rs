@@ -7047,9 +7047,13 @@ mod page_parts_tests {
         fn put(&mut self, at: usize, len: usize) {
             let len = len.min(PAGES * PAGE - at);
             for k in 0..len {
-                let v = self.next() as u8;
+                // Every byte written changes (an old value XOR a non-zero one), so a part left stale always shows.
+                let v = (self.next() as u8) | 1;
                 // SAFETY: inside the allocation.
-                unsafe { ((self.p + at + k) as *mut u8).write_volatile(v) };
+                unsafe {
+                    let at = (self.p + at + k) as *mut u8;
+                    at.write_volatile(at.read_volatile() ^ v);
+                }
             }
         }
 
@@ -7130,7 +7134,7 @@ mod page_parts_tests {
         fixed.push(t.refresh_all("part 2"));
         t.put(at(1, 5), PART);
         fixed.push(t.refresh_all("part 5"));
-        t.put(at(1, 2) + 4000, 50); // into part 3 too
+        t.put(at(1, 2) + 4000, 200); // into part 3 too (4000 + 200 passes 4096)
         t.put(at(1, 9) + 300, 1);
         t.put(at(2, 15) + 4095, 1);
         fixed.push(t.refresh_all("parts 2, 3, 9 and another page's 15"));
