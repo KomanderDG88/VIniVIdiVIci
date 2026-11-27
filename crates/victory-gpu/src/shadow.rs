@@ -467,7 +467,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // shrinks by the copies' bytes, at most `card_limits`' second number.
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
-    let hundredths = if card_room_kept_on() { 97 } else { 80 };
+    let hundredths = if card_room_kept_on() { side_line_hundredths() } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * hundredths
     {
@@ -533,10 +533,20 @@ fn window_card_most() -> u64 {
 
 /// The card's use, in bytes of its `budget`, up to which a window goes to
 /// the card: eight tenths, a fifth kept free; with the placement and the
-/// texture queue keeping the windows' room ([`card_room_kept`]) 97
-/// hundredths, as a title buffer's copy whose room was kept.
+/// texture queue keeping the windows' room ([`card_room_kept`]) nine
+/// tenths ([`side_line_hundredths`]).
 fn window_line(budget: u64) -> u64 {
-    if card_room_kept_on() && placement::set().is_some() { budget / 100 * 97 } else { budget / 10 * 8 }
+    if card_room_kept_on() && placement::set().is_some() { budget / 100 * side_line_hundredths() } else { budget / 10 * 8 }
+}
+
+/// The card's use, in hundredths of its budget, up to which a copy whose
+/// room was kept is made: 97 as before; with `VICTORY_CARD_SIDE=1` 90, the
+/// texture queue's own line (`resource::room`). Ours, not in #1476: on an
+/// 8 GB card 97 left ~215 MB for what no room counts (our lists, staging,
+/// heaps), and past the budget the driver moves allocations to shared
+/// memory, slower than the bus the placement saves.
+pub(crate) fn side_line_hundredths() -> u64 {
+    if placement::set().is_some() { 90 } else { 97 }
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).

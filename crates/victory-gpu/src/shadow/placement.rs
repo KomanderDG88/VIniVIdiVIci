@@ -28,7 +28,8 @@
 //!   windows through the bus, 66.7, 69.6, 83.7 and 74.5 ms with two sides
 //!   (the later runs of both had other programs on the card), and the thread
 //!   that prepares submissions about 7 ms less at work through the bus;
-//! - a window goes to the card up to 97 hundredths of the budget, as a title
+//! - a window goes to the card up to 90 hundredths of the budget (97 in the
+//!   PR; ours: the texture queue's line), as a title
 //!   buffer's copy does, and the texture queue keeps the room of both totals,
 //!   less what they hold already (`card_room_kept`), so that copies made
 //!   after the textures came still find it.
@@ -129,13 +130,17 @@ pub(crate) fn set() -> Option<Set> {
         match set {
             Some(set) => tracing::info!(
                 "what shaders touch is on the card's side (VICTORY_CARD_SIDE=1): the card's budget {} MB; title buffers' copies \
-                 from {} KiB up to {} MB, windows up to {} MB {}, both up to 97 % of the budget with their room kept by the \
-                 texture queue; switches of their own set, which win: {}",
+                 from {} KiB up to {} MB, windows up to {} MB {}, both up to 90 % of the budget with their room kept by the \
+                 texture queue (kept at most {}); switches of their own set, which win: {}",
                 budget.unwrap_or(0) >> 20,
                 set.buffers_least >> 10,
                 set.buffers_most >> 20,
                 set.windows_most >> 20,
                 if bus { "through the bus, in GPU upload heaps" } else { "with two sides" },
+                match std::env::var("VICTORY_CARD_ROOM_KEPT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&mb| mb > 0) {
+                    Some(mb) => format!("{mb} MB, VICTORY_CARD_ROOM_KEPT_MB"),
+                    None => format!("{} MB", (set.buffers_most + set.windows_most) >> 20),
+                },
                 if own.is_empty() { "none".to_owned() } else { own.join(", ") }
             ),
             None => tracing::info!(
