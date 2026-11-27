@@ -6359,6 +6359,8 @@ mod tests {
 
 #[cfg(test)]
 mod spread_seen_tests {
+    use super::{draw_sources_allowance, draw_sources_parse, DrawSources};
+
     /// Only a count past 65,535 turns the spread signature on; the largest
     /// asked here (17,048) and the limit itself do not.
     #[test]
