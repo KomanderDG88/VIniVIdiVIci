@@ -184,6 +184,8 @@ pub(super) enum Access {
     Fill(usize, usize),
     /// A texture's staging buffer read from title memory (address, bytes).
     Texture(usize, usize),
+    /// A refresh of a host copy from title memory (address, bytes).
+    Refresh(usize, usize),
     /// Work that may read and write title memory anywhere.
     Anywhere,
     Other,
@@ -204,7 +206,11 @@ impl Access {
             // copy's destination there pins it as a fill's does.
             &Step::Host(_, (from, to)) if from < to => Access::Fill(from, to - from),
             Step::Run(..) => Access::Anywhere,
-            Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => Access::Other,
+            // Ours (not upstream): a refresh uploads title memory into the
+            // host copy; one of the destination after a copy left to the
+            // card would put the old bytes over the card's copy.
+            &Step::Refresh(_, at, len) => Access::Refresh(at, len),
+            Step::GpuWrite(..) | Step::Host(..) => Access::Other,
         }
     }
 }
@@ -227,10 +233,12 @@ pub(super) enum Pin {
     LaterTexture,
     /// A later card copy kept on the CPU reads or writes the destination.
     LaterCard,
+    /// A later refresh uploads the destination from title memory (ours).
+    LaterRefresh,
 }
 
 /// How many [`Pin`]s there are.
-const PINS: usize = 7;
+const PINS: usize = 8;
 
 /// Where a step of a submission is done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,6 +336,7 @@ pub(super) fn places(steps: &[Access], written: &[(usize, usize)], all: bool) ->
             }
             Access::Fill(at, len) => later.push(Reach::new(at, len, i, Pin::LaterFill)),
             Access::Texture(at, len) => later.push(Reach::new(at, len, i, Pin::LaterTexture)),
+            Access::Refresh(at, len) => later.push(Reach::new(at, len, i, Pin::LaterRefresh)),
             Access::Anywhere => later_anywhere = Some(i),
             Access::Other => {}
         }
@@ -352,7 +361,7 @@ fn early_hazards(steps: &[Access]) -> Vec<Option<(Pin, usize)>> {
             Access::Anywhere => {
                 anywhere.get_or_insert(i);
             }
-            Access::Fill(..) | Access::Texture(..) | Access::Other => {}
+            Access::Fill(..) | Access::Texture(..) | Access::Refresh(..) | Access::Other => {}
         }
     }
     early
@@ -747,7 +756,7 @@ pub(super) fn line_per_frame(frames: f64) {
     tracing::info!(
         "title buffer copies from memory flights write, done on the card (VICTORY_CARD_READ_COPY={}): {:.1} per frame recorded ({:.1} only because flights wrote the source lately, {:.1} refused for want of a host copy); \
          {:.1} left to the card at submission, {:.1} kept on the CPU (no flight writing the source any more {:.1}, work of ours {:.1}, \
-         an earlier write of the source {:.1}, a later copy {:.1}, a later fill of upload memory {:.1}, a later texture {:.1}, a later card copy {:.1}); \
+         an earlier write of the source {:.1}, a later copy {:.1}, a later fill of upload memory {:.1}, a later texture {:.1}, a later card copy {:.1}, a later refresh {:.1}); \
          {:.1} constant buffers a frame read from the card's copy ({:.1} KB)",
         level(),
         recorded as f64 / frames,
@@ -762,6 +771,7 @@ pub(super) fn line_per_frame(frames: f64) {
         pins[Pin::LaterFill as usize],
         pins[Pin::LaterTexture as usize],
         pins[Pin::LaterCard as usize],
+        pins[Pin::LaterRefresh as usize],
         constants as f64 / frames,
         bytes as f64 / frames / 1024.0
     );
@@ -769,7 +779,7 @@ pub(super) fn line_per_frame(frames: f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::Access::{Anywhere, Card, Copy, Fill, Other, Texture};
+    use super::Access::{Anywhere, Card, Copy, Fill, Other, Refresh, Texture};
     use super::*;
 
     const WRITTEN: [(usize, usize); 1] = [(0x1000, 0x2000)];
@@ -903,6 +913,18 @@ mod tests {
         assert_eq!(
             pin_of(&[card(), Other, Fill(DST + 0x10, 16)], &WRITTEN),
             Place::Kept(Pin::LaterFill, 2)
+        );
+    }
+
+    #[test]
+    fn a_later_refresh_of_the_destination_keeps_the_copy_on_the_cpu() {
+        assert_eq!(
+            pin_of(&[card(), Other, Refresh(DST, 0x40)], &WRITTEN),
+            Place::Kept(Pin::LaterRefresh, 2)
+        );
+        assert_eq!(
+            places(&[Refresh(DST, 0x40), card()], &WRITTEN, false),
+            [Place::Cpu, Place::Card]
         );
     }
 
