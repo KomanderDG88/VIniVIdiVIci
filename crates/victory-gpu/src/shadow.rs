@@ -119,7 +119,7 @@ struct Card {
     /// side, each with the number of the send that took it
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
-    sent: Mutex<Vec<(usize, usize, u64)>>,
+    sent: Mutex<SentRuns>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
     /// The copy itself, for [`CHANGED`]: set once it is shared.
@@ -728,10 +728,93 @@ fn take_dirty(c: &Card, fetched: u64, sent_as: u64) -> Vec<(usize, usize)> {
     let ranges = std::mem::take(&mut *dirty);
     if relay() {
         let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-        sent.retain(|s| s.2 > fetched);
-        sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+        sent.forget(fetched);
+        sent.note(sent_as, ranges.clone());
     }
     ranges
+}
+
+/// What went up, by send: its number, and the offsets, in order and joined
+/// (a refresh sends thousands of runs of a few words).
+#[derive(Default)]
+struct SentRuns(Vec<(u64, Vec<(usize, usize)>)>);
+
+impl SentRuns {
+    fn note(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
+        if ranges.is_empty() {
+            return;
+        }
+        let ranges = joined(ranges);
+        match self.0.iter_mut().find(|s| s.0 == number) {
+            Some((_, all)) => *all = joined([std::mem::take(all), ranges].concat()),
+            None => self.0.push((number, ranges)),
+        }
+    }
+
+    /// Sends up to `number` are of no use any more.
+    fn forget(&mut self, number: u64) {
+        self.0.retain(|s| s.0 > number);
+    }
+
+    /// Adds to `out` what sends after `number` took of `[from, to)`.
+    fn near(&self, number: u64, from: usize, to: usize, out: &mut Vec<(usize, usize)>) {
+        for (_, ranges) in self.0.iter().filter(|s| s.0 > number) {
+            let first = ranges.partition_point(|r| r.1 <= from);
+            out.extend(ranges[first..].iter().take_while(|r| r.0 < to).copied());
+        }
+    }
+
+    #[cfg(test)]
+    fn of(all: &[(usize, usize, u64)]) -> SentRuns {
+        let mut sent = SentRuns::default();
+        for &(a, b, number) in all {
+            sent.note(number, vec![(a, b)]);
+        }
+        sent
+    }
+}
+
+#[cfg(test)]
+mod sent_runs_tests {
+    use super::{SentRuns, outside};
+
+    /// What the notes say was sent after a fetch, around a range, leaves out
+    /// of it the same bytes as the list of every range with its send that
+    /// they took the place of (`outside` of either).
+    #[test]
+    fn sent_runs_leave_out_what_the_list_did() {
+        let mut seed = 11u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as usize
+        };
+        for round in 0..300 {
+            let mut list: Vec<(usize, usize, u64)> = Vec::new();
+            let mut runs = SentRuns::default();
+            for number in 1..=6u64 {
+                let ranges: Vec<(usize, usize)> = (0..random() % 12)
+                    .map(|_| {
+                        let a = random() % 4096;
+                        (a, a + 1 + random() % 64)
+                    })
+                    .collect();
+                list.extend(ranges.iter().map(|&(a, b)| (a, b, number)));
+                runs.note(number, ranges);
+                if random() % 3 == 0 {
+                    let fetched = number - 1;
+                    list.retain(|s| s.2 > fetched);
+                    runs.forget(fetched);
+                }
+            }
+            let (fetched, from) = (random() as u64 % 7, random() % 4096);
+            let to = from + random() % 512;
+            let old: Vec<(usize, usize)> =
+                list.iter().filter(|s| s.2 > fetched).map(|s| (s.0, s.1)).filter(|&(a, b)| a < to && b > from).collect();
+            let mut new = Vec::new();
+            runs.near(fetched, from, to, &mut new);
+            assert_eq!(outside(from, to, old), outside(from, to, new), "round {round}");
+        }
+    }
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -5254,13 +5337,8 @@ impl Shadow {
         {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            skip.extend(
-                dirty
-                    .iter()
-                    .copied()
-                    .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                    .filter(|&(a, b)| a < at + n && b > at),
-            );
+            skip.extend(dirty.iter().copied().filter(|&(a, b)| a < at + n && b > at));
+            sent.near(fetched_after, at, at + n, &mut skip);
         }
         title.clear();
         title.resize(n, 0);
@@ -6480,7 +6558,7 @@ mod window_tests {
 
 #[cfg(test)]
 mod card_merge_tests {
-    use super::{Card, Shadow};
+    use super::{Card, SentRuns, Shadow};
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -6550,14 +6628,14 @@ mod card_merge_tests {
                 staging: staging.clone(),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
-                sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                sent: Mutex::new(SentRuns::of(&[(title_byte, title_byte + 1, 7)])),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
                 me: std::sync::OnceLock::new(),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
-                card.sent.lock().unwrap().retain(|s| s.2 > mark);
+                card.sent.lock().unwrap().forget(mark);
             }
             // Flight 6's slot: the card's bytes behind its lists, before send 7.
             let mut slot = content.clone();
