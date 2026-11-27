@@ -1210,7 +1210,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             COPY_TEXTURE => {
                 let step = size_of::<CopyLocation>().div_ceil(8);
                 let boxed = (w[1] >> 32 & 1) as usize;
-                super::held_at_call(w[1] >> 33 & 1 != 0, || {
+                super::held_at_call(held_bit(op, w) == Some(true), || {
                     super::copy_texture_region(
                         list,
                         at_or(w, 2),
@@ -1223,10 +1223,12 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 });
             }
             COPY_RESOURCE => {
-                super::held_at_call(w[2] != 0, || super::copy_resource(list, w[0] as This, w[1] as This));
+                super::held_at_call(held_bit(op, w) == Some(true), || {
+                    super::copy_resource(list, w[0] as This, w[1] as This)
+                });
             }
             RESOLVE => {
-                super::held_at_call(w[5] != 0, || {
+                super::held_at_call(held_bit(op, w) == Some(true), || {
                     super::resolve(list, w[0] as This, w[1] as u32, w[2] as This, w[3] as u32, w[4] as u32)
                 });
             }
@@ -1234,6 +1236,23 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         }
     }
     (calls, closed)
+}
+
+/// What the asking for held levels said at the call of copy `op` written
+/// down with words `w` ([`held_at_call`]); `None` for other calls.
+fn held_bit(op: u64, w: &[u64]) -> Option<bool> {
+    match op {
+        COPY_RESOURCE => w.get(2).map(|&b| b != 0),
+        RESOLVE => w.get(5).map(|&b| b != 0),
+        COPY_TEXTURE => w.get(1).map(|&b| b >> 33 & 1 != 0),
+        _ => None,
+    }
+}
+
+/// Tests: this thread is taken for one that translates lists.
+#[cfg(test)]
+pub(crate) fn translating_here() {
+    IN_TRANSLATE.set(true);
 }
 
 /// The table of a list whose calls are written down: that of the others with
@@ -1517,6 +1536,89 @@ mod tests {
         assert_eq!(super::translate(std::ptr::null(), &s, || false), (1, false));
         assert_eq!((ran.load(Relaxed), dropped.load(Relaxed)), (0, 3));
         f.recording = None;
+    }
+
+    /// (Ours.) A thread that translates lists never waits for one to be
+    /// translated: it panics, saying so, instead of standing for good.
+    #[test]
+    #[should_panic(expected = "a thread that translates lists would wait")]
+    fn a_translating_thread_never_waits_for_a_list() {
+        translating_here();
+        let r = Recording::new(0);
+        r.done.store(true, Release);
+        r.wait();
+    }
+
+    /// (Ours.) What the asking for held levels said at the title's call goes
+    /// with each copy in its stream, whichever list is translated first; the
+    /// copy's translation answers with it and asks nothing, and once it is
+    /// done the asking is the card's again.
+    #[test]
+    fn held_levels_said_at_the_call_go_with_the_copy() {
+        let null: This = std::ptr::null();
+        // At the call: a copy of a list of ours (no texture: nothing held).
+        let list: This = Box::into_raw(super::super::boxed(0, null, true)).cast_const().cast();
+        front(list).begin(0, null);
+        copy_resource(list, null, null);
+        let s = std::mem::take(&mut front(list).words);
+        // (Past the reset.)
+        let at = 1 + (s[0] >> 16) as usize;
+        assert_eq!((s[at] & 0xffff, held_bit(s[at] & 0xffff, &s[at + 1..])), (COPY_RESOURCE, Some(false)));
+        // SAFETY: made just now, with no host list.
+        drop(unsafe { Box::from_raw(list.cast_mut().cast::<List>()) });
+        // Two lists' copies, each with what was said at its call.
+        let (mut a, mut b) = (Front::default(), Front::default());
+        a.recording = Some(Arc::new(Recording::new(0)));
+        b.recording = Some(Arc::new(Recording::new(0)));
+        a.put(COPY_RESOURCE, &[0x10, 0x20, 1]);
+        a.put(RESOLVE, &[0x10, 0, 0x20, 3, 28, 1]);
+        b.put(COPY_RESOURCE, &[0x10, 0x30, 0]);
+        b.put_with(COPY_TEXTURE, &[0, 7 | 1 << 32 | 1 << 33], &[]);
+        let bits = |s: &[u64]| {
+            let (mut i, mut out) = (0, Vec::new());
+            while i < s.len() {
+                let (op, len) = (s[i] & 0xffff, (s[i] >> 16) as usize);
+                out.extend(held_bit(op, &s[i + 1..i + 1 + len]));
+                i += 1 + len;
+            }
+            out
+        };
+        // B's stream translated before A's: each keeps its own.
+        let (sb, sa) = (std::mem::take(&mut b.words), std::mem::take(&mut a.words));
+        assert_eq!(bits(&sb), [false, true]);
+        assert_eq!(bits(&sa), [true, true]);
+        // (The box bit beside it is its own.)
+        assert_eq!(sb[sb.len() - 1] >> 32 & 1, 1);
+        // The translation answers with the bit, and asks again after.
+        super::super::held_at_call(true, || assert!(super::super::will_write(null)));
+        super::super::held_at_call(false, || assert!(!super::super::will_write(null)));
+        assert!(!super::super::will_write(null));
+    }
+
+    /// (Ours.) Unset (or with no line to put submissions in, as in the
+    /// tests), lists are made as before: nothing is written down, work of
+    /// ours is done on the list at once, and copies ask for held levels
+    /// themselves.
+    #[test]
+    fn unset_lists_are_made_as_before() {
+        let null: This = std::ptr::null();
+        if !wanted() {
+            assert!(!on());
+        } else if on() {
+            return;
+        }
+        let mut allocator = null;
+        assert_eq!(super::super::create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(super::super::create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        // SAFETY: one of our lists, just made.
+        assert!(unsafe { (*list.cast::<List>()).thin.recording.is_none() });
+        let work: super::super::External = Box::new(|_| true);
+        assert!(put_external(list, work).is_err());
+        assert!(!super::super::will_write(null));
+        let release = |o: This| crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 
     /// A view's record is the one at the call, also if its slot is written

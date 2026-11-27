@@ -981,15 +981,32 @@ mod tests {
         Present(&'static str, Log),
         /// Takes others of its kind, waits that are met, and signals along.
         Group(Vec<&'static str>, Log, Vec<(usize, u64)>),
+        /// A submission whose lists are being translated (`Job::Lists`): it
+        /// stands until the fence has the value (they are translated), then
+        /// its parts take its place.
+        Folded(usize, u64, Vec<&'static str>, Log),
     }
 
     impl Work for T {
         type Ask = (usize, u64);
         fn ask(&self) -> Option<(usize, u64)> {
             match self {
-                &T::Wait(fence, value) => Some((fence, value)),
+                &T::Wait(fence, value) | &T::Folded(fence, value, ..) => Some((fence, value)),
                 _ => None,
             }
+        }
+        fn folded(&self) -> bool {
+            matches!(self, T::Folded(..))
+        }
+        fn unfold(self) -> Vec<T> {
+            match self {
+                T::Folded(_, _, names, log) => names.into_iter().map(|n| T::Run(n, log.clone())).collect(),
+                other => vec![other],
+            }
+        }
+        fn settle(ask: &(usize, u64)) {
+            // (The translation it stands for ends.)
+            crate::fence::set(ask.0 as This, ask.1);
         }
         fn met(ask: &(usize, u64)) -> bool {
             crate::fence::completed(ask.0 as This) >= ask.1
@@ -998,7 +1015,7 @@ mod tests {
             matches!(self, T::Present(..))
         }
         fn runs(&self) -> bool {
-            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..))
+            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..) | T::Folded(..))
         }
         fn take_along(&mut self, next: T) -> Result<bool, T> {
             let T::Group(names, _, signals) = self else {
@@ -1019,6 +1036,7 @@ mod tests {
         }
         fn go(self, forced: bool) {
             match self {
+                T::Folded(..) => unreachable!("a folded one is unfolded"),
                 T::Wait(..) => {
                     if forced {
                         FORCED_HERE.with(|f| f.set(f.get() + 1));
@@ -1208,6 +1226,47 @@ mod tests {
     /// With the thread: a fence behind a submission is not reached before the
     /// submission has been done, presents hold the title back a frame later,
     /// and a drain comes back when everything was done.
+    /// (Ours.) A submission whose lists are not translated yet stands, and
+    /// what is behind it in its queue (a present too) with it; other queues
+    /// go on. Once they are, its parts take its place, in order; a drain
+    /// waits for the translation first.
+    #[test]
+    fn a_submission_stands_until_its_lists_are_translated() {
+        let lane: &'static Lane<T> = Box::leak(Box::new(Lane::new()));
+        std::thread::spawn(|| lane.serve());
+        let log: Log = Default::default();
+        let f = fence();
+        lane.push(1, [T::Folded(f, 1, vec!["x", "y"], log.clone()), T::Present("present", log.clone())]);
+        lane.push(2, [T::Run("other", log.clone())]);
+        while log.lock().unwrap().is_empty() {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(*log.lock().unwrap(), ["other"]);
+        crate::fence::set(f as This, 1);
+        lane.wake();
+        while log.lock().unwrap().len() < 4 {
+            std::thread::yield_now();
+        }
+        assert_eq!(*log.lock().unwrap(), ["other", "x", "y", "present"]);
+        // A drain settles one not translated yet, then runs it.
+        let g = fence();
+        lane.push(1, [T::Folded(g, 1, vec!["z"], log.clone())]);
+        lane.drain();
+        assert_eq!(value(g), 1);
+        assert_eq!(log.lock().unwrap().last().map(String::as_str), Some("z"));
+    }
+
+    /// (Ours.) A thread that translates lists never waits for the line: it
+    /// panics, saying so, instead of standing for good (the line waits for
+    /// it).
+    #[test]
+    #[should_panic(expected = "a thread that translates lists would wait")]
+    fn a_translating_thread_never_waits_for_the_line() {
+        crate::list::thin::translating_here();
+        drain();
+    }
+
     #[test]
     fn the_title_goes_on_and_is_told_in_order() {
         let lane: &'static Lane<T> = Box::leak(Box::new(Lane::new()));

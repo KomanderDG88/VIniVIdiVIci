@@ -827,6 +827,14 @@ mod tests {
         }
     }
 
+    /// (Ours.) With lists written down (`VICTORY_THIN=1`) the level is 1 at
+    /// most; without, the one asked for.
+    #[test]
+    fn with_lists_written_down_the_level_is_one_at_most() {
+        assert_eq!([0, 1, 2, 3].map(|l| clamped(l, true)), [0, 1, 1, 1]);
+        assert_eq!([0, 1, 2, 3].map(|l| clamped(l, false)), [0, 1, 2, 3]);
+    }
+
     #[test]
     fn a_copy_from_what_flights_write_is_left_to_the_card() {
         assert_eq!(on_cpu(&[card()], &WRITTEN), [false]);
