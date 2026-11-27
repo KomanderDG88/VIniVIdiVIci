@@ -594,6 +594,11 @@ static VIDEO_PEAK: [std::sync::atomic::AtomicU64; 4] = [
 /// and when that was ([`now_ms`]).
 static MEMORY_MARK: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// `crate::resource::HELD` 0 and 2 (host copies held from a later level
+/// than the title's first, and copies remade with more levels) as they
+/// were when [`video_memory_line`] last took them (`VICTORY_HELD_LEVELS=1`).
+static HELD_MARK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Running totals for [`video_memory_line`] and [`removal_memory`]: the
 /// bytes of upload, shared and card buffers made since the start
 /// ([`MADE`]), the bytes of host textures alive, the bytes of host copies
@@ -626,13 +631,28 @@ fn video_memory_line() {
     let then = [0, 1, 2, 3, 4, 5].map(|i| MEMORY_MARK[i].swap(now[i], Ordering::Relaxed));
     let at = now_ms();
     let before = MEMORY_MARK[6].swap(at, Ordering::Relaxed);
+    // Held levels (`VICTORY_HELD_LEVELS=1`): copies made held and copies
+    // remade with more levels in that time, so that a copy that keeps
+    // growing, being let go and held again shows. Unset: nothing taken.
+    let held = if crate::resource::held_only() {
+        let now = [0, 2].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
+        let then = [0, 1].map(|i| HELD_MARK[i].swap(now[i], Ordering::Relaxed));
+        format!(
+            "; held levels: {} host copies made held from a later level, {} remade with more levels ({} so far)",
+            now[0].saturating_sub(then[0]),
+            now[1].saturating_sub(then[1]),
+            now[1],
+        )
+    } else {
+        String::new()
+    };
     if looks == 0 {
         return;
     }
     tracing::info!(
         "video memory in the {} ms since the last such line, at {looks} looks: the card's own in use at most {} MB, its budget at least {} MB, \
          the PC's shared in use at most {} MB; made in that time: upload buffers {} MB, shared buffers {} MB, card buffers {} MB, \
-         {} host copies of textures; host textures alive {} MB (then {} MB), {} MB of filled ones let go",
+         {} host copies of textures; host textures alive {} MB (then {} MB), {} MB of filled ones let go{held}",
         at.saturating_sub(before),
         most >> 20,
         least >> 20,

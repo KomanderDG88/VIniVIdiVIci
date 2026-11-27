@@ -1536,6 +1536,8 @@ static REPLACED: std::sync::Mutex<Vec<(u64, Made)>> = std::sync::Mutex::new(Vec:
 
 /// Since the start: host copies held from a later level than the title's
 /// first, and their bytes; host copies replaced by one with more levels.
+/// The memory line says 0 and 2 for its own window (`crate::host`
+/// `video_memory_line`), so that copies remade back and forth show.
 #[cfg(windows)]
 pub(crate) static HELD: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
@@ -5480,5 +5482,109 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(!card_will_write(texture));
         assert!(!want_level(texture, 3));
         assert!(std::sync::Arc::ptr_eq(&host_copy(texture).unwrap(), &more));
+    }
+
+    /// Held levels on the host (`VICTORY_HELD_LEVELS=1` and a host GPU, or
+    /// nothing is checked): a slot made with the old copy (its `Kept`, a
+    /// reference to the copy's texture) still has it, alive and as it was
+    /// uploaded, after a view of a lower level replaced the copy
+    /// (`want_level`: into `REPLACED`) and after `let_go_idle` let
+    /// `REPLACED` go (a second and four frames later): only the slot's
+    /// letting go frees it.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_slot_keeps_the_old_held_copy_after_it_is_replaced_and_let_go() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !held_only() {
+            return;
+        }
+        // 256x256 BC7, nine levels, 4 KiB blocks; every byte 0x5a, so that
+        // each level the host holds reads 0x5a whatever its tiling.
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap();
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        // SAFETY: the `whole` bytes just committed.
+        unsafe { std::ptr::write_bytes(at.cast::<u8>(), 0x5a, whole as usize) };
+        let texture = texture_at(at as u64, &desc).unwrap();
+        assert!(!want_level(texture, 2), "no copy yet: noted");
+        let copy = host_copy(texture).unwrap();
+        // SAFETY: a live texture.
+        assert_eq!(unsafe { copy.texture.GetDesc() }.MipLevels, 7);
+        // The first row of blocks of a read back's first level.
+        let first_row = |readback: &ID3D12Resource, rows: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            let len = rows.Footprint.Width as usize / 4 * 16;
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: a finished copy of at least one row of blocks.
+            unsafe {
+                readback.Map(0, None, Some(&mut mapped)).unwrap();
+                let row = std::slice::from_raw_parts(mapped.cast::<u8>().add(rows.Offset as usize), len).to_vec();
+                readback.Unmap(0, None);
+                row
+            }
+        };
+        // Uploaded and read back while it is the texture's copy.
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, texture, &copy.texture);
+        crate::list::ensure_state(&list, texture, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, &copy.texture).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        drop(list);
+        let uploaded = first_row(&readback, &rows);
+        assert!(uploaded.iter().all(|&b| b == 0x5a), "title level 2 as host level 0");
+        // The slot made with it: its `Kept`.
+        let kept: ID3D12Resource = copy.texture.clone();
+        let state = copy.state.load(Relaxed);
+        let old = std::sync::Arc::downgrade(&copy);
+        drop(copy);
+        let replaced = |old: &std::sync::Weak<HostTexture>| {
+            REPLACED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(_, (host, _))| std::ptr::eq(std::sync::Arc::as_ptr(host), old.as_ptr()))
+        };
+        // A view of level 0: the copy is replaced, the old one waits.
+        assert!(want_level(texture, 0));
+        assert!(replaced(&old), "the old copy waits in REPLACED");
+        let more = host_copy(texture).unwrap();
+        // SAFETY: a live texture.
+        assert_eq!(unsafe { more.texture.GetDesc() }.MipLevels, 9);
+        assert_eq!(copy_dropped(texture, &kept), 2, "the slot's views still shift by 2");
+        // A second and four frames on, the sweep lets REPLACED go.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        crate::frame::begin_frames(4);
+        let_go_idle();
+        assert!(!replaced(&old), "let go by let_go_idle");
+        if old.upgrade().is_none() {
+            // Retired at once (no submission was running): the slot alone.
+            assert_eq!(crate::host::references(&kept), 1);
+        }
+        // SAFETY: a live texture.
+        let d = unsafe { kept.GetDesc() };
+        assert_eq!((d.Width, d.Height, d.MipLevels), (64, 64, 7));
+        // Still readable, and as it was uploaded.
+        let list = host.new_list().unwrap();
+        let from = crate::host::legal_state(&kept, state);
+        let to = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        if from != to {
+            let barrier = crate::host::transition(&kept, D3D12_RESOURCE_STATES(from as i32), D3D12_RESOURCE_STATES(to as i32));
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, &kept).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        drop(list);
+        assert_eq!(first_row(&readback, &rows), uploaded, "the kept copy reads as uploaded");
+        // The slot lets go: nothing else held it.
+        drop(kept);
+        drop(more);
     }
 }
