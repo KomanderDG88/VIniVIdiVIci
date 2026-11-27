@@ -68,7 +68,9 @@ fn touches_of(runs: &[&HostList]) -> crate::merge::Touches {
         let deferred = list.deferred();
         for step in &deferred.copies {
             match step {
-                &Step::Copy(dst, src, len) => {
+                // A copy also recorded on the card (`readcopy`): as a copy,
+                // wherever the submission leaves it.
+                &Step::Copy(dst, src, len) | &Step::CardCopy(dst, src, len, _) => {
                     touches.read.push((src, src + len));
                     touches.read.push((dst, dst + len));
                     touches.written.push((dst, dst + len));

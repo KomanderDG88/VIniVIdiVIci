@@ -3045,6 +3045,11 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// A title buffer copy whose source flights in the air write
+    /// ([`readcopy`]): also done on the card, in the list. The flag says the
+    /// CPU copies it at submission as a `Copy` does; unset, the card's copy
+    /// alone is the copy, and nothing waits for flights on its account.
+    CardCopy(usize, usize, usize, std::sync::atomic::AtomicBool),
     /// Work that may write title memory; with the place it writes
     /// (address, bytes) when that is known (the title's memory-to-memory
     /// copies, `crate::list` `copy_memory`): [`near_writes`].
@@ -3057,6 +3062,18 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+}
+
+impl Step {
+    /// Whether the CPU does this step's copy at submission: a `Copy`
+    /// always, a [`Step::CardCopy`] unless the submission left it to the
+    /// card ([`readcopy::decide`]).
+    fn on_cpu(&self) -> bool {
+        match self {
+            Step::CardCopy(.., on_cpu) => on_cpu.load(Ordering::Relaxed),
+            _ => true,
+        }
+    }
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -3088,6 +3105,10 @@ struct Deferred {
     /// second fill would find holding the same bytes
     /// ([`HostList::fill_scratch`]).
     filled: std::collections::HashMap<(usize, usize), u64>,
+    /// With `VICTORY_CARD_READ_COPY=2`: constant buffers copied on the card
+    /// since the last title copy (source, bytes): the host GPU address of
+    /// the copy ([`HostList::card_constant`]).
+    carded: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -3123,6 +3144,13 @@ impl Deferred {
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
         self.uploads.push(buffer);
+    }
+
+    /// A title copy or work of ours that writes title memory was recorded:
+    /// what the list knew of title memory no longer holds.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.carded.clear();
     }
 }
 
@@ -3754,6 +3782,7 @@ fn read_ahead_rest(runs: &[&HostList], own: &card_steps::Taken) {
             }
             let (src, len) = match step {
                 &Step::Copy(dst, src, len) if !touches(&written, dst, dst + len) => (src, len),
+                &Step::CardCopy(dst, src, len, _) if step.on_cpu() && !touches(&written, dst, dst + len) => (src, len),
                 &Step::Fill(_, src, len, _) => (src, len),
                 _ => continue,
             };
@@ -3775,8 +3804,12 @@ fn blocked_by(written: &[(usize, usize)], copied: &[(usize, usize)], runs: &[&Ho
     }
     for list in runs {
         for step in &list.deferred().copies {
+            if !step.on_cpu() {
+                continue;
+            }
             match step {
-                &Step::Copy(dst, src, len) => {
+                Step::Copy(dst, src, len) | Step::CardCopy(dst, src, len, _) => {
+                    let (dst, src, len) = (*dst, *src, *len);
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         // A copy that only READS where flights may write is
                         // not waited for either, and checked like a fill
@@ -4001,6 +4034,8 @@ mod fill_ahead {
 }
 
 pub(crate) use fill_ahead::wrote as shaders_write;
+
+mod readcopy;
 
 /// Diagnostics: the fills of upload memory that made a submission wait for
 /// flights (`blocked_by`), which one they are, and whether the wait was
@@ -4865,6 +4900,7 @@ fn late_line(frames: f64) {
             t[3] / 1000.0,
         );
     }
+    readcopy::line_per_frame(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -6824,6 +6860,7 @@ impl Host {
             return;
         };
         let told = !sent.writes.is_empty();
+        readcopy::note_sent(&sent);
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
@@ -6879,6 +6916,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         submitted.at(crate::copystat::Site::Other);
         let number = sent.number;
+        readcopy::note_sent(&sent);
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
@@ -7139,6 +7177,13 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        // Title copies out of what flights write, also recorded on the card
+        // ([`readcopy`]; never without `VICTORY_CARD_READ_COPY`): which of
+        // them the CPU still does, decided before anything below looks at
+        // the steps.
+        if late {
+            readcopy::decide(runs);
+        }
         // Or the reads are done on the card, behind the flights
         // ([`card_steps`]; never without `VICTORY_CARD_STEPS`).
         let own = if late { self.card_steps(runs) } else { None };
@@ -8459,8 +8504,10 @@ impl Batch {
                     Step::GpuWrite(shadow, ..) => {
                         Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)
                     }
-                    Step::Copy(..) if taken(list, i) => Touch::Nothing,
-                    Step::Copy(..) | Step::Run(..) => Touch::Title,
+                    Step::Copy(..) | Step::CardCopy(..) if taken(list, i) => Touch::Nothing,
+                    // Left to the card ([`readcopy`]): no title memory here.
+                    Step::CardCopy(..) if !step.on_cpu() => Touch::Nothing,
+                    Step::Copy(..) | Step::CardCopy(..) | Step::Run(..) => Touch::Title,
                     Step::Fill(..) | Step::Host(..) | Step::Texture(_) => Touch::Nothing,
                 };
                 touches.push(touch);

@@ -924,6 +924,12 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        // A source that flights in the air write: also on the card, behind
+        // them, so that the submission need not settle them to read it
+        // (`VICTORY_CARD_READ_COPY=1`).
+        if list.copy_after_flights(to, from, len as usize) {
+            return;
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]

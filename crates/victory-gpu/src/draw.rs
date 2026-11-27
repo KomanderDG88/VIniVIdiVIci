@@ -1400,6 +1400,11 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    // A constant buffer a card copy wrote lately
+    // (`VICTORY_CARD_READ_COPY=2`): copied on the card, in order.
+    if let Some(gpu) = list.card_constant(address, len) {
+        return Some(gpu);
+    }
     if crate::host::list_reuse() {
         return list.fill_scratch(address as *const u8, len);
     }
@@ -5002,6 +5007,13 @@ impl State {
                 }
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // A constant buffer a card copy wrote lately
+                        // (`VICTORY_CARD_READ_COPY=2`): copied on the card,
+                        // in order.
+                        if let Some(gpu) = list.card_constant(address, u64::from(size)) {
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;

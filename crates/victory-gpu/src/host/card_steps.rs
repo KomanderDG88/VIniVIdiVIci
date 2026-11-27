@@ -581,7 +581,11 @@ impl Host {
         for list in runs {
             for (i, step) in list.deferred().copies.iter().enumerate() {
                 does.push(match step {
-                    &Step::Copy(dst, src, len) => Does::Copy {
+                    // A title copy also recorded on the card (`readcopy`):
+                    // left to the card, nothing of it is done here; kept on
+                    // the CPU, it is a copy as any other.
+                    Step::CardCopy(..) if !step.on_cpu() => continue,
+                    &Step::Copy(dst, src, len) | &Step::CardCopy(dst, src, len, _) => Does::Copy {
                         dst,
                         src,
                         len,

@@ -1005,7 +1005,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
         if list_reuse_set() {
             deferred.filled.clear();
         }
@@ -1088,7 +1088,7 @@ impl HostList {
                 Step::Refresh(shadow, address, len) => Some((std::sync::Arc::as_ptr(shadow) as usize, *address, *len)),
                 _ => None,
             },
-            |step| matches!(step, Step::Copy(..) | Step::Run(..)),
+            |step| matches!(step, Step::Copy(..) | Step::CardCopy(..) | Step::Run(..)),
         );
     }
 
@@ -1448,10 +1448,11 @@ impl HostList {
     /// (refreshes after it copy again; [`near_writes`] uses the place,
     /// without the switch any write of title memory is assumed).
     pub(crate) fn defer_at(&self, at: usize, len: usize, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work), Some((at, len))));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work), Some((at, len))));
+        deferred.title_written();
         if list_reuse_set() {
-            self.deferred().filled.clear();
+            deferred.filled.clear();
         }
     }
 
@@ -1535,12 +1536,17 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for (i, step) in self.deferred().copies.iter().enumerate() {
-            if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
+            if matches!(step, Step::Copy(..) | Step::CardCopy(..) | Step::Fill(..)) && taken(i) {
+                continue;
+            }
+            // A title copy the submission left to the card ([`readcopy`]):
+            // the card's copy in the list is the copy.
+            if !step.on_cpu() {
                 continue;
             }
             let started = std::time::Instant::now();
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
+                &Step::Copy(dst, src, len) | &Step::CardCopy(dst, src, len, _) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
