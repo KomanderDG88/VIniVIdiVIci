@@ -712,6 +712,14 @@ fn address_stores_only() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ADDRESS_STORES").is_some_and(|v| v == "1"))
 }
 
+/// Tests: the dynamic slots of the tables this list made, in order.
+#[cfg(test)]
+impl State {
+    pub(crate) fn dynamic_ranges(&self) -> Vec<(u32, u32)> {
+        self.dynamic.iter().map(|&(_, _, first, n)| (first, n)).collect()
+    }
+}
+
 impl State {
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
