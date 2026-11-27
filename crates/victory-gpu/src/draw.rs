@@ -1199,6 +1199,23 @@ fn recheck_every() -> u64 {
     })
 }
 
+/// Frames to the next look at an uploaded texture picked by index whose
+/// fixed schedule ([`RECHECK_FRAMES`]) is through, or `None`: not looked
+/// at again. `every` is [`recheck_every`]'s; `aliased_every` the alias
+/// recheck's (`crate::texture::AliasRecheck::every`, 0 without
+/// `VICTORY_ALIAS_RECHECK`): a texture whose pages the title also shows at
+/// other addresses (`aliased`, asked only then) keeps being looked at that
+/// often, or at `every` if that is sooner. The title paints such textures
+/// (faces, hair) through the other view long after their upload, with
+/// nothing to tell of it here. With `aliased_every` 0: exactly as before.
+/// After kitty-core/Kitty6 ae3cce8 (`K6_ALIASED_RECHECK_EVERY`).
+fn after_schedule(every: u64, aliased_every: u64, aliased: impl FnOnce() -> bool) -> Option<u64> {
+    if aliased_every > 0 && (every == 0 || aliased_every < every) && aliased() {
+        return Some(aliased_every);
+    }
+    (every > 0).then_some(every)
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -3754,7 +3771,14 @@ impl State {
             // next frame with `VICTORY_RECHECK_SOON=1` ([`recheck_soon`]).
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                // (Whole for an aliased texture with `VICTORY_ALIAS_RECHECK`:
+                // `crate::texture::fingerprint_texture`.)
+                let alias = crate::texture::alias_recheck();
+                if alias.on() {
+                    crate::texture::alias_recheck_line();
+                }
+                let (looked, whole) = crate::texture::fingerprint_texture(at, len);
+                if looked == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -3762,13 +3786,30 @@ impl State {
                         }
                         // The schedule is over: looked at again every so many
                         // frames for as long as the slot shows it
-                        // (`recheck_every`), or never again.
-                        None => match recheck_every() {
-                            0 => host.texture_slot_done(index, write, None),
-                            every => host.texture_slot_recheck(index, write, frame + every, (at, len), print, looks, uploaded),
-                        },
+                        // (`recheck_every`; an aliased one `after_schedule`),
+                        // or never again.
+                        None => {
+                            let aliased = || {
+                                let aliased = crate::texture::aliased(at, len);
+                                if aliased {
+                                    crate::texture::ALIAS_STATS[2].fetch_add(1, Ordering::Relaxed);
+                                }
+                                aliased
+                            };
+                            match after_schedule(recheck_every(), alias.every, aliased) {
+                                None => host.texture_slot_done(index, write, None),
+                                Some(every) => {
+                                    host.texture_slot_recheck(index, write, frame + every, (at, len), print, looks, uploaded)
+                                }
+                            }
+                        }
                     }
                     continue;
+                }
+                if whole {
+                    crate::texture::ALIAS_STATS[3].fetch_add(1, Ordering::Relaxed);
+                } else if alias.every > 0 && usize::from(looks) + 1 >= RECHECK_FRAMES.len() {
+                    crate::texture::ALIAS_STATS[4].fetch_add(1, Ordering::Relaxed);
                 }
                 if recheck_soon() {
                     again_in = 1;
@@ -4021,7 +4062,7 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
+                    let print = crate::texture::fingerprint_texture(at, len).0;
                     if again_in != RECHECK_FRAMES[0] {
                         HEAP_TEXTURES_SOON.fetch_add(1, Ordering::Relaxed);
                     }
@@ -6339,6 +6380,23 @@ mod rescan_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Past the fixed schedule: without the alias recheck exactly as
+    /// `recheck_every` decides, and the alias test never asked; with it,
+    /// an aliased texture keeps being looked at (at the sooner of the two),
+    /// one that is not as before.
+    #[test]
+    fn after_the_schedule_only_aliased_textures_are_kept_looked_at() {
+        let never = || -> bool { panic!("asked whether aliased with the alias recheck off") };
+        assert_eq!(after_schedule(0, 0, never), None);
+        assert_eq!(after_schedule(120, 0, never), Some(120));
+        assert_eq!(after_schedule(0, 30, || true), Some(30));
+        assert_eq!(after_schedule(0, 30, || false), None);
+        assert_eq!(after_schedule(120, 30, || true), Some(30));
+        assert_eq!(after_schedule(120, 30, || false), Some(120));
+        // An every sooner than the alias recheck's: not asked, as before.
+        assert_eq!(after_schedule(10, 30, never), Some(10));
+    }
 
     #[test]
     fn dropping_a_descriptor_heap_releases_both_buffer_pass_caches() {
