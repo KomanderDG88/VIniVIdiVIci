@@ -3336,6 +3336,12 @@ impl Shadow {
         shadow
     }
 
+    /// [`Shadow::placed`], for tests elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) fn placed_for_tests(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
+        Shadow::placed(placed, start, len, window)
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {

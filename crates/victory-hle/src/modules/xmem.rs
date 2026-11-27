@@ -2098,6 +2098,46 @@ mod tests {
         LOW_RESERVATIONS.lock().unwrap().retain(|&(a, _)| a != base as usize);
     }
 
+    /// Renderer port 1's reservations: of 32-bit graphics memory at an
+    /// address of ours, a placeholder of 64 KiB pages or, as this build of
+    /// the title makes its heap (kind 0x42000), a host placeholder reserved
+    /// without the 64 KiB page flag.
+    #[test]
+    fn port_1_notes_32_bit_reservations_with_or_without_the_64k_flag() {
+        let low = GRAPHICS | ADDRESS_32BIT;
+        assert_eq!(MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x42000);
+        assert!(low_reservation(true, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, true, low));
+        assert!(low_reservation(false, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, true, low), "kind 0x42000");
+        assert!(!low_reservation(false, MEM_RESERVE | MEM_COMMIT, true, low), "committed memory");
+        assert!(!low_reservation(true, MEM_RESERVE, false, low), "at the title's address");
+        assert!(!low_reservation(true, MEM_RESERVE, true, GRAPHICS), "not 32-bit memory");
+    }
+
+    /// A page written through a view of ours before it is mapped
+    /// (DirectStorage's destination) is not fresh: [`arrange`] leaves it,
+    /// and the page that would have taken its place, where they are, and
+    /// the byte written shows where the title maps that page.
+    #[test]
+    fn port_1_leaves_pages_that_are_not_fresh() {
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, GRAPHICS | ADDRESS_32BIT, PAGE_READWRITE);
+        assert!(!base.is_null() && (base as usize) < 1 << 32);
+        LOW_RESERVATIONS.lock().unwrap().push((base as usize, 2 * PAGE));
+        let pages = allocate(2);
+        let index = |number: usize| physical().pages.get(&number).map(|s| s.index);
+        assert!(write_physical(&pages[1..], 0, &[5]));
+        let not_fresh = ARRANGED[1].load(Ordering::Relaxed);
+        let swapped = [pages[1], pages[0]];
+        arrange(&mut physical(), base as usize, &swapped);
+        assert_eq!([index(pages[0]), index(pages[1])], [Some(0), Some(1)]);
+        assert!(ARRANGED[1].load(Ordering::Relaxed) >= not_fresh + 2);
+        assert_eq!(XMemMapPhysicalPages(base, 2, swapped.as_ptr()), base);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { base.cast::<u8>().read() }, 5);
+        assert_eq!(XMemMapPhysicalPages(base, 2, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        LOW_RESERVATIONS.lock().unwrap().retain(|&(a, _)| a != base as usize);
+    }
+
     #[test]
     fn physical_pages_map_alias_and_unmap() {
         let mut pages = [0usize; 3];
