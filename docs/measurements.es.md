@@ -39,6 +39,8 @@ Copiamos los archivos del título a un SSD NVMe del mismo equipo. Estas ejecucio
 
 Las cifras que hay detrás de la tabla de Estado, de la más reciente a la más antigua. Cada una es una sesión salvo que diga otra cosa.
 
+**27 de noviembre, por la noche: los fps en un equipo con poca memoria.** Dos sesiones con los mismos interruptores (texturas originales, `VICTORY_HELD_LEVELS=1`): una a unos 6,2 fps y otra a unos 3,8 fps en las mismas escenas tenían los mismos draws por frame (4500 y 4447), los mismos draws descartados (256 y 259), las mismas copias de memoria del título (71 y 68 MB por frame) y el mismo tiempo de tarjeta (42 y 38 ms); lo distinto era la memoria libre en el mundo, una mediana de 5377 MB frente a 1384 MB, mientras otros programas del PC ocupaban varios GB. En este PC de 32 GB el juego necesita unos 3 GB libres en el mundo; si no, Windows pagina y los fps caen casi a la mitad. Las sesiones con menos no se comparan en fps.
+
 **27 de noviembre, por la tarde: la memoria durante la carga.** Texturas originales (sin `VICTORY_TEXTURE_DROP_MIPS`), `VICTORY_HELD_LEVELS=1`, el perfil Series S, `VICTORY_RAM_TRIM=1`.
 
 - *De dónde sale el pico de la carga*, leído de las líneas de la capa en una sesión: en unos 3 s las copias en memoria de los búferes del título pasaron de 266 a 3112 MB y la memoria compartida con la tarjeta de 549 a 3825 MB; al final esas copias ocupaban 3276 MB para cubrir 1642 MB que pedía el título, redondeados a celdas enteras.

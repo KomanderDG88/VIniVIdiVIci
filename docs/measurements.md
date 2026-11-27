@@ -39,6 +39,8 @@ The title's files were copied to an NVMe SSD on the same machine. These runs use
 
 The figures behind the Status table, the newest first. Each is one session unless it says otherwise.
 
+**27 November, night: frame rate on a machine short of memory.** Two sessions with the same switches (original textures, `VICTORY_HELD_LEVELS=1`): one at about 6.2 fps and one at about 3.8 fps in the same scenes had the same draws a frame (4,500 and 4,447), the same draws dropped (256 and 259), the same copies of title memory (71 and 68 MB a frame) and the same time on the card (42 and 38 ms); what differed was the memory free in the world, a median of 5,377 MB against 1,384 MB, while other programs on the PC held several GB. On this 32 GB PC the game needs about 3 GB free in the world, or Windows pages and the frame rate falls by almost half; sessions with less are not compared for frame rate.
+
 **27 November, evening: memory during the load.** Original textures (no `VICTORY_TEXTURE_DROP_MIPS`), `VICTORY_HELD_LEVELS=1`, the Series S profile, `VICTORY_RAM_TRIM=1`.
 
 - *Where the load's peak comes from*, read from the layer's lines in one session: in about 3 s the copies of title buffers held in memory grew from 266 to 3,112 MB and the memory shared with the card from 549 to 3,825 MB; at the end those copies took 3,276 MB to cover 1,642 MB the title asked for, rounded to whole cells.
