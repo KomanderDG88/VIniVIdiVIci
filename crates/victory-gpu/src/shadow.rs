@@ -6489,7 +6489,7 @@ mod card_merge_tests {
 
     /// A plain buffer on the software adapter: what a copy's `buffer` and
     /// its card's `staging` are; the merge never touches them.
-    fn warp_buffer() -> Option<ID3D12Resource> {
+    pub(super) fn warp_buffer() -> Option<ID3D12Resource> {
         // SAFETY: plain DXGI and D3D12 creation calls on the software adapter.
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
@@ -6991,5 +6991,231 @@ mod ram_trim_tests {
 
         let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
         map.1.remove(&(start, LEN as u64));
+    }
+}
+
+#[cfg(test)]
+mod page_parts_tests {
+    use super::Shadow;
+    use crate::watch::{PAGE, PARTS_IN_TEST};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    const PART: usize = 4096;
+    const PAGES: usize = 4;
+
+    /// Title memory the kernel's write watch watches, a host copy of most of it (its ends inside its first and
+    /// last pages), and the numbers that make the title's writes.
+    struct Title {
+        p: usize,
+        s: usize,
+        e: usize,
+        side: Vec<u8>,
+        shadow: Option<Shadow>,
+        seed: u64,
+    }
+
+    impl Title {
+        fn new(buffer: ID3D12Resource) -> Title {
+            // SAFETY: a fresh write-watched allocation, freed in `Drop`.
+            let p = unsafe {
+                VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+            } as usize;
+            assert_ne!(p, 0);
+            assert_eq!(p % PAGE, 0);
+            let (s, e) = (p + 1000, p + PAGES * PAGE - 500);
+            let mut side = vec![0u8; e - s];
+            let shadow = Shadow::new(buffer, side.as_mut_ptr(), 0, s as u64, (e - s) as u64);
+            Title {
+                p,
+                s,
+                e,
+                side,
+                shadow: Some(shadow),
+                seed: 0x9e37_79b9_7f4a_7c15,
+            }
+        }
+
+        fn next(&mut self) -> usize {
+            self.seed = self.seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (self.seed >> 33) as usize
+        }
+
+        /// The title writes `len` bytes at offset `at` of the allocation (the kernel sees it).
+        fn put(&mut self, at: usize, len: usize) {
+            let len = len.min(PAGES * PAGE - at);
+            for k in 0..len {
+                let v = self.next() as u8;
+                // SAFETY: inside the allocation.
+                unsafe { ((self.p + at + k) as *mut u8).write_volatile(v) };
+            }
+        }
+
+        /// A write through a view the kernel does not watch: the same bytes at the same offset of page `page` and
+        /// of page `alias` (one physical page at two addresses), the kernel's bits of those 4 KiB parts taken
+        /// away, and the journal told as `crate::inplace::write_own` tells it: the pages written whole.
+        fn put_aliased(&mut self, page: usize, alias: Option<usize>, offset: usize, len: usize) {
+            let len = len.min(PAGE - offset);
+            for k in 0..len {
+                let v = self.next() as u8;
+                for q in std::iter::once(page).chain(alias) {
+                    // SAFETY: inside the allocation.
+                    unsafe { ((self.p + q * PAGE + offset + k) as *mut u8).write_volatile(v) };
+                }
+            }
+            if len != 0 {
+                let (lo, hi) = (offset / PART * PART, (offset + len).div_ceil(PART) * PART);
+                for q in std::iter::once(page).chain(alias) {
+                    // SAFETY: whole kernel pages of our write-watched allocation.
+                    assert_eq!(unsafe { ResetWriteWatch((self.p + q * PAGE + lo) as *const _, hi - lo) }, 0);
+                }
+            }
+            let base = self.p / PAGE;
+            let others: Vec<usize> = alias.map(|q| base + q).into_iter().collect();
+            crate::watch::wrote_own(base + page, &others);
+        }
+
+        /// Refreshes `[a, b)` (offsets of the allocation, cut to the copy) and checks that the copy holds title
+        /// memory there, byte for byte. Returns the bytes copied.
+        fn refresh(&mut self, a: usize, b: usize, what: &str) -> usize {
+            let (a, b) = ((self.p + a).max(self.s), (self.p + b).min(self.e));
+            if a >= b {
+                return 0;
+            }
+            let bytes = self.shadow.as_ref().unwrap().update(a, b - a);
+            // SAFETY: inside the allocation.
+            let title = unsafe { std::slice::from_raw_parts(a as *const u8, b - a) };
+            let copy = &self.side[a - self.s..b - self.s];
+            if let Some(k) = (0..b - a).find(|&k| title[k] != copy[k]) {
+                let at = a + k - self.p;
+                panic!(
+                    "{what}: stale after the refresh of {:#x}..{:#x}: offset {at:#x} (page {}, part {}), parts {}",
+                    a - self.p,
+                    b - self.p,
+                    at / PAGE,
+                    at % PAGE / PART,
+                    crate::watch::parts_on()
+                );
+            }
+            bytes
+        }
+
+        fn refresh_all(&mut self, what: &str) -> usize {
+            self.refresh(0, PAGES * PAGE, what)
+        }
+    }
+
+    impl Drop for Title {
+        fn drop(&mut self) {
+            self.shadow = None;
+            // SAFETY: the allocation made in `new`.
+            unsafe { VirtualFree(self.p as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// One run, with `VICTORY_PAGE_PARTS` as `parts` says: the bytes copied by the fixed refreshes, the bytes of
+    /// all refreshes, and the copy at the end.
+    fn scenario(buffer: ID3D12Resource, parts: bool) -> (Vec<usize>, usize, Vec<u8>) {
+        PARTS_IN_TEST.set(parts);
+        let mut t = Title::new(buffer);
+        let mut fixed = Vec::new();
+        let at = |page: usize, part: usize| page * PAGE + part * PART;
+        // Everything written, then taken.
+        t.put(0, PAGES * PAGE);
+        t.refresh_all("first");
+        // Successive writes to different parts of one page, a refresh after each.
+        t.put(at(1, 2) + 17, 40);
+        fixed.push(t.refresh_all("part 2"));
+        t.put(at(1, 5), PART);
+        fixed.push(t.refresh_all("part 5"));
+        t.put(at(1, 2) + 4000, 50); // into part 3 too
+        t.put(at(1, 9) + 300, 1);
+        t.put(at(2, 15) + 4095, 1);
+        fixed.push(t.refresh_all("parts 2, 3, 9 and another page's 15"));
+        // Through a view the kernel does not watch, at pages 1 and 2; part 11 of page 1 as well.
+        t.put_aliased(1, Some(2), 4 * PART + 8, 64);
+        t.put(at(1, 11), 8);
+        fixed.push(t.refresh_all("an aliased write"));
+        // Parts again after the page was written whole.
+        t.put(at(1, 6) + 1, 1);
+        fixed.push(t.refresh_all("part 6 after whole"));
+        // A refresh that starts and ends inside a page: part 3 in it, part 12 not; then part 13, and all.
+        t.put(at(2, 3) + 9, 9);
+        t.put(at(2, 12) + 9, 9);
+        fixed.push(t.refresh(at(2, 2) + 100, at(2, 8) + 7, "inside a page"));
+        t.put(at(2, 13), 3);
+        fixed.push(t.refresh_all("after the refresh inside a page"));
+        // The pages of the copy's ends, which it holds in part: their parts at the ends.
+        t.put(at(0, 0) + 1001, 5);
+        t.put(at(3, 15) + 4095 - 501, 5);
+        t.put(at(0, 0) + 10, 5); // before the copy
+        fixed.push(t.refresh_all("the ends"));
+        // Noted written whole with no new bytes, then a part.
+        t.put_aliased(3, None, 0, 0);
+        fixed.push(t.refresh_all("noted whole"));
+        t.put(at(3, 1), 1);
+        fixed.push(t.refresh_all("a part after noted whole"));
+
+        // Writes and refreshes of every kind, as they come.
+        let mut total: usize = fixed.iter().sum();
+        for round in 0..200 {
+            for _ in 0..1 + t.next() % 6 {
+                let kind = t.next() % 10;
+                let page = t.next() % PAGES;
+                let offset = t.next() % PAGE;
+                let most = if t.next() % 4 == 0 { 3 * PART } else { 300 };
+                let len = 1 + t.next() % most;
+                match kind {
+                    0..=5 => t.put(page * PAGE + offset, len),
+                    6 | 7 => {
+                        let alias = (page + 1 + t.next() % (PAGES - 1)) % PAGES;
+                        t.put_aliased(page, Some(alias), offset, len);
+                    }
+                    _ => t.put_aliased(page, None, offset, if kind == 8 { 0 } else { len }),
+                }
+            }
+            let what = format!("round {round}");
+            if t.next() % 2 == 0 {
+                // Cut: from inside a page to inside a page, then another write, then all.
+                let a = t.next() % (PAGES * PAGE);
+                let b = a + 1 + t.next() % (PAGES * PAGE - a);
+                total += t.refresh(a, b, &what);
+                let at = t.next() % (PAGES * PAGE);
+                let len = 1 + t.next() % 64;
+                t.put(at, len);
+            }
+            total += t.refresh_all(&what);
+        }
+        let copy = t.side.clone();
+        PARTS_IN_TEST.set(false);
+        (fixed, total, copy)
+    }
+
+    /// `VICTORY_PAGE_PARTS` end to end: refreshes of real write-watched memory (`Shadow::update`: the kernel's
+    /// asking, the journal's parts, `Shadow::copy_stale`) after writes to different parts of one page across
+    /// refreshes, writes through views the kernel does not watch and other whole-page notes, and refreshes that
+    /// start and end inside pages. After every refresh the copy holds title memory byte for byte, with the switch
+    /// and without; with it only the parts written are copied.
+    #[test]
+    fn page_parts_refreshes_leave_no_written_part_stale() {
+        let _one = crate::inplace::tests::one_warp_at_a_time();
+        let Some(buffer) = super::card_merge_tests::warp_buffer() else {
+            return;
+        };
+        let (on, on_total, on_copy) = scenario(buffer.clone(), true);
+        let (off, off_total, off_copy) = scenario(buffer, false);
+        assert_eq!(on_copy, off_copy, "the same writes, the same copy");
+        // Without the switch whole pages: page 1 (twice), pages 1 and 2, pages 1 and 2 (aliased), page 1, the
+        // range inside page 2, page 2, the copy's two end pages as far as it holds them, page 3 (twice).
+        let inside = 6 * PART + 7 - 100;
+        let ends = (PAGE - 1000) + (PAGE - 500);
+        assert_eq!(off, [PAGE, PAGE, 2 * PAGE, 2 * PAGE, PAGE, inside, PAGE, ends, PAGE - 500, PAGE - 500]);
+        // With it the parts: 2; 5; 2, 3, 9 and 15; pages 1 and 2 whole; 6; 3 (12 is outside); 3, 12 and 13; part 0
+        // of page 0 from the copy's start and part 15 of page 3 to its end; page 3 whole; part 1 of page 3.
+        let ends = (PART - 1000) + (PART - 500);
+        assert_eq!(on, [PART, PART, 4 * PART, 2 * PAGE, PART, PART, 3 * PART, ends, PAGE - 500, PART]);
+        assert!(on_total < off_total, "{on_total} bytes copied with the parts, {off_total} without");
     }
 }
