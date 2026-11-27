@@ -19,17 +19,24 @@
 //! ([`super::physical`]) and never before it; the fault handler and the
 //! lookups for our own reads take the record's alone, so they never wait on
 //! the page table (a GPU reader may hold the remapping lock while a
-//! remapper holding the page table waits for it). Nothing reads title
-//! memory, and nothing calls into the GPU side, while the record's lock is
-//! held.
+//! remapper holding the page table waits for it). Nothing reads or writes
+//! title memory, and nothing calls into the GPU side, while the record's
+//! lock is held (a title's query buffer is filled in after it is let go).
+//! Should a thread fault on a recorded page all the same while it holds
+//! the lock, the handler does not wait on itself: it knows ([`holding`])
+//! and leaves the fault to the other handlers, said once.
 //!
 //! Off by default: unset, or anything but `1`, keeps every request on the
 //! eager path, and none of this is reached.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Once, OnceLock};
+use std::time::Instant;
 
 use victory_gpu::recorded::{C, count};
 use windows_sys::Win32::Foundation::{ERROR_INVALID_ADDRESS, SetLastError};
@@ -111,8 +118,52 @@ struct Record {
 
 static RECORD: LazyLock<Mutex<Record>> = LazyLock::new(Mutex::default);
 
-fn record() -> MutexGuard<'static, Record> {
-    RECORD.lock().unwrap_or_else(|e| e.into_inner())
+thread_local! {
+    /// Whether this thread holds the record's lock ([`Held`]). A fault it
+    /// takes on a recorded page then cannot be served, as the handler would
+    /// wait on the lock this thread holds; [`on_fault`] leaves it to the
+    /// other handlers.
+    static HOLDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The record's lock, held: [`holding`] says so on this thread until the
+/// guard goes.
+struct Held {
+    guard: ManuallyDrop<MutexGuard<'static, Record>>,
+    /// What [`HOLDING`] said before, put back once the lock is let go.
+    was: bool,
+}
+
+impl Deref for Held {
+    type Target = Record;
+    fn deref(&self) -> &Record {
+        &self.guard
+    }
+}
+
+impl DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Record {
+        &mut self.guard
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // SAFETY: dropped here alone, and not used after.
+        unsafe { ManuallyDrop::drop(&mut self.guard) };
+        HOLDING.set(self.was);
+    }
+}
+
+fn record() -> Held {
+    let guard = RECORD.lock().unwrap_or_else(|e| e.into_inner());
+    let was = HOLDING.replace(true);
+    Held { guard: ManuallyDrop::new(guard), was }
+}
+
+/// Whether this thread holds the record's lock.
+fn holding() -> bool {
+    HOLDING.get()
 }
 
 /// Pages recorded now, and the lowest and highest address of any extent:
@@ -363,9 +414,66 @@ fn allowed(at: usize, write: bool) -> bool {
     }
 }
 
+/// What the handler does with a read or a write fault, decided before any
+/// lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// No recorded page can be there: the next handler's.
+    Pass,
+    /// A recorded page may be there, but this thread holds the record's
+    /// lock: taking it would wait on itself, so the next handler's.
+    Holding,
+    /// A recorded page may be there: looked up under the lock.
+    Look,
+}
+
+/// [`Step`] for a fault that may (`near`) or cannot meet a recorded page,
+/// on a thread that holds the record's lock or not.
+fn step(near: bool, holding: bool) -> Step {
+    match (near, holding) {
+        (false, _) => Step::Pass,
+        (true, true) => Step::Holding,
+        (true, false) => Step::Look,
+    }
+}
+
+/// Faults that may have met a recorded page, taken while their thread held
+/// the record's lock (left to the other handlers).
+static HOLDING_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// The handler's answer to a read or a write fault at `at`, after `step`:
+/// the record's lock is taken for [`Step::Look`] alone.
+fn respond(step: Step, at: usize, write: bool) -> i32 {
+    use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH};
+    match step {
+        Step::Pass => EXCEPTION_CONTINUE_SEARCH,
+        Step::Holding => {
+            HOLDING_FAULTS.fetch_add(1, Relaxed);
+            static SAID: Once = Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(
+                    address = format_args!("{at:#x}"),
+                    "a fault on a recorded page while this thread holds the record table (VICTORY_LAZY_REMAP): left \
+                     to the other handlers"
+                );
+            });
+            EXCEPTION_CONTINUE_SEARCH
+        }
+        Step::Look => match touch(at, write) {
+            Touch::Mapped => {
+                count(C::Faults, 1);
+                EXCEPTION_CONTINUE_EXECUTION
+            }
+            Touch::Allowed => EXCEPTION_CONTINUE_EXECUTION,
+            Touch::No => EXCEPTION_CONTINUE_SEARCH,
+        },
+    }
+}
+
 /// The access-fault handler: a read or a write of a recorded page with no
 /// view gets that page mapped, and the access resumes. Execute faults are
-/// not ours.
+/// not ours. Each read or write fault is counted, served or passed on, with
+/// the time it took (the frame-rate line).
 unsafe extern "system" fn on_fault(
     info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
 ) -> i32 {
@@ -380,17 +488,25 @@ unsafe extern "system" fn on_fault(
     }
     let kind = r.ExceptionInformation[0];
     let at = r.ExceptionInformation[1];
-    if !(kind == READ || kind == WRITE) || !maybe_recorded(at, 1) {
+    if !(kind == READ || kind == WRITE) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    match touch(at, kind == WRITE) {
-        Touch::Mapped => {
-            count(C::Faults, 1);
-            EXCEPTION_CONTINUE_EXECUTION
-        }
-        Touch::Allowed => EXCEPTION_CONTINUE_EXECUTION,
-        Touch::No => EXCEPTION_CONTINUE_SEARCH,
+    let started = Instant::now();
+    let next = step(maybe_recorded(at, 1), holding());
+    let answer = respond(next, at, kind == WRITE);
+    let served = answer == EXCEPTION_CONTINUE_EXECUTION;
+    count(C::HandlerCalls, 1);
+    count(if served { C::HandlerServed } else { C::HandlerPassed }, 1);
+    count(C::HandlerNs, started.elapsed().as_nanos() as u64);
+    // In the tests, loudly: a path that touches title memory under the
+    // record's lock.
+    if cfg!(test) {
+        debug_assert!(
+            next != Step::Holding,
+            "a fault on a recorded page at {at:#x} while this thread holds the record table"
+        );
     }
+    answer
 }
 
 fn install() -> bool {
@@ -791,8 +907,13 @@ pub extern "system" fn VirtualQuery(
     // SAFETY: the title's own arguments.
     let n = unsafe { windows_sys::Win32::System::Memory::VirtualQuery(address, buffer, length) };
     if n >= size_of::<MEMORY_BASIC_INFORMATION>() {
+        // Adjusted in a copy: the title's buffer is not written under the
+        // record's lock (a fault there could not be served).
         // SAFETY: the system filled a whole structure there.
-        adjust_query(address as usize, unsafe { &mut *buffer });
+        let mut info = unsafe { buffer.read_unaligned() };
+        adjust_query(address as usize, &mut info);
+        // SAFETY: as above.
+        unsafe { buffer.write_unaligned(info) };
     }
     n
 }

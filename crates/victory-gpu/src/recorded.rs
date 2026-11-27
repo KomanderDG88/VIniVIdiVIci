@@ -182,6 +182,14 @@ pub enum C {
     Us,
     /// Bytes our own copies moved through stable views.
     HostBytes,
+    /// Calls of the access-fault handler that reached its range check (a
+    /// read or a write fault), those of them served (a recorded page
+    /// mapped, or found mapped), those passed on to the other handlers, and
+    /// the nanoseconds spent in it. For the frame-rate line alone.
+    HandlerCalls,
+    HandlerServed,
+    HandlerPassed,
+    HandlerNs,
     Count,
 }
 
@@ -200,7 +208,7 @@ pub fn count(c: C, n: u64) {
         C::Faults => T::LazyFaults,
         C::Us => T::LazyUs,
         C::HostBytes => T::LazyHostBytes,
-        C::Count => return,
+        C::HandlerCalls | C::HandlerServed | C::HandlerPassed | C::HandlerNs | C::Count => return,
     };
     add(t, n);
 }
@@ -219,16 +227,17 @@ pub(crate) fn line() {
         *last = Some(now);
         seconds
     };
-    let [pages, ops, eager, views, faults, us, bytes] =
-        [0, 1, 2, 3, 4, 5, 6].map(|i| SINCE_LINE[i].swap(0, Relaxed) as f64 / seconds);
+    let [pages, ops, eager, views, faults, us, bytes, calls, served, passed, handler_ns] =
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(|i| SINCE_LINE[i].swap(0, Relaxed) as f64 / seconds);
     tracing::info!(
         "page mappings recorded without the system (VICTORY_LAZY_REMAP=1), per second: {pages:.0} pages asked for, \
          {ops:.0} system mapping calls made ({:.0} avoided of the {eager:.0} the eager path would make), {views:.0} \
          one-page views made on a first touch, {faults:.0} faults served, {:.1} ms recording, {:.1} MB through stable \
-         views",
+         views, handler calls {calls:.0} (served {served:.0}, passed on {passed:.0}), handler time {:.2} ms",
         (eager - ops).max(0.0),
         us / 1e3,
         bytes / 1e6,
+        handler_ns / 1e6,
     );
 }
 

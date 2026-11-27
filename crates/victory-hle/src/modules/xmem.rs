@@ -239,8 +239,12 @@ pub extern "system" fn XMemVirtualQuery(
         let info = &mut *out;
         // A recorded page reads as the eager path's view
         // (`VICTORY_LAZY_REMAP=1`; nothing without it).
+        // Adjusted in a copy: the title's buffer is not written under the
+        // record's lock (a fault there could not be served).
         if lazy::enabled() {
-            lazy::adjust_query(address as usize, &mut info.host);
+            let mut host = info.host;
+            lazy::adjust_query(address as usize, &mut host);
+            info.host = host;
         }
         info.flags = if info.host.State == MEM_COMMIT {
             GRAPHICS

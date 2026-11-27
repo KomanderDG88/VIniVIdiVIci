@@ -475,3 +475,28 @@ fn kernel_writers_get_views_first() {
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     });
 }
+
+/// The handler's first step, decided before any lock: a fault that cannot
+/// meet a recorded page is passed on, and one that may is looked up under
+/// the record's lock, unless this thread holds it already. Then it is
+/// passed on without the lock (taking it here would wait on this thread),
+/// and counted.
+#[test]
+fn a_fault_under_the_record_lock_is_passed_on_without_taking_it() {
+    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
+    assert_eq!(step(false, false), Step::Pass);
+    assert_eq!(step(false, true), Step::Pass);
+    assert_eq!(step(true, false), Step::Look);
+    assert_eq!(step(true, true), Step::Holding);
+    assert!(!holding());
+    {
+        let _held = record();
+        assert!(holding(), "the record's lock says so while it is held");
+        let before = HOLDING_FAULTS.load(Relaxed);
+        let next = step(true, holding());
+        assert_eq!(next, Step::Holding);
+        assert_eq!(respond(next, 0x7_0000_0000, true), EXCEPTION_CONTINUE_SEARCH);
+        assert!(HOLDING_FAULTS.load(Relaxed) > before, "counted");
+    }
+    assert!(!holding(), "the flag goes with the lock");
+}
