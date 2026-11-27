@@ -81,6 +81,9 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // Refreshes a thread of ours was still finding for it
+        // (`VICTORY_HEAP_PASS_ASIDE`): among its steps before it goes.
+        self.take_coming();
         // The copies below write buffers on the card: no draw after them joins a window.
         crate::indirect::end_window(self);
         // Host queries begun in this list and never ended here: ended now, answered "visible".
@@ -156,6 +159,9 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.clamp_window.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // (A list reset without its close: what was still coming is not
+        // waited for, and goes nowhere.)
+        *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         // Oversized per-list tables shrunk on reset only with
         // `VICTORY_RAM_TRIM=1`.
@@ -1044,6 +1050,46 @@ impl HostList {
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
         }
+    }
+
+    /// `work` finds, on a thread of ours, refreshes that belong at this place
+    /// among the list's steps (`VICTORY_HEAP_PASS_ASIDE`, [`aside`]); they
+    /// are there when the list is closed. One at a time: one still coming
+    /// is put in first.
+    pub(crate) fn refreshes_coming(&self, work: impl FnOnce() -> Vec<aside::Refresh> + Send + 'static) {
+        self.take_coming();
+        let at = self.deferred().copies.len();
+        let coming = aside::begin(work);
+        *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, coming));
+    }
+
+    /// The refreshes that were still to come are put among the steps, where
+    /// they were asked for, noted once as [`HostList::defer_refresh`] notes
+    /// them ([`aside::splice_once`]: a title copy or a run of ours notes a
+    /// range anew).
+    fn take_coming(&self) {
+        let Some((at, coming)) = self.coming.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let found = coming.wait();
+        if found.is_empty() {
+            return;
+        }
+        let mut deferred = self.deferred();
+        let found = found
+            .into_iter()
+            .map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, to.saturating_sub(from) as usize))
+            .collect();
+        aside::splice_once(
+            &mut deferred.copies,
+            at,
+            found,
+            |step| match step {
+                Step::Refresh(shadow, address, len) => Some((std::sync::Arc::as_ptr(shadow) as usize, *address, *len)),
+                _ => None,
+            },
+            |step| matches!(step, Step::Copy(..) | Step::Run(..)),
+        );
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's

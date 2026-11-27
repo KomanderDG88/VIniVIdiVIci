@@ -1504,6 +1504,10 @@ pub(crate) struct HostList {
     /// Occlusion queries begun on the host in this list and not ended in it (`crate::query`, `VICTORY_OCCLUSION`):
     /// host heap, console kind, index, console heap.
     open_queries: Mutex<Vec<(ID3D12QueryHeap, u32, u32, usize)>>,
+    /// With `VICTORY_HEAP_PASS_ASIDE=1`: refreshes of host copies a thread
+    /// of ours is still finding, and where among the list's steps they belong
+    /// ([`aside`]).
+    coming: Mutex<Option<(usize, std::sync::Arc<aside::Coming>)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The pair of timestamps its run is timed with since its last reset
@@ -4956,6 +4960,7 @@ fn late_line(frames: f64) {
     }
 }
 
+pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 mod merging;
@@ -5294,6 +5299,7 @@ impl Host {
                 window_check: OnceLock::new(),
                 clamp_window: Mutex::new(None),
                 open_queries: Mutex::new(Vec::new()),
+                coming: Mutex::new(None),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
@@ -9333,6 +9339,17 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        // With `VICTORY_HEAP_PASS_ASIDE=1` the walk of those passes is in
+        // `picked_ms` too, though done beside the recording: what the lists
+        // waited for it at their close.
+        if aside::on() {
+            let waited = aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            if picked > 0.0 {
+                tracing::info!(
+                    "the walk over the heap's buffer views beside the recording (VICTORY_HEAP_PASS_ASIDE=1): {waited:.2} ms a frame waited for at the lists' close, of {picked_ms:.1} ms of heap buffers"
+                );
+            }
+        }
         {
             let [busy, detiling, lists, shown, again, left] =
                 std::array::from_fn::<f64, 6, _>(|i| crate::heap_worker::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);

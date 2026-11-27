@@ -701,6 +701,17 @@ fn changed_slots(
     first.min(last)..last
 }
 
+/// `f` of the title heap at `heap`, if that heap is still there; it stays
+/// until `f` is done (its drop waits for the registry). For work on the heap
+/// away from the thread that holds it (`crate::host::aside`). `f` must not
+/// take the registry again, as no holder of it does.
+#[cfg(windows)]
+pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T> {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: registered heaps are live (removed when dropped).
+    heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap is still there, and `id` says it is the one that
 /// took them ([crate::descriptor::host::HostHeap::id]): the title can release
