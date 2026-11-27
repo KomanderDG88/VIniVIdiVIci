@@ -71,6 +71,15 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
+    // The host's PC FidelityFX upscaler in place of the title's loader DLL,
+    // only with VICTORY_FIDELITYFX_DIR (unset: nothing read, as before).
+    // First, before anything builds the import registry.
+    if victory_hle::modules::fidelityfx::init_from_env() {
+        println!(
+            "fidelityfx     host upscaler {}",
+            victory_hle::modules::fidelityfx::provider().unwrap_or("?")
+        );
+    }
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
@@ -115,7 +124,10 @@ pub fn run(
             dll: &str,
             symbol: &victory_pe::ImportSymbol,
         ) -> victory_loader::Resolution {
+            // With the host's upscaler the whole DLL is served by it
+            // (`victory_hle::modules::fidelityfx`), its dispatch included.
             let ours = dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+                && !victory_hle::modules::fidelityfx::serving()
                 && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
             if ours {
                 return victory_loader::Resolution::Found {
