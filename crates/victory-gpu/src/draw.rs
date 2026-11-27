@@ -712,6 +712,14 @@ fn address_stores_only() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ADDRESS_STORES").is_some_and(|v| v == "1"))
 }
 
+/// Tests: the dynamic slots of the tables this list made, in order.
+#[cfg(test)]
+impl State {
+    pub(crate) fn dynamic_ranges(&self) -> Vec<(u32, u32)> {
+        self.dynamic.iter().map(|&(_, _, first, n)| (first, n)).collect()
+    }
+}
+
 impl State {
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
@@ -4997,6 +5005,7 @@ impl State {
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let cached = crate::descriptor::host::view_cache::on();
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
@@ -5005,7 +5014,12 @@ impl State {
                 if let Some(title) = title_first {
                     host.table_slot(title + k);
                 }
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                // The view and its record, for the cache of views made.
+                let (found, record) = match crate::descriptor::view_and_key(table + u64::from(k) * 32) {
+                    Some((view, record)) => (Some(view), record),
+                    None => (None, 0),
+                };
+                match found {
                     Some(View::Constant(address, size)) => {
                         // A constant buffer a card copy wrote lately
                         // (`VICTORY_CARD_READ_COPY=2`): copied on the card,
@@ -5030,6 +5044,7 @@ impl State {
                     Some(view) => {
                         match halved(self, slot, k * 8) {
                             Some(shown) => host.make_at(index, &shown),
+                            None if cached => host.make_at_cached(index, &view, record),
                             None => host.make_at(index, &view),
                         }
                         #[cfg(feature = "diagnostics")]

@@ -155,6 +155,14 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     crate::profile::seen(crate::profile::Seen::Record);
 }
 
+/// Tests: the dynamic slots of the tables list `this` made, in order.
+#[cfg(test)]
+pub(crate) fn dynamic_ranges(this: This) -> Vec<(u32, u32)> {
+    // SAFETY: one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).dynamic_ranges()
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
@@ -293,6 +301,24 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             idle.1 += bytes;
         }
     }
+}
+
+/// All idle host lists let go (their command allocators and what they
+/// kept), for `VICTORY_OOM_RECLAIM=1` when the card refused a buffer
+/// (`crate::host`'s `reclaim_for_oom`): each has run and been reset, so
+/// nothing in the air names it. Left alone if [`IDLE`] is held (perhaps by
+/// the thread that asked). How many went.
+#[cfg(windows)]
+pub(crate) fn drain_idle() -> usize {
+    let gone = match crate::host::try_lock_or_skip(&IDLE) {
+        Some(mut idle) => {
+            idle.1 = 0;
+            std::mem::take(&mut idle.0)
+        }
+        None => return 0,
+    };
+    // Let go outside the lock.
+    gone.len()
 }
 
 /// Releases cold idle host lists (and excess spare gather/scratch buffers on

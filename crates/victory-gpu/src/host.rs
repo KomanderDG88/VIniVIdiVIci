@@ -259,7 +259,10 @@ fn sweep() {
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
+    // (Those the title made and the host has not begun get the next numbers:
+    // the line of `crate::queue::behind`, `VICTORY_SUBMIT_LINE=1`; none
+    // without it.)
+    let started = STARTED.load(Ordering::Acquire) + crate::queue::queued();
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         if retire_lean() && !reaper_on() {
@@ -2486,8 +2489,14 @@ fn trim_spare_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
             policy.panic_memory,
         )
     };
+    crate::ram_trim::note_pool_trimmed(let_spare_go(freed));
+}
+
+/// Scratch chunks taken out of [`SPARE`] let go (outside its lock), the
+/// counts kept in step; their bytes.
+fn let_spare_go(freed: Vec<(Chunk, u64)>) -> u64 {
     if freed.is_empty() {
-        return;
+        return 0;
     }
     let mut bytes = 0u64;
     let count = freed.len() as u64;
@@ -2500,7 +2509,102 @@ fn trim_spare_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
     ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
     // Drop COM buffers outside `SPARE`'s lock.
     drop(freed);
-    crate::ram_trim::note_pool_trimmed(bytes);
+    bytes
+}
+
+/// `VICTORY_OOM_RECLAIM=1` (after LoverCatys/ruff-lab `e234e609`, its
+/// `reclaim_for_oom`): a buffer the card refuses with `E_OUTOFMEMORY`
+/// (upload, read-back, shared, unordered-access) is asked for once more
+/// after the idle pools are emptied: the spare scratch chunks ([`SPARE`],
+/// upload memory), the idle host lists (`crate::list::drain_idle`: their
+/// command allocators) and the snapshot pool (`crate::shadow::drain_pools`:
+/// commit charge). Unset (the default): refused, as before.
+fn oom_reclaim() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OOM_RECLAIM").is_some_and(|v| v == "1"))
+}
+
+/// Whether a creation that failed with `code` on try `attempt` (from 0) is
+/// tried once more, the pools emptied first ([`oom_reclaim`]): only when
+/// on, only out of memory, only once.
+fn retry_after_oom(on: bool, attempt: u32, code: i32) -> bool {
+    on && attempt == 0 && code == crate::object::E_OUTOFMEMORY
+}
+
+/// Whether the pools are emptied again at `now` (ms), last emptied at `last`
+/// (0: never): not again within 250 ms (threads refused together wait for
+/// the one emptying them, then try once more without emptying them again).
+fn reclaim_due(now: u64, last: u64) -> bool {
+    last == 0 || now >= last.saturating_add(250)
+}
+
+/// Locks `m` unless another holds it (perhaps this thread, which asked for
+/// a buffer while holding it): then None, and that pool is left alone.
+pub(crate) fn try_lock_or_skip<T>(m: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+    match m.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// [`oom_reclaim`]'s emptying of the idle pools, before the one more try.
+/// Serialized; not within itself (a buffer asked for while letting go).
+fn reclaim_for_oom(why: &str) {
+    thread_local! {
+        static IN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if IN.with(|i| i.replace(true)) {
+        return;
+    }
+    static LAST: Mutex<u64> = Mutex::new(0);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        if reclaim_due(now, *last) {
+            *last = now;
+            // The lists first: a list let go gives its scratch chunks to
+            // the spare ones (`Scratch`'s drop).
+            let lists = crate::list::drain_idle();
+            let freed = try_lock_or_skip(&SPARE).map(|mut s| s.trim(0, 0, now, true)).unwrap_or_default();
+            let spare = let_spare_go(freed);
+            let snapshots = crate::shadow::drain_pools();
+            crate::ram_trim::note_pool_trimmed(spare + snapshots);
+            tracing::warn!(
+                why,
+                spare_mb = spare >> 20,
+                lists,
+                snapshot_mb = snapshots >> 20,
+                "E_OUTOFMEMORY: idle pools emptied, asked once more (VICTORY_OOM_RECLAIM=1)"
+            );
+        }
+    }
+    IN.with(|i| i.set(false));
+}
+
+#[cfg(test)]
+mod oom_tests {
+    use super::{reclaim_due, retry_after_oom};
+    use crate::object::E_OUTOFMEMORY;
+
+    #[test]
+    fn only_out_of_memory_is_tried_again_once_and_only_when_on() {
+        assert!(retry_after_oom(true, 0, E_OUTOFMEMORY));
+        assert!(!retry_after_oom(true, 1, E_OUTOFMEMORY), "once");
+        assert!(!retry_after_oom(false, 0, E_OUTOFMEMORY), "off by default");
+        // E_INVALIDARG and DXGI_ERROR_DEVICE_REMOVED: refused as before.
+        assert!(!retry_after_oom(true, 0, 0x8007_0057_u32 as i32));
+        assert!(!retry_after_oom(true, 0, 0x887A_0005_u32 as i32));
+    }
+
+    #[test]
+    fn pools_are_emptied_at_most_every_250_ms() {
+        assert!(reclaim_due(5, 0), "never emptied");
+        assert!(!reclaim_due(1_000, 900));
+        assert!(!reclaim_due(1_149, 900));
+        assert!(reclaim_due(1_150, 900));
+        assert!(!reclaim_due(0, u64::MAX), "no overflow");
+    }
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -9146,25 +9250,30 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a read-back buffer.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
-        };
-        match made {
-            Ok(()) => buffer,
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no read-back buffer");
-                None
+        // Once more after the idle pools are emptied ([`oom_reclaim`]).
+        for attempt in 0..2 {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a read-back buffer.
+            let made = unsafe {
+                self.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+            };
+            match made {
+                Ok(()) => return buffer,
+                Err(e) if retry_after_oom(oom_reclaim(), attempt, e.code().0) => reclaim_for_oom("read-back buffer"),
+                Err(e) => {
+                    tracing::warn!(error = %e, size, "no read-back buffer");
+                    return None;
+                }
             }
         }
+        None
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -9188,31 +9297,36 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
-                None
+        // Once more after the idle pools are emptied ([`oom_reclaim`]).
+        for attempt in 0..2 {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of an upload buffer.
+            let made = unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+            match made {
+                Ok(()) => return Some((buffer?, data.cast())),
+                Err(e) if retry_after_oom(oom_reclaim(), attempt, e.code().0) => reclaim_for_oom("upload buffer"),
+                Err(e) => {
+                    tracing::warn!(error = %e, size, "no upload buffer");
+                    return None;
+                }
             }
         }
+        None
     }
 }
 
@@ -10129,31 +10243,36 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
-                None
+        // Once more after the idle pools are emptied ([`oom_reclaim`]).
+        for attempt in 0..2 {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of a CPU-visible buffer.
+            let made = unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+            match made {
+                Ok(()) => return Some((buffer?, data.cast())),
+                Err(e) if retry_after_oom(oom_reclaim(), attempt, e.code().0) => reclaim_for_oom("shared buffer"),
+                Err(e) => {
+                    tracing::warn!(error = %e, size, "no shared buffer");
+                    return None;
+                }
             }
         }
+        None
     }
 
     /// A device-local buffer shaders may write (unordered access) and indirect
@@ -10180,25 +10299,30 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a device-local buffer.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut buffer,
-            )
-        };
-        match made {
-            Ok(()) => buffer,
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no unordered-access buffer");
-                None
+        // Once more after the idle pools are emptied ([`oom_reclaim`]).
+        for attempt in 0..2 {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a device-local buffer.
+            let made = unsafe {
+                self.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+            };
+            match made {
+                Ok(()) => return buffer,
+                Err(e) if retry_after_oom(oom_reclaim(), attempt, e.code().0) => reclaim_for_oom("unordered-access buffer"),
+                Err(e) => {
+                    tracing::warn!(error = %e, size, "no unordered-access buffer");
+                    return None;
+                }
             }
         }
+        None
     }
 }
 

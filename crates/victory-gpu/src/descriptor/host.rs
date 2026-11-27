@@ -13,6 +13,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
+
+pub(crate) mod view_cache;
 use crate::host::host;
 
 /// [`HostHeap::slot_flags`]: title slot `index` is in the queue of
@@ -1537,6 +1539,27 @@ pub(crate) fn probe_view_limit() {
 /// give it more), and the longest table one makes.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// For the gate of `crate::list::thin` (the next step of the port): the
+/// title slots of the biggest view heap that took or gave back dynamic slots,
+/// the dynamic slots it has free now (`u32::MAX`: none has yet), and how many
+/// it has in all. Relaxed stores under the heap's lock of `next`; nothing
+/// reads them yet. (Ported from fxceless/victory-fork f299fba1, from
+/// trustno1-coder/VIctory-NVIDIA 959dcaf; upstream keeps the third in
+/// `DYNAMIC_LOW[1]`, which ours does not have.)
+static DYNAMIC_FREE: [std::sync::atomic::AtomicU32; 3] = [
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(u32::MAX),
+    std::sync::atomic::AtomicU32::new(0),
+];
+
+/// The dynamic slots free now in the title's view heap ([`DYNAMIC_FREE`]),
+/// and how many it has in all (0: none was asked for yet).
+#[allow(dead_code)]
+pub(crate) fn dynamic_room() -> (u32, u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (DYNAMIC_FREE[1].load(Relaxed), DYNAMIC_FREE[2].load(Relaxed))
+}
+
 /// The dynamic slots of a view heap of `count` title slots whose null slot
 /// is `null` (0: none), read once from `VICTORY_DYNAMIC_SLOTS`
 /// ([`dynamic_slots_for`]). Unset: [`DYNAMIC`] on every host, as before.
@@ -1802,6 +1825,44 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Tests: what slots of a view heap hold.
+#[cfg(test)]
+impl HostHeap {
+    /// The host resource slot `index` holds.
+    pub(crate) fn kept_at(&self, index: u32) -> Option<ID3D12Resource> {
+        let piece = &self.kept[(index % KEPT_PIECES) as usize];
+        piece.lock().unwrap_or_else(|e| e.into_inner()).get((index / KEPT_PIECES) as usize).cloned().flatten()
+    }
+
+    /// The bytes of slot `index`'s descriptor (the shader-visible heap's
+    /// CPU side: readable on the hosts the tests run on).
+    pub(crate) fn slot_bytes(&self, index: u32) -> Vec<u8> {
+        // SAFETY: a slot of the heap, `step` bytes.
+        unsafe { std::slice::from_raw_parts(self.cpu(index).ptr as *const u8, self.step as usize) }.to_vec()
+    }
+}
+
+/// Tests: the bytes of the descriptor [`make`] makes of `view` (none if it
+/// cannot), in a heap the shaders do not see.
+#[cfg(test)]
+pub(crate) fn made_bytes(view: &View) -> Option<Vec<u8>> {
+    let device = &host()?.device;
+    // SAFETY: plain heap creation and queries; the slot is ours.
+    unsafe {
+        let heap: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+            .ok()?;
+        let at = heap.GetCPUDescriptorHandleForHeapStart();
+        make(view, at)?;
+        let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        Some(std::slice::from_raw_parts(at.ptr as *const u8, step as usize).to_vec())
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -1864,6 +1925,7 @@ impl HostHeap {
                 2
             }]
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.note_room();
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -1879,7 +1941,19 @@ impl HostHeap {
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % self.dynamic as usize) as u32;
+        self.note_room();
         Some(self.count + first as u32)
+    }
+
+    /// Notes the dynamic slots free now ([`DYNAMIC_FREE`]), if no bigger
+    /// heap has noted its own. Under the lock of `next`.
+    fn note_room(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.count >= DYNAMIC_FREE[0].load(Relaxed) {
+            DYNAMIC_FREE[0].store(self.count, Relaxed);
+            DYNAMIC_FREE[1].store(self.free.load(Relaxed), Relaxed);
+            DYNAMIC_FREE[2].store(self.dynamic, Relaxed);
+        }
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2835,6 +2909,7 @@ impl HostHeap {
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             slots.fill(false);
+            self.note_room();
         }
     }
 
@@ -2846,6 +2921,18 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         self.keep(index, made.and_then(|(kept, _)| kept));
+    }
+
+    /// As [`HostHeap::make_at`], a texture view copied from the cache of
+    /// views made ([`view_cache`]; `key`: the view's record).
+    pub(crate) fn make_at_cached(&self, index: u32, view: &View, key: u64) {
+        if !self.sampler
+            && let Some(copied) = view_cache::cache().and_then(|c| c.copy(view, key, self.cpu(index)))
+        {
+            self.keep(index, Some(copied.texture));
+            return;
+        }
+        self.make_at(index, view);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.

@@ -1685,6 +1685,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod samplers;
+#[cfg(all(test, windows))]
+mod list_bench;
 
 /// Host pipelines created and loaded from the library since the start
 /// (`crate::framelog`).

@@ -715,7 +715,14 @@ fn writes_in(
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
-    let known_view = guarded && known_view(first * PAGE);
+    // With [`guard_views`] also a block the guards once took for a view
+    // ([`VIEWS`]), and for an asking that leaves the guards out (textures)
+    // a block known so by its bits: the kernel refused those too.
+    let known_view = if guarded {
+        known_view(first * PAGE)
+    } else {
+        guard_views() && !view_ask() && known_view_unlocked(first)
+    };
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
@@ -773,7 +780,16 @@ fn writes_in(
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-        let (written, later) = written?;
+        let Some((written, later)) = written else {
+            // [`guard_views`]: known for a view by [`VIEWS`], and not one
+            // (other memory mapped there now): forgotten, and the kernel
+            // asked as before.
+            if known_view && guard_views() && forget_views(&VIEWS, first, last) {
+                drop(held);
+                return writes_in(start, end, guarded, light, runs, marks);
+            }
+            return None;
+        };
         arming = later;
         written
     } else {
@@ -900,19 +916,11 @@ const BLOCK: usize = PAGE;
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
 /// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
 fn known_view(start: usize) -> bool {
-    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ask = *ASK.get_or_init(|| {
-        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
-            .iter()
-            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
-    });
-    if ask {
+    if view_ask() {
         return false;
     }
     let first = start / BLOCK;
-    // The light refresh: a block known by its bit is read-only by our hand
-    // or a hole the guards noted, which is what they are asked below.
-    if light() && PUBLISHED.all(first, first + 1) {
+    if known_view_unlocked(first) {
         return true;
     }
     let g = guards();
@@ -920,6 +928,25 @@ fn known_view(start: usize) -> bool {
         || g.absent.contains(&first)
         || (view_known() && g.viewed.contains(&first))
         || g.untouched.holds(first)
+}
+
+/// `VICTORY_VIEW_ASK=1` (or `VICTORY_GUARD_ASK=1`): view memory is asked
+/// of the kernel all the same ([`known_view`]).
+fn view_ask() -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASK.get_or_init(|| {
+        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
+            .iter()
+            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
+    })
+}
+
+/// [`known_view`] of block `first` from the bits, with no lock: the light
+/// refresh's (a block known by its bit is read-only by our hand or a hole
+/// the guards noted, which is what they are asked) and, with
+/// [`guard_views`], [`VIEWS`].
+fn known_view_unlocked(first: usize) -> bool {
+    (light() && PUBLISHED.all(first, first + 1)) || (guard_views() && VIEWS.all(first, first + 1))
 }
 
 struct Guards {
@@ -1189,6 +1216,77 @@ fn view_known() -> bool {
             on
         }
     }
+}
+
+/// Whether the blocks the guards ever took for view memory are known as
+/// such by a bit of their own, with no lock, and the kernel's write watch
+/// is not asked about them (`VICTORY_GUARD_VIEWS=1`; off by default, and
+/// then nothing changes).
+///
+/// The kernel keeps no write watch for views and refuses every asking
+/// about them, some 300 a frame (avatarmanz/VIctory-7900XTX's renderer
+/// port #6, run guard-2): those of ranges whose first block a write has
+/// opened (no longer read-only, so nothing in the guards says it is a
+/// view: the "failed write-watch asking" lines), and those of the
+/// textures' askings that leave the guards out (`guarded` false), which
+/// were refused even for blocks the guards hold. With the switch a block
+/// is noted in [`VIEWS`] when the guards take it ([`guard_runs_at`]); a
+/// guarded asking about it goes to the guards at once, and an unguarded
+/// one is answered "not watched" at once, which is what the kernel said.
+/// A block wrongly there (other memory mapped at the address) is found no
+/// view by the guards ([`is_view`]): forgotten, and the kernel asked as
+/// before ([`writes_in`]).
+fn guard_views() -> bool {
+    #[cfg(test)]
+    {
+        VIEWS_IN_TEST.get()
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_VIEWS").is_some_and(|v| v == "1"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`guard_views`], for what this thread asks.
+    static VIEWS_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// With [`guard_views`]: the blocks the guards took for view memory, kept
+/// across the runtime's mappings there (a section's view, or the
+/// placeholder of one: the kernel's write watch refuses both). Set only by
+/// [`note_views`], cleared only by [`forget_views`].
+static VIEWS: Bits = Bits::new();
+
+/// The blocks `[first, last)` taken by the guards: known for view memory
+/// in `bits` ([`VIEWS`]).
+fn note_views(bits: &Bits, first: usize, last: usize) {
+    if !bits.all(first, last) {
+        (first..last).for_each(|block| bits.set(block));
+    }
+}
+
+/// What `bits` ([`VIEWS`]) knows of `[first, last)` is forgotten: whether
+/// it knew `first`.
+fn forget_views(bits: &Bits, first: usize, last: usize) -> bool {
+    let knew = bits.all(first, first + 1);
+    let mut word = first / 64;
+    while word * 64 < last {
+        // (Words with no bit, or never made, are passed over.)
+        let set = bits.word(word);
+        if set != 0 {
+            for bit in 0..64 {
+                let block = word * 64 + bit;
+                if set & (1 << bit) != 0 && (first..last).contains(&block) {
+                    bits.clear(block);
+                }
+            }
+        }
+        word += 1;
+    }
+    knew
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -2004,6 +2102,10 @@ fn guard_runs_at(
     }
     install();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // A view from now on, whether a write opens it ([`guard_views`]).
+    if guard_views() {
+        note_views(&VIEWS, first, last);
+    }
     let mut g = guards();
     // Blocks of the range another asking is making read-only outside the
     // lock ([`Arming`]): noted clean, and perhaps writable still. Read now
@@ -3251,6 +3353,43 @@ pub(crate) mod tests {
         assert_eq!(generation_at(&found, 5), Some(12));
         assert_eq!(generation_at(&found, 3), None);
         assert_eq!(generation_at(&[], 2), None);
+    }
+
+    /// Pure: the blocks known for views by their bits (`VICTORY_GUARD_VIEWS`,
+    /// [`VIEWS`]): noted as the guards take them, forgotten by range (whether
+    /// the first was known is said, for the asking to go to the kernel
+    /// again); without the switch nothing is known, as before.
+    #[test]
+    fn view_blocks_are_known_by_their_bits_until_forgotten() {
+        static BITS: Bits = Bits::new();
+        let known = |block: usize| BITS.all(block, block + 1);
+        // Without the switch nothing is looked at.
+        assert!(!guard_views());
+
+        note_views(&BITS, 3, 5);
+        assert!(known(3) && known(4) && !known(5) && !known(2));
+        note_views(&BITS, 3, 5);
+        assert!(BITS.all(3, 5), "noted again: unchanged");
+        // Across a word's edge, and words never made.
+        note_views(&BITS, 62, 66);
+        assert!(BITS.all(62, 66));
+        assert!(!forget_views(&BITS, 1 << 30, (1 << 30) + 64), "nothing there");
+        assert!(forget_views(&BITS, 4, 64), "its first block was known");
+        assert!(known(3) && !known(4) && !known(62) && !known(63));
+        assert!(known(64) && known(65), "outside the range: kept");
+        assert!(!forget_views(&BITS, 4, 5), "forgotten already");
+        assert!(forget_views(&BITS, 3, 100));
+        assert!((0..100).all(|b| !known(b)));
+
+        // With the switch, `VIEWS` itself answers without the guards' lock.
+        VIEWS_IN_TEST.set(true);
+        let block = (1 << 34) / BLOCK;
+        assert!(!known_view_unlocked(block) || light());
+        note_views(&VIEWS, block, block + 1);
+        assert!(known_view_unlocked(block));
+        assert!(forget_views(&VIEWS, block, block + 1));
+        VIEWS_IN_TEST.set(false);
+        assert!(!VIEWS.all(block, block + 1));
     }
 
     /// Pure: a recorded page stays untouched only if every other address of

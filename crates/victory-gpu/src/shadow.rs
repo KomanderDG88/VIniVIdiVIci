@@ -1752,6 +1752,21 @@ fn give_back_with(
     drop(dropped);
 }
 
+/// Empties [`POOL`] (after LoverCatys/ruff-lab `e234e609`'s `drain_pools`;
+/// it has no `EXACT_POOL` here): for `VICTORY_OOM_RECLAIM=1` when the card
+/// refused a buffer (`crate::host`'s `reclaim_for_oom`). Left alone if the
+/// pool is held (perhaps by the thread that asked). The committed bytes let
+/// go.
+pub(crate) fn drain_pools() -> u64 {
+    let gone = match POOL.try_lock() {
+        Ok(mut pool) => std::mem::take(&mut *pool),
+        Err(std::sync::TryLockError::Poisoned(e)) => std::mem::take(&mut *e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => return 0,
+    };
+    // Let go outside the lock.
+    gone.iter().map(|entry| entry.buf.committed_bytes() as u64).sum()
+}
+
 /// Immediately releases all idle committed bytes in [`POOL`] under commit pressure.
 fn trim_pool_panic() {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
