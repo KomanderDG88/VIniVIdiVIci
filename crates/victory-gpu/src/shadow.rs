@@ -3124,8 +3124,10 @@ mod merge_tests {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             seed >> 8
         };
-        for round in 0..200 {
-            let n = 4 * (random() as usize % 400);
+        // Lengths of whole words up to ~8 KB: most are not a multiple of the
+        // AVX2 loop's 256 bytes, so the remainders take the dword path.
+        for round in 0..400 {
+            let n = 4 * (random() as usize % 2000);
             let was: Vec<u8> = (0..n).map(|_| random() as u8).collect();
             let mut now = was.clone();
             for _ in 0..random() % 200 {
