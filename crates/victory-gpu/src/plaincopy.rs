@@ -273,10 +273,13 @@ pub(crate) const fn least() -> usize {
 }
 
 /// With the frame line: what [`copy`] did per frame over `frames`. (Also
-/// the line of `crate::launch`, said from here: `host.rs`, which says the
-/// frame line, is kept under the tree's size limit for a source file.)
+/// the lines of `crate::launch` and `crate::recorded`, said from here:
+/// `host.rs`, which says the frame line, is kept under the tree's size
+/// limit for a source file.)
 pub(crate) fn line(frames: f64) {
     crate::launch::line(frames);
+    // And the recording's (`VICTORY_LAZY_REMAP=1`; nothing without it).
+    crate::recorded::line();
     if mode() == 0 {
         return;
     }

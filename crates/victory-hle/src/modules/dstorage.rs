@@ -1205,6 +1205,13 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
+        // Recorded pages get their views first (`VICTORY_LAZY_REMAP=1`;
+        // nothing without it): the guards' handling below then applies to
+        // real views. A destination that cannot have them fails the request.
+        if !super::xmem::lazy::materialize(request.destination as usize, len) {
+            const ERROR_NOACCESS: i32 = 998;
+            return Err(from_win32(&std::io::Error::from_raw_os_error(ERROR_NOACCESS)));
+        }
         // Opens the guarded blocks and tells the GPU side a placed texture
         // there changes. `fill` writes from user mode (a file read is read
         // beside first, see `execute`), so a block guarded again meanwhile

@@ -8494,7 +8494,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
     // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+    // Recorded pages (`VICTORY_LAZY_REMAP=1`) through their stable view
+    // first: the system reports them not there.
+    let whole = crate::recorded::copy(src, dst, len, read_plain)
+        .unwrap_or_else(|| (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -8539,7 +8542,12 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             read_pieces(at, to, remaining);
             break;
         }
-        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+        if info.State != MEM_COMMIT && crate::recorded::present_bytes(at as usize, n) != 0 {
+            // Recorded pages (`VICTORY_LAZY_REMAP=1`): reserved to the
+            // system, read through their stable view; what lies between
+            // them reads as zeros.
+            read_pieces(at, to, n);
+        } else if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
@@ -8578,12 +8586,21 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     crate::backreads::touched(src as usize, dst.len(), false);
     // In place first, if asked for (`crate::plaincopy`): the destination is
     // memory of ours, as in `copy_mapped`.
-    crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
+    // Recorded pages (`VICTORY_LAZY_REMAP=1`) through their stable view.
+    let (to, len) = (dst.as_mut_ptr(), dst.len());
+    crate::recorded::copy(src, to, len, read_plain)
+        .unwrap_or_else(|| crate::plaincopy::copy(to, src, len) || read(src, to, len))
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// readable; recorded pages (`VICTORY_LAZY_REMAP=1`) on either side go
+/// through their stable view.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    crate::recorded::copy(src, dst, len, read_plain).unwrap_or_else(|| read_plain(src, dst, len))
+}
+
+/// [`read`] through the kernel alone.
+fn read_plain(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -8620,10 +8637,20 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     #[cfg(feature = "diagnostics")]
     crate::backreads::touched(dst as usize, len, true);
+    // Recorded pages (`VICTORY_LAZY_REMAP=1`) through their stable view,
+    // the rest as usual.
+    let plain = |at: usize, n: usize| write_plain(at as *mut u8, src.wrapping_add(at - dst as usize), n);
+    if !crate::recorded::write(dst, src, len, plain) {
+        write_plain(dst, src, len);
+    }
+}
+
+/// [`write_mapped`] through the kernel alone.
+fn write_plain(dst: *mut u8, src: *const u8, len: usize) {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);

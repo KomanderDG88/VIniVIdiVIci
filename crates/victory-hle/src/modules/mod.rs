@@ -69,6 +69,13 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(net::module());
     #[cfg(windows)]
     all.push(xmem::module());
+    // The title's memory calls, only while page mappings are recorded
+    // (`VICTORY_LAZY_REMAP=1`): without the switch they go to the host as
+    // before.
+    #[cfg(windows)]
+    if xmem::lazy::enabled() {
+        all.push(xmem::lazy::module());
+    }
     #[cfg(windows)]
     all.push(xsystem::module());
     all

@@ -32,6 +32,9 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+/// Page mappings recorded without the system (`VICTORY_LAZY_REMAP=1`).
+pub(crate) mod lazy;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -141,6 +144,13 @@ fn virtual_alloc(
     if placeholder {
         kind |= MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
     }
+    // Other memory in place of part of a placeholder reservation: that part
+    // is reused, so nothing is recorded there any more, and it must have
+    // the boundaries the eager path would have given it
+    // (`VICTORY_LAZY_REMAP=1`; nothing without it).
+    if !base.is_null() && kind & MEM_REPLACE_PLACEHOLDER != 0 && !lazy::reuse(base as usize, size) {
+        return std::ptr::null_mut();
+    }
     let mut parameter = MEM_EXTENDED_PARAMETER::default();
     parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
@@ -172,6 +182,11 @@ fn virtual_alloc(
             constrained.into(),
         )
     };
+    // A placeholder reservation of the title's: where page-mapping copies
+    // may be recorded (`VICTORY_LAZY_REMAP=1`; nothing without it).
+    if placeholder && base.is_null() && !at.is_null() {
+        lazy::note_reservation(at as usize, size);
+    }
     if base.is_null() {
         // The census keeps what the title asked for (`VICTORY_CENSUS`).
         #[cfg(windows)]
@@ -222,6 +237,11 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
+        // A recorded page reads as the eager path's view
+        // (`VICTORY_LAZY_REMAP=1`; nothing without it).
+        if lazy::enabled() {
+            lazy::adjust_query(address as usize, &mut info.host);
+        }
         info.flags = if info.host.State == MEM_COMMIT {
             GRAPHICS
         } else {
@@ -531,6 +551,9 @@ struct Section {
     /// temporary view, so a run with the switch on can tell which sections
     /// are really persistent.
     fallback_noted: OnceLock<()>,
+    /// Whether a warn has been said that this section's pages stay eager
+    /// with `VICTORY_LAZY_REMAP=1` (its stable view was refused).
+    lazy_refused: OnceLock<()>,
     /// Bytes `[from, from + len)` of this section, from its start, that live
     /// persistent views hold. The section has one address, so two writers may
     /// share it only when their bytes do not touch; a claim that does is
@@ -551,6 +574,7 @@ impl Section {
             size,
             committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
             fallback_noted: OnceLock::new(),
+            lazy_refused: OnceLock::new(),
             holding: Mutex::new(Vec::new()),
         }
     }
@@ -1166,13 +1190,18 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
     let mut pieces: Vec<(usize, usize)> = Vec::new();
     {
         let physical = physical();
+        let recorded = lazy::enabled();
         for (i, page) in touched.iter().enumerate() {
-            let Some(addresses) = physical.pages.get(page).and_then(|slice| physical.shown.get(&slice.key(0))) else {
-                continue;
-            };
             // The bytes of this page that the write covers.
             let lo = if i == 0 { offset % PAGE } else { 0 };
             let hi = (end - (first + i) * PAGE).min(PAGE);
+            // Recorded pages show it too (`VICTORY_LAZY_REMAP=1`).
+            if recorded && let Some(slice) = physical.pages.get(page) {
+                pieces.extend(lazy::shown(slice.key(0)).into_iter().map(|at| (at + lo, hi - lo)));
+            }
+            let Some(addresses) = physical.pages.get(page).and_then(|slice| physical.shown.get(&slice.key(0))) else {
+                continue;
+            };
             pieces.extend(addresses.iter().map(|&at| (at + lo, hi - lo)));
         }
     }
@@ -1224,6 +1253,11 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping(base, n * PAGE);
+    // Pages recorded there go first (`VICTORY_LAZY_REMAP=1`; nothing
+    // without it).
+    if !lazy::clear(base, n * PAGE) {
+        return std::ptr::null_mut();
+    }
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -1311,6 +1345,15 @@ fn alias(to: usize, from: usize, len: usize) -> bool {
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping(to, len);
+    // Recorded, with no system call, where it can be
+    // (`VICTORY_LAZY_REMAP=1`); else eager, from a destination without
+    // records.
+    if let Some(mapped) = lazy::alias(&mut physical, to, from, len) {
+        return mapped;
+    }
+    if !lazy::clear(to, len) {
+        return false;
+    }
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
