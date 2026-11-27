@@ -8632,29 +8632,31 @@ const WIDE_READ_MIN: usize = 4 << 20;
 const WIDE_READ_CHUNK: usize = 2 << 20;
 
 /// [`read`] of a long range, its bytes read by several threads at once
-/// (`crate::shadow::wide`). False if any piece was not readable: the caller
-/// reads the whole range again the slow way, over the bytes it already has.
+/// (`crate::shadow::wide_pieces`). False if any piece was not readable: the
+/// caller reads the whole range again the slow way, over the bytes it already
+/// has.
 ///
 /// The pieces are disjoint parts of one destination, and the kernel's read
 /// of them shares nothing: on a machine with cores to spare this is the one
-/// copy that ran on one thread, at the speed of that thread's memory.
+/// copy that ran on one thread, at the speed of that thread's memory. The
+/// calling thread reads pieces too and runs no other job while it waits:
+/// it may hold the submission's lock, a shadow's or a texture's.
 fn read_wide(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     let (src, dst) = (src as usize, dst as usize);
     let whole = std::sync::Arc::new(AtomicBool::new(true));
-    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(len.div_ceil(WIDE_READ_CHUNK));
-    for at in (0..len).step_by(WIDE_READ_CHUNK) {
+    let pieces = len.div_ceil(WIDE_READ_CHUNK);
+    let piece_whole = whole.clone();
+    crate::shadow::wide_pieces(pieces, move |i| {
+        let at = i * WIDE_READ_CHUNK;
         let n = WIDE_READ_CHUNK.min(len - at);
-        let whole = whole.clone();
-        jobs.push(Box::new(move || {
-            // SAFETY: a piece of the caller's range, which it vouches for.
-            let (src, dst) = unsafe { ((src as *const u8).add(at), (dst as *mut u8).add(at)) };
-            if !read(src, dst, n) {
-                whole.store(false, Relaxed);
-            }
-        }));
-    }
-    crate::shadow::wide_run(jobs);
+        // SAFETY: a piece of the caller's range, which it vouches for; every
+        // piece is done before `wide_pieces` returns.
+        let (src, dst) = unsafe { ((src as *const u8).add(at), (dst as *mut u8).add(at)) };
+        if !read(src, dst, n) {
+            piece_whole.store(false, Relaxed);
+        }
+    });
     whole.load(Relaxed)
 }
 

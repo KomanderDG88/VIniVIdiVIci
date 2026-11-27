@@ -309,34 +309,35 @@ pub(crate) fn sync_heaps() {
         // records are mirrored in one go under one lock
         // (`HostHeap::mirror_copied_page`), so the pages can be looked at in
         // any order; the reads and compares around that lock, which are most
-        // of the work, no longer wait for each other.
+        // of the work, no longer wait for each other. This thread looks at
+        // parts too and runs no other job while it waits
+        // (`crate::shadow::wide_pieces`): it holds the registry and the pass's
+        // own lock.
         let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
         let done = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64, 0u64)));
-        let threads = crate::shadow::wide_count().min(work.len()).max(1);
-        let per = work.len().div_ceil(threads);
-        let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(threads);
-        for part in work.chunks(per) {
-            let part = part.to_vec();
-            let (gate, done) = (gate.clone(), done.clone());
-            jobs.push(Box::new(move || {
-                // One page of bytes and one list of the slots to mirror for
-                // the job's pages, not one per page.
-                let mut page_bytes: Vec<u8> = Vec::new();
-                let mut due: Vec<(u32, u64)> = Vec::new();
-                let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
-                for look in &part {
-                    let (at_pages, at_looked, at_mirrored) = look.take(&mut page_bytes, &mut due, &gate);
-                    pages += at_pages;
-                    looked += at_looked;
-                    mirrored += at_mirrored;
-                }
-                let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
-                done.0 += pages;
-                done.1 += looked;
-                done.2 += mirrored;
-            }));
-        }
-        crate::shadow::wide_run(jobs);
+        let parts = (crate::shadow::wide_count() * 2).min(work.len()).max(1);
+        let per = work.len().div_ceil(parts);
+        let count = work.len().div_ceil(per);
+        let work = std::sync::Arc::new(work);
+        let (part_gate, part_done) = (gate.clone(), done.clone());
+        crate::shadow::wide_pieces(count, move |i| {
+            let part = &work[i * per..((i + 1) * per).min(work.len())];
+            // One page of bytes and one list of the slots to mirror for the
+            // part's pages, not one per page.
+            let mut page_bytes: Vec<u8> = Vec::new();
+            let mut due: Vec<(u32, u64)> = Vec::new();
+            let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+            for look in part {
+                let (at_pages, at_looked, at_mirrored) = look.take(&mut page_bytes, &mut due, &part_gate);
+                pages += at_pages;
+                looked += at_looked;
+                mirrored += at_mirrored;
+            }
+            let mut done = part_done.lock().unwrap_or_else(|e| e.into_inner());
+            done.0 += pages;
+            done.1 += looked;
+            done.2 += mirrored;
+        });
         let (at_pages, at_looked, at_mirrored) = *done.lock().unwrap_or_else(|e| e.into_inner());
         pages += at_pages;
         looked += at_looked;

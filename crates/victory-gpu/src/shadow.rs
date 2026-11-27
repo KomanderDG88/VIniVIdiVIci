@@ -1923,6 +1923,167 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// Runs `piece(0)` to `piece(pieces - 1)`, each exactly once, on this thread
+/// and on kept threads of [`wide`] that are free to help, and returns when
+/// all of them are done (the pieces of `crate::host::read_wide` and of
+/// `crate::descriptor::sync_heaps`).
+///
+/// Unlike [`wide`], this thread runs no job but its own: its callers hold
+/// locks (the submission's, a shadow's, a texture's) and a job of someone
+/// else's taken from the shared queue while they wait (a relay, a refresh)
+/// could want one of them, or keep them held for as long as it runs. The
+/// pieces are claimed through one counter shared by this thread and the
+/// helpers it posts; this thread claims and does pieces until none is left,
+/// then waits only for the pieces of its own batch that helpers are still
+/// doing. A helper that starts late finds nothing to claim and returns; with
+/// the pool busy, this thread does every piece, as one thread did before.
+pub(crate) fn wide_pieces(pieces: usize, piece: impl Fn(usize) + Send + Sync + 'static) {
+    if pieces < 2 || !wide_available() {
+        for i in 0..pieces {
+            in_wide(|| piece(i));
+        }
+        return;
+    }
+    let helpers = wide_threads().min(pieces - 1);
+    run_pieces(pieces, Box::new(piece), helpers, |jobs| {
+        let workers = workers();
+        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.len() >= wide_threads() {
+            // Every kept thread has work queued already: this one does all.
+            return;
+        }
+        queue.extend(jobs);
+        drop(queue);
+        workers.more.notify_all();
+    });
+}
+
+/// One batch of [`wide_pieces`].
+struct Pieces {
+    count: usize,
+    /// The next piece to claim; at `count` or past it, none is left.
+    next: std::sync::atomic::AtomicUsize,
+    /// The pieces done, and the word that all are.
+    done: Mutex<usize>,
+    all: std::sync::Condvar,
+    piece: Box<dyn Fn(usize) + Send + Sync>,
+}
+
+impl Pieces {
+    /// Claims and does pieces of this batch until none is left to claim.
+    fn work(&self) {
+        let mut did = 0;
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if i >= self.count {
+                break;
+            }
+            in_wide(|| (self.piece)(i));
+            did += 1;
+        }
+        if did > 0 {
+            let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+            *done += did;
+            if *done == self.count {
+                self.all.notify_all();
+            }
+        }
+    }
+
+    /// Waits until every piece is done (the claimed ones by other threads).
+    fn wait(&self) {
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        while *done < self.count {
+            done = self.all.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// [`wide_pieces`] with `helpers` helper jobs handed to `post` (the kept
+/// threads' queue, or in tests a list never run, or threads of their own).
+fn run_pieces(
+    count: usize,
+    piece: Box<dyn Fn(usize) + Send + Sync>,
+    helpers: usize,
+    post: impl FnOnce(Vec<Job>),
+) {
+    let batch = Arc::new(Pieces {
+        count,
+        next: std::sync::atomic::AtomicUsize::new(0),
+        done: Mutex::new(0),
+        all: std::sync::Condvar::new(),
+        piece,
+    });
+    let jobs: Vec<Job> = (0..helpers)
+        .map(|_| {
+            let batch = batch.clone();
+            Box::new(move || batch.work()) as Job
+        })
+        .collect();
+    post(jobs);
+    batch.work();
+    batch.wait();
+}
+
+#[cfg(test)]
+mod pieces_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn counters(n: usize) -> Arc<Vec<AtomicUsize>> {
+        Arc::new((0..n).map(|_| AtomicUsize::new(0)).collect())
+    }
+
+    fn counting(seen: &Arc<Vec<AtomicUsize>>) -> Box<dyn Fn(usize) + Send + Sync> {
+        let seen = seen.clone();
+        Box::new(move |i| {
+            seen[i].fetch_add(1, Ordering::Relaxed);
+        })
+    }
+
+    #[test]
+    fn helpers_never_scheduled_leave_the_batch_to_the_caller() {
+        let seen = counters(37);
+        let mut parked: Vec<Job> = Vec::new();
+        run_pieces(37, counting(&seen), 4, |jobs| parked = jobs);
+        assert_eq!(parked.len(), 4);
+        assert!(seen.iter().all(|n| n.load(Ordering::Relaxed) == 1));
+        // Helpers that start after the batch is done find nothing to claim.
+        for job in parked {
+            job();
+        }
+        assert!(seen.iter().all(|n| n.load(Ordering::Relaxed) == 1));
+    }
+
+    #[test]
+    fn helpers_racing_the_caller_do_each_piece_once() {
+        for round in 0..200 {
+            let count = 1 + round % 64;
+            let seen = counters(count);
+            let mut threads = Vec::new();
+            run_pieces(count, counting(&seen), 4, |jobs| {
+                threads.extend(jobs.into_iter().map(std::thread::spawn));
+            });
+            // Every piece is done when the caller returns, helpers or not.
+            assert!(seen.iter().all(|n| n.load(Ordering::Relaxed) == 1), "round {round}");
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert!(seen.iter().all(|n| n.load(Ordering::Relaxed) == 1), "round {round}");
+        }
+    }
+
+    #[test]
+    fn through_the_kept_threads_each_piece_once() {
+        for count in [0, 1, 2, 3, 17, 64] {
+            let seen = counters(count);
+            let piece = counting(&seen);
+            wide_pieces(count, move |i| piece(i));
+            assert!(seen.iter().all(|n| n.load(Ordering::Relaxed) == 1), "count {count}");
+        }
+    }
+}
+
 /// Whether a long copy of title memory (`crate::host::copy_mapped`) and the
 /// pages of the pass over the view heaps (`crate::descriptor::sync_heaps`)
 /// are read by several threads of [`wide`] at once (`VICTORY_WIDE_READS=1`;
@@ -1954,7 +2115,7 @@ thread_local! {
 }
 
 /// Runs one job of [`wide`], marked as such for [`in_wide_job`].
-fn in_wide(job: Box<dyn FnOnce() + Send>) {
+fn in_wide(job: impl FnOnce()) {
     struct Unmark;
     impl Drop for Unmark {
         fn drop(&mut self) {
