@@ -10289,6 +10289,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             Some(instance.into()),
             None,
         )
+        .inspect(|hwnd| crate::window_icon::apply(hwnd.0))
     }
 }
 

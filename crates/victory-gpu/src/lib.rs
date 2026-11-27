@@ -106,6 +106,7 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+pub mod window_icon;
 #[cfg(windows)]
 mod windowskip;
 #[cfg(windows)]
