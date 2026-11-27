@@ -407,10 +407,9 @@ pub(crate) fn removal_note() -> String {
 pub(crate) fn trim() {
     static ON: OnceLock<bool> = OnceLock::new();
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
-    if at == 0
-        || TRIMMED.load(Ordering::Relaxed)
-        || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
-    {
+    // (The `TRIMMED` check is below: under low memory a trim may come
+    // again before a load clears it.)
+    if at == 0 || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0")) {
         return;
     }
     let avail = crate::host::available_physical_ram();
@@ -430,7 +429,7 @@ pub(crate) fn trim() {
         TRIMMED_AT.store(now, Ordering::Relaxed);
         let n = LOW_TRIMS.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::info!(
-            "pipeline library: its mapped pages let go while pipelines still load, the PC's available memory              being {} MB, under {} MB (VICTORY_LIBRARY_TRIM_LOW_MB; {} MB of view; {n} such so far)",
+            "pipeline library: its mapped pages let go while pipelines still load, the PC's available memory being {} MB, under {} MB (VICTORY_LIBRARY_TRIM_LOW_MB; {} MB of view; {n} such so far)",
             avail.unwrap_or(0) >> 20,
             low_mb().unwrap_or(0),
             len >> 20,
