@@ -145,3 +145,29 @@ fn warp_adapter_accepts_only_software() {
         desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
     );
 }
+
+/// [`Batch::fill`] ([`wide_fills`]): every fill put off lands where its
+/// step said, one after the other below `FEW` and in pieces above it.
+#[test]
+fn fills_put_off_are_all_done() {
+    for count in [3usize, 500] {
+        let source: Vec<u8> = (0..count * 40).map(|i| (i * 7 + 3) as u8).collect();
+        let mut out = vec![0u8; count * 48];
+        let mut batch = Batch::default();
+        for i in 0..count {
+            // 40 bytes of the source into a slot of 48, the rest left as is.
+            let dst = out.as_mut_ptr() as usize + i * 48;
+            let src = source.as_ptr() as usize + i * 40;
+            batch.fills.push((dst, src, 40));
+        }
+        batch.fill();
+        assert!(batch.fills.is_empty());
+        for i in 0..count {
+            let (got, want) = (&out[i * 48..i * 48 + 40], &source[i * 40..i * 40 + 40]);
+            assert_eq!(got, want, "fill {i} of {count}");
+            assert!(out[i * 48 + 40..i * 48 + 48].iter().all(|&b| b == 0));
+        }
+        // Nothing noted: nothing done.
+        batch.fill();
+    }
+}

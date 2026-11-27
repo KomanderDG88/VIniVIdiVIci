@@ -1494,6 +1494,9 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    // Fills put off read title memory as it is before the
+                    // write ([`wide_fills`]).
+                    batch.fill();
                     if near_writes() {
                         batch.title_wrote_near(dst, len, false);
                     } else {
@@ -1524,6 +1527,13 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                     crate::port::filled(src, len);
+                    if wide_fills() {
+                        // Done with the others before the next write of
+                        // ours or step of ours ([`Batch::fill`]).
+                        batch.fills.push((dst, src, len));
+                        preparing(1, len as u64);
+                        continue;
+                    }
                     copy_fill(dst as *mut u8, src as *const u8, len);
                     len
                 }
@@ -1541,6 +1551,7 @@ impl HostList {
                     // to date first and checked again after it, and the
                     // submission's one asking stands, told of the write, as
                     // for a title buffer copy ([`near_writes`]).
+                    batch.fill();
                     let written = batch.title_wrote_near(*at, *len, true);
                     work();
                     for &(from, to) in &written {
@@ -1554,6 +1565,7 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work, _) | Step::Host(work, _) => {
+                    batch.fill();
                     if matches!(step, Step::Run(..)) {
                         batch.title_written();
                     } else if !batch.due_textures.is_empty() {

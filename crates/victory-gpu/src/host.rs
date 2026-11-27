@@ -7275,6 +7275,8 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        // The fills put off ([`wide_fills`]): done before the lists go on.
+        batch.fill();
         part = prep_part(1, part);
         batch.flush();
         crate::watch::ask_once_end();
@@ -7980,9 +7982,58 @@ struct Batch {
     /// staging buffers in `textures`, by the same key. A texture without
     /// an entry is checked again after any write of ours.
     texture_spans: std::collections::HashMap<usize, (usize, usize)>,
+    /// With [`wide_fills`]: fills not done yet (destination, source, bytes),
+    /// done by [`Batch::fill`].
+    fills: Vec<(usize, usize, usize)>,
+}
+
+/// Whether the fills of a submission's upload memory are done together on
+/// several threads (`VICTORY_WIDE_FILLS=1`; off by default: one after the
+/// other, where the lists name them, as before). After avatarmanz's
+/// aff4def0, on by default there (`=0` turned it off).
+///
+/// They are 7,000 to 12,000 a frame, some 500 bytes each, 5 ms of the
+/// submitting thread (theirs). Each reads title memory and writes upload
+/// memory that the card alone reads, when the lists run: none reads what
+/// another writes. They are done before the next step that writes title
+/// memory or runs code of ours (a title buffer copy, a `Run`, a `Host`),
+/// and before the submission goes on from its steps (the last refreshes,
+/// the snapshots, the lists to the card). What changes: a fill reads
+/// title memory a little later in the preparing than its step, never
+/// after a write of ours that came after it. Unset, nothing is put off.
+fn wide_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_FILLS").is_some_and(|v| v == "1"))
 }
 
 impl Batch {
+    /// With [`wide_fills`]: the fills noted are done, several at a time
+    /// when there are many (`crate::shadow::wide_pieces`, this thread among
+    /// them), all done before it returns. The time counted is the time it
+    /// took, not the threads' sum; the bytes were counted when noted.
+    fn fill(&mut self) {
+        // Below this many the threads cost more than they save (theirs).
+        const FEW: usize = 96;
+        const PART: usize = 64;
+        if self.fills.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        if self.fills.len() < FEW {
+            for (dst, src, len) in self.fills.drain(..) {
+                copy_fill(dst as *mut u8, src as *const u8, len);
+            }
+        } else {
+            let fills = std::mem::take(&mut self.fills);
+            crate::shadow::wide_pieces(fills.len().div_ceil(PART), move |i| {
+                for &(dst, src, len) in fills.iter().skip(i * PART).take(PART) {
+                    copy_fill(dst as *mut u8, src as *const u8, len);
+                }
+            });
+        }
+        preparing(0, started.elapsed().as_micros() as u64);
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
