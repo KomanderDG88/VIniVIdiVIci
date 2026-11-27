@@ -43,6 +43,89 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// The parts of a page ([`KERNEL_PAGE`] each).
+pub(crate) const PARTS: usize = PAGE / KERNEL_PAGE;
+/// All of them, a bit each.
+pub(crate) const WHOLE: u16 = u16::MAX;
+
+/// Whether the journal keeps, for each 4 KiB part of a page the kernel's write watch found written, the asking that
+/// last found that part written, and a refresh copies only the parts written since its copy took the page
+/// (`VICTORY_PAGE_PARTS=1`; off by default: the 64 KiB page, as before). What is checked stays a page.
+///
+/// The kernel says which 4 KiB pages were written, and a copy took the 64 KiB around each: 29 MB a frame written so
+/// were most of 114 MB copied, and as much sent up and hashed again on the card (avatarmanz/VIctory-7900XTX 3ead56e1,
+/// session play-1125-0203, run cpu-2). Next to `VICTORY_DIRTY_4K` ([`dirty4k`]), which keeps only the 4 KiB pages of
+/// a page's last asking and narrows a copy only if it took the page at or after the asking before that, this keeps
+/// the last asking of every part, so a copy that took the page any number of askings ago is narrowed too. Pages noted
+/// written another way (the guards of view memory, our own writes) count as written whole, as with that switch.
+///
+/// Off by default here (on in avatarmanz): unset, the journal keeps no parts, the map stays empty and every refresh
+/// copies what it copied before.
+pub(crate) fn parts_on() -> bool {
+    #[cfg(test)]
+    {
+        PARTS_IN_TEST.get()
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_some_and(|v| v == "1"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`parts_on`], for what this thread notes and copies.
+    pub(crate) static PARTS_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl Journal {
+    /// Page `page` was found written at asking `now` (and its entry of `written` already says so), the parts in
+    /// `parts` (a bit each; [`WHOLE`]: all of it, or not known); `before`, the asking that had found it written before
+    /// (0: never). With [`parts_on`] the parts' askings are kept ([`Journal::parts`]); a page noted whole, or any page
+    /// without the switch, has its entry taken away, and counts as written whole.
+    fn note_parts(&mut self, page: usize, parts: u16, now: u64, before: u64) {
+        if parts == WHOLE || !parts_on() {
+            self.parts.remove(&page);
+            return;
+        }
+        // Noted whole by this same asking already (our own writes under a standing asking): stays whole.
+        if before == now && !self.parts.contains_key(&page) {
+            return;
+        }
+        // Not here: written whole at `before`, as far as anyone knows.
+        let all = self.parts.entry(page).or_insert([before; PARTS]);
+        for (k, at) in all.iter_mut().enumerate() {
+            if parts >> k & 1 != 0 {
+                *at = now;
+            }
+        }
+    }
+
+    /// The parts of `page` written by an asking after `taken`, a bit each ([`WHOLE`] if not known).
+    #[cfg(test)]
+    fn parts_since(&self, page: usize, taken: u64) -> u16 {
+        self.parts.get(&page).map_or(WHOLE, |all| parts_after(all, taken))
+    }
+}
+
+/// Of a page's parts' askings ([`Journal::parts`]), those after `taken`, a bit each.
+pub(crate) fn parts_after(all: &[u64; PARTS], taken: u64) -> u16 {
+    all.iter().enumerate().filter(|(_, at)| **at > taken).fold(0, |m, (k, _)| m | 1 << k)
+}
+
+/// With [`parts_on`]: the entries of [`Journal::parts`] for the pages of `[start, end)`, in page order. Empty without
+/// the switch. Read once the refresh's asking is done (later askings only add parts, or take an entry away, which
+/// makes the page whole: what a copy takes is never less than it would have taken at the asking).
+pub(crate) fn parts_of(start: usize, end: usize) -> Vec<(usize, [u64; PARTS])> {
+    if !parts_on() || start >= end {
+        return Vec::new();
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.parts.range(first..last).map(|(&p, all)| (p, *all)).collect()
+}
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
@@ -75,6 +158,10 @@ struct Journal {
     /// `k * 4096..(k + 1) * 4096` of the page). Only where the kernel's write watch answered: a page noted written
     /// any other way (the guards, our own writes) has no entry, and counts as written whole.
     sub: BTreeMap<usize, (u64, u64, u16)>,
+    /// With `VICTORY_PAGE_PARTS=1` ([`parts_on`]): page number → for each of its sixteen 4 KiB parts
+    /// ([`KERNEL_PAGE`]), the asking that last found that part written. A page that is not here was written whole,
+    /// as far as anyone knows: every note that does not name parts takes its entry away ([`Journal::note_parts`]).
+    parts: BTreeMap<usize, [u64; PARTS]>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -92,6 +179,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: Written::new(),
     sub: BTreeMap::new(),
+    parts: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -299,6 +387,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
         j.sub.remove(&page);
+        j.parts.remove(&page);
     }
 }
 
@@ -323,10 +412,12 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     }
     let before = j.written.insert(page, now).unwrap_or(0);
     j.sub.remove(&page);
+    j.parts.remove(&page);
     for &other in others {
         if other != page {
             j.written.insert(other, now);
             j.sub.remove(&other);
+            j.parts.remove(&other);
         }
     }
     (before, now)
@@ -398,14 +489,17 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 }
 
 /// Notes in the journal that the kernel's asking `now` found the 4 KiB page at `at` written: its 64 KiB page as
-/// written at `now`, and with [`dirty4k_kept`] which of its 4 KiB pages the asking found ([`Journal::sub`]).
+/// written at `now`, and with [`dirty4k_kept`] which of its 4 KiB pages the asking found ([`Journal::sub`]); with
+/// [`parts_on`], the part's asking ([`Journal::parts`]).
 fn note_kernel(j: &mut Journal, at: usize, now: u64) {
     let page = at / PAGE;
     let before = j.written.insert(page, now).unwrap_or(0);
+    let bit = 1u16 << ((at % PAGE) / KERNEL_PAGE);
+    // (Without `VICTORY_PAGE_PARTS` this takes away an entry there is none of.)
+    j.note_parts(page, bit, now, before);
     if !dirty4k_kept() {
         return;
     }
-    let bit = 1u16 << ((at % PAGE) / KERNEL_PAGE);
     if before == now {
         // Found again in the same asking: one more 4 KiB page of it. A page this asking already noted whole (our
         // own writes under a standing asking) stays whole: it has no entry.
@@ -707,6 +801,7 @@ fn writes_in(
     for &page in &pages[count..] {
         j.written.insert(page, now);
         j.sub.remove(&page);
+        j.parts.remove(&page);
     }
     // The light refresh: the guards were asked, and what they found is
     // noted. The blocks they made clean are known by their bits from now
@@ -3736,6 +3831,91 @@ pub(crate) mod tests {
         BITS.set(1 << 40);
         BITS.clear(1 << 40);
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+
+    /// `VICTORY_PAGE_PARTS`: the parts of a page written since a copy took it (avatarmanz 3ead56e1's test, on
+    /// this journal).
+    #[test]
+    fn the_parts_of_a_page_written_since_it_was_taken() {
+        PARTS_IN_TEST.set(true);
+        let mut j = Journal {
+            asked: 0,
+            written: Written::new(),
+            sub: BTreeMap::new(),
+            parts: BTreeMap::new(),
+            found: Vec::new(),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        // As the journal's writers note: the page first, then its parts; the asking noted before.
+        let note = |j: &mut Journal, page: usize, parts: u16, now: u64| {
+            let before = j.written.insert(page, now).unwrap_or(0);
+            j.note_parts(page, parts, now, before);
+            before
+        };
+        assert_eq!(j.parts_since(7, 0), WHOLE);
+        assert_eq!(note(&mut j, 7, WHOLE, 3), 0);
+        // Parts 0 and 5 at 4, part 5 again at 6: at 2 the whole page is due.
+        assert_eq!(note(&mut j, 7, 0b10_0001, 4), 3);
+        assert_eq!(note(&mut j, 7, 0b10_0000, 6), 4);
+        assert_eq!(j.parts_since(7, 2), WHOLE);
+        assert_eq!(j.parts_since(7, 3), 0b10_0001);
+        assert_eq!(j.parts_since(7, 4), 0b10_0000);
+        assert_eq!(j.parts_since(7, 5), 0b10_0000);
+        assert_eq!(j.parts_since(7, 6), 0);
+        // Written whole: all of it, whoever took it before.
+        assert_eq!(note(&mut j, 7, WHOLE, 8), 6);
+        assert_eq!(j.parts_since(7, 7), WHOLE);
+        // A page never written before: what was not named was never written.
+        assert_eq!(note(&mut j, 9, 0b100, 9), 0);
+        assert_eq!(j.parts_since(9, 5), 0b100);
+        // Noted whole by an asking, then in part by the same one: whole.
+        assert_eq!(note(&mut j, 11, WHOLE, 10), 0);
+        assert_eq!(note(&mut j, 11, 0b1, 10), 10);
+        assert_eq!(j.parts_since(11, 5), WHOLE);
+        // Without the switch a note keeps no parts and takes away what was kept.
+        PARTS_IN_TEST.set(false);
+        assert_eq!(note(&mut j, 9, 0b1, 12), 9);
+        assert_eq!(j.parts_since(9, 10), WHOLE);
+        assert!(j.parts.is_empty());
+    }
+
+    /// `VICTORY_PAGE_PARTS`: the kernel's 4 KiB pages are kept as the parts of their page, and a copy that took the
+    /// page before is due again only in the parts written; our own write makes it whole (after avatarmanz
+    /// 3ead56e1's refresh test).
+    #[test]
+    fn the_parts_the_kernel_names_are_kept() {
+        PARTS_IN_TEST.set(true);
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end, page) = (p, p + 2 * PAGE, p / PAGE + 1);
+        let (taken, _) = writes(start, end, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((p + PAGE + 3 * KERNEL_PAGE + 8) as *mut u8).write(1);
+            ((p + PAGE + 9 * KERNEL_PAGE) as *mut u8).write(1);
+        }
+        let (now, written) = writes(start, end, false).expect("watched");
+        assert!(written.contains(&(page, now)));
+        let parts = parts_of(start, end);
+        let kept = parts.iter().find(|e| e.0 == page).expect("kept by its parts");
+        assert_eq!(parts_after(&kept.1, taken), 1 << 3 | 1 << 9);
+        assert_eq!(parts_after(&kept.1, now), 0);
+        wrote_own(page, &[]);
+        assert!(parts_of(start, end).iter().all(|e| e.0 != page), "written whole");
+        PARTS_IN_TEST.set(false);
+        assert!(parts_of(start, end).is_empty(), "nothing read without the switch");
+        // SAFETY: the allocation made above.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 }
 

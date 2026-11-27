@@ -4533,7 +4533,9 @@ impl Shadow {
                 let marks = skip.then_some(&marks[..]);
                 // With `VICTORY_DIRTY_4K`: the 4 KiB pages the kernel found, read before the copy's lock.
                 let subs = crate::watch::subpages(from, to);
-                let copied = self.copy_stale(from, to, now, &written, marks, &subs);
+                // With `VICTORY_PAGE_PARTS`: the askings of the pages' 4 KiB parts, read the same way.
+                let parts = crate::watch::parts_of(from, to);
+                let copied = self.copy_stale(from, to, now, &written, marks, &subs, &parts);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -4664,6 +4666,11 @@ impl Shadow {
     /// the 4 KiB pages its last asking found and the asking before that which found the page written. A copy that
     /// took the page at or after that earlier asking copies only those 4 KiB pages: the others have not been written
     /// since it took them (`crate::watch::dirty4k`).
+    ///
+    /// `parts` ([`crate::watch::parts_of`], `VICTORY_PAGE_PARTS`): for a page the kernel's write watch found written
+    /// in parts, the asking that last found each of its sixteen 4 KiB parts written. A copy that took the page before
+    /// copies only the parts written after it did (`crate::watch::parts_on`); this goes before `subs`.
+    #[allow(clippy::too_many_arguments)]
     fn copy_stale(
         &self,
         from: usize,
@@ -4672,6 +4679,7 @@ impl Shadow {
         written: &[(usize, u64)],
         marks: Option<&[(usize, u64)]>,
         subs: &[(usize, u64, u64, u16)],
+        parts: &[(usize, [u64; crate::watch::PARTS])],
     ) -> usize {
         const KERNEL_PAGE: usize = 4096;
         let narrow = !subs.is_empty() && crate::watch::dirty4k();
@@ -4682,6 +4690,7 @@ impl Shadow {
         let mut chunks = marks.map(|marks| crate::cold_skip::Chunks::new(&mut verified, pages, marks));
         let mut writes = written.iter().peekable();
         let mut subs = subs.iter().peekable();
+        let mut parts = parts.iter().peekable();
         let (mut bytes, mut run): (_, Option<usize>) = (0, None);
         let (mut walked, mut passed) = (0, 0);
         let last = (to - 1) / PAGE;
@@ -4712,6 +4721,10 @@ impl Shadow {
                 }
                 // The page's entry, if it stands for the asking the refresh was given for the page.
                 let sub = subs.peek().filter(|s| s.0 == page && s.1 == write && write != 0).map(|s| (s.2, s.3));
+                while parts.peek().is_some_and(|p| p.0 < page) {
+                    parts.next();
+                }
+                let page_parts = parts.peek().filter(|p| p.0 == page).map(|p| p.1);
                 let at = &mut copied[page - base];
                 if *at == 0 || write > *at {
                     let taken = *at;
@@ -4729,7 +4742,16 @@ impl Shadow {
                     if crate::watch::dirty4k_kept() {
                         crate::watch::dirty4k_count(found, narrow && found.is_some());
                     }
-                    if narrow && let Some(bits) = found {
+                    // `VICTORY_PAGE_PARTS`: the parts written after the copy took the page. None of them (it cannot
+                    // be, for a page noted written after that) or all of them: the page whole, as before.
+                    let found = match page_parts {
+                        Some(all) if taken != 0 => {
+                            Some(crate::watch::parts_after(&all, taken)).filter(|&bits| bits != 0 && bits != crate::watch::WHOLE)
+                        }
+                        _ if narrow => found,
+                        _ => None,
+                    };
+                    if let Some(bits) = found {
                         if let Some(first) = run.take() {
                             bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
                         }
