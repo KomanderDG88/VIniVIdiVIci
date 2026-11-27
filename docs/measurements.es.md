@@ -39,6 +39,12 @@ Copiamos los archivos del título a un SSD NVMe del mismo equipo. Estas ejecucio
 
 Las cifras que hay detrás de la tabla de Estado, de la más reciente a la más antigua. Cada una es una sesión salvo que diga otra cosa.
 
+**27 de noviembre, por la tarde: la memoria durante la carga.** Texturas originales (sin `VICTORY_TEXTURE_DROP_MIPS`), `VICTORY_HELD_LEVELS=1`, el perfil Series S, `VICTORY_RAM_TRIM=1`.
+
+- *De dónde sale el pico de la carga*, leído de las líneas de la capa en una sesión: en unos 3 s las copias en memoria de los búferes del título pasaron de 266 a 3112 MB y la memoria compartida con la tarjeta de 549 a 3825 MB; al final esas copias ocupaban 3276 MB para cubrir 1642 MB que pedía el título, redondeados a celdas enteras.
+- *Sitio para los destinos de render según lo que ocupan* (`VICTORY_CARD_ROOM_FOLLOW=1`, sin los 1536 MB fijos): una sesión de 900 s, 6,06 fps en la ventana medida, ningún hueco de textura retenido por falta de sitio.
+- *La librería de pipelines soltada con poca memoria* (`VICTORY_LIBRARY_TRIM_LOW_MB=2048`), con `VICTORY_CARD_ROOM_FOLLOW=1` y ventanas más pequeñas (`VICTORY_WINDOW_KB=256`, `VICTORY_WINDOW_TAILS=1`, `VICTORY_WINDOW_REUSE=1`): una sesión llegó al final de sus 900 s, con 427 MB libres en el peor momento y un pico de 15,6 GiB de memoria del juego, frente a 16,5 GiB en otra que paró la guarda del laboratorio durante la carga; en el mundo fue a unos 3,7 fps, con copias de memoria del título unas tres veces mayores por frame que sin las ventanas pequeñas. Lo siguiente es una pareja con y sin las ventanas pequeñas.
+
 **27 de noviembre: texturas originales en 8 GB.** El perfil Series S, los interruptores de Estado y `VICTORY_TABLED_ALL=1`, sin `VICTORY_TEXTURE_DROP_MIPS`, con `VICTORY_RAM_TRIM=1`.
 
 - *Niveles retenidos* (`VICTORY_HELD_LEVELS=1`, portado de edsuuu/VI-BR-PORT 8bb5142d, apagado por defecto; en `main` desde el 27 de noviembre): una textura que el título coloca en memoria recibe una copia en el anfitrión desde el primer nivel que muestran sus vistas, y se rehace con más niveles cuando una vista pide uno. Una sesión de 900 s con la compilación `4ed54e1e`: ningún hueco de textura retenido por falta de sitio en ninguno de 166 censos, cuando el mismo código sin él retenía unos 14 000 e iba a unos 4,2 fps; 5,90 fps en la ventana medida de la maniobra guionizada; pico de memoria del juego de 17,8 GiB. La imagen aún no está juzgada: todas las capturas de esa sesión se tomaron antes de que apareciera el mundo.

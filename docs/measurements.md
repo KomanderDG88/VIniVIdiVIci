@@ -39,6 +39,12 @@ The title's files were copied to an NVMe SSD on the same machine. These runs use
 
 The figures behind the Status table, the newest first. Each is one session unless it says otherwise.
 
+**27 November, evening: memory during the load.** Original textures (no `VICTORY_TEXTURE_DROP_MIPS`), `VICTORY_HELD_LEVELS=1`, the Series S profile, `VICTORY_RAM_TRIM=1`.
+
+- *Where the load's peak comes from*, read from the layer's lines in one session: in about 3 s the copies of title buffers held in memory grew from 266 to 3,112 MB and the memory shared with the card from 549 to 3,825 MB; at the end those copies took 3,276 MB to cover 1,642 MB the title asked for, rounded to whole cells.
+- *Room for render targets by what they take* (`VICTORY_CARD_ROOM_FOLLOW=1`, without the fixed 1,536 MB): one session of 900 s, 6.06 fps over the measured window, no texture slot held for room.
+- *The pipeline library let go under low memory* (`VICTORY_LIBRARY_TRIM_LOW_MB=2048`), with `VICTORY_CARD_ROOM_FOLLOW=1` and smaller windows (`VICTORY_WINDOW_KB=256`, `VICTORY_WINDOW_TAILS=1`, `VICTORY_WINDOW_REUSE=1`): one session ran its 900 s to the end, with 427 MB free at the lowest and a peak of 15.6 GiB of game memory, against 16.5 GiB in one stopped by the lab's guard during the load; in the world it ran at about 3.7 fps, with copies of title memory about three times larger per frame than without the smaller windows. A pair with and without the smaller windows is next.
+
 **27 November: original textures on 8 GB.** The Series S profile, the switches of Status and `VICTORY_TABLED_ALL=1`, without `VICTORY_TEXTURE_DROP_MIPS`, with `VICTORY_RAM_TRIM=1`.
 
 - *Held levels* (`VICTORY_HELD_LEVELS=1`, ported from edsuuu/VI-BR-PORT 8bb5142d, off by default; in `main` since 27 November): a texture the title places in memory gets a host copy from the first level its views show, and is remade with more levels when a view asks for one. One session of 900 s on build `4ed54e1e`: no texture slot held for want of room in any of 166 counts, where the same code without it held some 14,000 and ran at about 4.2 fps; 5.90 fps over the measured window of the scripted manoeuvre; peak game memory 17.8 GiB. The picture is not judged yet: every screenshot of that session was taken before the world appeared.
