@@ -945,30 +945,52 @@ pub fn upscale_stretch(
     output: *const std::ffi::c_void,
     render: [u32; 2],
 ) -> bool {
-    const SHADER_READ: u32 = 0x40;
-    const UNORDERED: u32 = 0x8;
     let (this, colour, output): (This, This, This) = (this.cast(), colour.cast(), output.cast());
     if this.is_null() || colour.is_null() || output.is_null() {
         return false;
     }
+    // Lists written down (`thin`): at this place of the list, when its
+    // calls are translated; the arguments are plain values. (Whether it
+    // records is known then: placed, it counts as done.)
+    if thin::on() {
+        let (colour, output) = (colour as usize, output as usize);
+        return external(
+            this,
+            Box::new(move |list: &crate::host::HostList| {
+                stretch_on(list, colour as This, output as This, render).is_some()
+            }),
+        );
+    }
     let mut done = false;
     with_state(this, |list, state| {
-        let (Some(to), Some(from), Some(host)) = (
-            crate::resource::host_resource(output),
-            crate::resource::host_resource(colour),
-            crate::host::host(),
-        ) else {
-            return;
-        };
-        ensure_state(list, colour, SHADER_READ);
-        ensure_state(list, output, UNORDERED);
-        done = crate::over::record_stretch(&host.device, &list.list, to, from, render);
-        if done {
-            crate::texture::host_written(output);
+        if let Some(recorded) = stretch_on(list, colour, output, render) {
+            done = recorded;
+            state.replay(list);
         }
-        state.replay(list);
     });
     done
+}
+
+/// [`upscale_stretch`]'s recording on host list `list`: whether it recorded,
+/// `None` if a texture has no host copy (then the list was not touched).
+#[cfg(windows)]
+pub(crate) fn stretch_on(list: &crate::host::HostList, colour: This, output: This, render: [u32; 2]) -> Option<bool> {
+    const SHADER_READ: u32 = 0x40;
+    const UNORDERED: u32 = 0x8;
+    let (Some(to), Some(from), Some(host)) = (
+        crate::resource::host_resource(output),
+        crate::resource::host_resource(colour),
+        crate::host::host(),
+    ) else {
+        return None;
+    };
+    ensure_state(list, colour, SHADER_READ);
+    ensure_state(list, output, UNORDERED);
+    let done = crate::over::record_stretch(&host.device, &list.list, to, from, render);
+    if done {
+        crate::texture::host_written(output);
+    }
+    Some(done)
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
@@ -1059,6 +1081,49 @@ fn unlike(dst: This, src: This, mapped: bool) -> bool {
 #[cfg(windows)]
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(windows)]
+thread_local! {
+    /// While a copy written down by [`thin`] is translated: what
+    /// [`crate::resource::card_will_write`] said of its destination at the
+    /// title's call, where the held levels were asked for, in the order of
+    /// the calls. Translated later, and several lists at a time, a copy of a
+    /// list sent after another's could take the place of a held copy first,
+    /// and the other list's copy would land in the copy left behind.
+    static HELD_AT_CALL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Held levels (`VICTORY_HELD_LEVELS=1`): the card is about to write texture
+/// `dst`; whether its host copy took the place of a held one. Asked at the
+/// title's call ([`HELD_AT_CALL`]).
+#[cfg(windows)]
+fn will_write(dst: This) -> bool {
+    HELD_AT_CALL.get().unwrap_or_else(|| crate::resource::card_will_write(dst))
+}
+
+/// Held levels: the card is about to read subresource `index` of `src`;
+/// already asked at the title's call if it was written down.
+#[cfg(windows)]
+fn will_read(src: This, index: Option<u32>) {
+    if HELD_AT_CALL.get().is_none() {
+        crate::resource::card_will_read(src, index);
+    }
+}
+
+/// Runs `f`, a copy written down whose held levels were asked for at the
+/// title's call: `replaced` is what [`will_write`] said then.
+#[cfg(windows)]
+fn held_at_call(replaced: bool, f: impl FnOnce()) {
+    struct Back;
+    impl Drop for Back {
+        fn drop(&mut self) {
+            HELD_AT_CALL.set(None);
+        }
+    }
+    HELD_AT_CALL.set(Some(replaced));
+    let _back = Back;
+    f();
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -1072,10 +1137,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         // made whole in place of a held copy is filled first all the same
         // (once): its upload is what makes the slots that show the old copy
         // again.
-        if crate::resource::card_will_write(dst) {
+        if will_write(dst) {
             crate::texture::fill_before_card_write(list, dst);
         }
-        crate::resource::card_will_read(src, None);
+        will_read(src, None);
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1224,11 +1289,11 @@ extern "system" fn copy_texture_region(
         // written by the card, so its host copy holds every level, filled
         // first where it was held (the copy writes one subresource); the
         // source's copy holds the level read.
-        if dst.kind != FOOTPRINT && crate::resource::card_will_write(dst.resource) {
+        if dst.kind != FOOTPRINT && will_write(dst.resource) {
             crate::texture::fill_before_card_write(list, dst.resource);
         }
         if src.kind != FOOTPRINT {
-            crate::resource::card_will_read(src.resource, Some(src.footprint.offset as u32));
+            will_read(src.resource, Some(src.footprint.offset as u32));
         }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
@@ -1486,10 +1551,10 @@ extern "system" fn resolve(
     if crate::resource::held_only()
         && let Some(list) = host_list(this)
     {
-        if crate::resource::card_will_write(dst) {
+        if will_write(dst) {
             crate::texture::fill_before_card_write(list, dst);
         }
-        crate::resource::card_will_read(src, Some(src_sub));
+        will_read(src, Some(src_sub));
     }
     #[cfg(windows)]
     if let Some(list) = host_list(this)

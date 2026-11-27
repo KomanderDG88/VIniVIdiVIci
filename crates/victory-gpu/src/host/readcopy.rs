@@ -79,8 +79,26 @@ fn level() -> u8 {
         if level == 0 {
             say_no_barriers();
         }
-        level
+        let thin = crate::list::thin::wanted();
+        let kept = clamped(level, thin);
+        if kept != level {
+            tracing::warn!(
+                asked = level,
+                kept,
+                "VICTORY_CARD_READ_COPY above 1 needs the copies of lists sent before to be recorded first; with VICTORY_THIN=1 lists are translated later and out of that order: 1"
+            );
+        }
+        kept
     })
+}
+
+/// The level kept with lists written down (`thin`, `VICTORY_THIN=1`): at
+/// most 1. Levels 2 and 3 fill on the CPU from what the copies recorded
+/// before left in title memory (`note_recent`, the flights that write a
+/// source); a list translated before one sent ahead of it would not see
+/// that list's copies yet and read the destination before their copy-back.
+fn clamped(level: u8, thin: bool) -> u8 {
+    if thin { level.min(1) } else { level }
 }
 
 /// The level that runs: the one asked for if the device has enhanced

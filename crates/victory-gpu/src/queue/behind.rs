@@ -784,6 +784,7 @@ pub(super) fn drain() {
     if OURS.get() {
         return;
     }
+    crate::list::thin::no_wait_here("the line of submissions (a drain)");
     let began = Instant::now();
     LANE.drain();
     STATS[DRAINING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -827,6 +828,7 @@ pub(super) fn submit(this: This, lists: &[This]) {
 /// Waits for room in the line, with `queued` submissions in it.
 fn room(queued: u64) {
     if queued > runs_most() as u64 {
+        crate::list::thin::no_wait_here("room in the line of submissions");
         let began = Instant::now();
         LANE.wait_runs(runs_most());
         STATS[ROOM].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -917,6 +919,7 @@ pub(super) fn present_later(
 /// After present number `put` went into the line: waits for the one before
 /// it to be sent.
 fn presented(put: u64) {
+    crate::list::thin::no_wait_here("a present in the line of submissions");
     let began = Instant::now();
     LANE.wait_presents(frames_most());
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);

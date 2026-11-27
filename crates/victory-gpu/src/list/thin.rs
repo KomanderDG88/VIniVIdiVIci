@@ -58,6 +58,18 @@ pub(crate) fn on() -> bool {
     })
 }
 
+thread_local! {
+    /// This thread translates lists ([`start`]).
+    static IN_TRANSLATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Before this thread waits for the line of submissions or for lists to be
+/// translated: never on a thread that translates them, as the line waits for
+/// those (a wait there could be for good). A panic says where, at once.
+pub(crate) fn no_wait_here(what: &str) {
+    assert!(!IN_TRANSLATE.get(), "a thread that translates lists would wait for {what}");
+}
+
 /// Whether it is asked for.
 pub(crate) fn wanted() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -332,6 +344,7 @@ impl Recording {
 
     /// Waits until it is translated.
     pub(crate) fn wait(&self) {
+        no_wait_here("a list to be translated");
         // (Not held back while someone waits.)
         self.wanted.store(true, Release);
         moved();
@@ -439,6 +452,7 @@ fn start() {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
             crate::queue::no_drain_here();
+            IN_TRANSLATE.set(true);
             loop {
                 // What was held back and is no longer, first: it is older.
                 let recording = loop {
@@ -611,10 +625,7 @@ plain! {
     DISPATCH_MESH dispatch_mesh = state::dispatch_mesh, (x: u32, y: u32, z: u32);
     DISPATCH_MESH_X dispatch_mesh_x = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
     COPY_BUFFER copy_buffer_region = super::copy_buffer_region, (dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64);
-    COPY_RESOURCE copy_resource = super::copy_resource, (dst: This, src: This);
-    COPY_RESOURCE_X copy_resource_x = super::copy_resource_x, (dst: This, src: This, flags: u32);
     COPY_MEMORY copy_memory = super::copy_memory, (dst: u64, src: u64, len: u64, flags: u32);
-    RESOLVE resolve = super::resolve, (dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32);
     RESOLVE_QUERIES resolve_queries = super::resolve_queries, (heap: This, kind: u32, first: u32, count: u32, buffer: This, offset: u64);
     BEGIN_QUERY begin_query = super::begin_query, (heap: This, kind: u32, index: u32);
     END_QUERY end_query = super::end_query, (heap: This, kind: u32, index: u32);
@@ -648,6 +659,24 @@ const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
 /// Work of ours (`super::external`), boxed.
 const EXTERNAL: u64 = after(17);
+/// Copies whose held levels are asked for at the call ([`held_at_call`]):
+/// their arguments, then what the destination's asking said.
+const COPY_RESOURCE: u64 = after(18);
+const RESOLVE: u64 = after(19);
+
+/// Held levels (`VICTORY_HELD_LEVELS=1`) of a copy, asked at the title's
+/// call, in the order of the calls, as before: the destination (if
+/// `dst_texture`) is about to be written by the card and the source's
+/// subresource `index` (if `src_texture`) read. Whether the destination's
+/// host copy took the place of a held one, carried in the stream to the
+/// copy's translation (`super::held_at_call`). Without the switch: no.
+fn held_at_call(dst: This, dst_texture: bool, src: This, src_texture: bool, index: Option<u32>) -> u64 {
+    let replaced = dst_texture && crate::resource::card_will_write(dst);
+    if src_texture {
+        crate::resource::card_will_read(src, index);
+    }
+    u64::from(replaced)
+}
 
 /// Writes down work of ours at this place of a title list's stream
 /// ([`super::external`]); gives it back if the list is not written down.
@@ -697,6 +726,25 @@ fn record(handle: u64) -> [u64; RECORD] {
 }
 const RECORD: usize = size_of::<RtvRecord>().div_ceil(8);
 
+extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return;
+    }
+    let replaced = held_at_call(dst, true, src, true, None);
+    front.put(COPY_RESOURCE, &[dst as u64, src as u64, replaced]);
+}
+extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+    copy_resource(this, dst, src);
+}
+extern "system" fn resolve(this: This, dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32) {
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return;
+    }
+    let replaced = held_at_call(dst, true, src, true, Some(src_sub));
+    front.put(RESOLVE, &[dst as u64, u64::from(dst_sub), src as u64, u64::from(src_sub), u64::from(format), replaced]);
+}
 extern "system" fn list_close(this: This) -> HRESULT {
     front(this).close();
     S_OK
@@ -851,9 +899,23 @@ extern "system" fn copy_texture_region(
         return;
     }
     let boxed = !source_box.is_null();
-    front(this).put_with(
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return;
+    }
+    const FOOTPRINT: u32 = 1;
+    // SAFETY: the title passes both locations (checked for null above).
+    let (to, from) = unsafe { (&*dst, &*src) };
+    let replaced = held_at_call(
+        to.resource,
+        to.kind != FOOTPRINT,
+        from.resource,
+        from.kind != FOOTPRINT,
+        Some(from.footprint.offset as u32),
+    );
+    front.put_with(
         COPY_TEXTURE,
-        &[u64::from(x) | u64::from(y) << 32, u64::from(z) | u64::from(boxed) << 32],
+        &[u64::from(x) | u64::from(y) << 32, u64::from(z) | u64::from(boxed) << 32 | replaced << 33],
         &[bytes_of(dst, 1), bytes_of(src, 1), bytes_of(source_box, usize::from(boxed))],
     );
 }
@@ -970,16 +1032,26 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             }
             COPY_TEXTURE => {
                 let step = size_of::<CopyLocation>().div_ceil(8);
-                let boxed = (w[1] >> 32) as usize;
-                super::copy_texture_region(
-                    list,
-                    at_or(w, 2),
-                    w[0] as u32,
-                    (w[0] >> 32) as u32,
-                    w[1] as u32,
-                    at_or(w, 2 + step),
-                    at(w, 2 + 2 * step, boxed),
-                );
+                let boxed = (w[1] >> 32 & 1) as usize;
+                super::held_at_call(w[1] >> 33 & 1 != 0, || {
+                    super::copy_texture_region(
+                        list,
+                        at_or(w, 2),
+                        w[0] as u32,
+                        (w[0] >> 32) as u32,
+                        w[1] as u32,
+                        at_or(w, 2 + step),
+                        at(w, 2 + 2 * step, boxed),
+                    )
+                });
+            }
+            COPY_RESOURCE => {
+                super::held_at_call(w[2] != 0, || super::copy_resource(list, w[0] as This, w[1] as This));
+            }
+            RESOLVE => {
+                super::held_at_call(w[5] != 0, || {
+                    super::resolve(list, w[0] as This, w[1] as u32, w[2] as This, w[3] as u32, w[4] as u32)
+                });
             }
             _ => {}
         }

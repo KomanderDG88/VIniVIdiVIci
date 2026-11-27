@@ -205,6 +205,10 @@ static HOST: OnceLock<Host> = OnceLock::new();
 struct Context {
     // Serializes recording and destruction for this particular temporal history.
     live: Mutex<bool>,
+    /// A destroy has begun ([`ffxDestroyContext`]): a dispatch recorded later
+    /// ([`dispatch_later`]) does not wait for `live`, which the destroy holds
+    /// while it waits for the submitted lists, maybe this dispatch's.
+    ending: std::sync::atomic::AtomicBool,
     first_dispatch: std::sync::Once,
     // The FFX API requires pointers in the creation descriptor to remain
     // live through destroy, including our replacement backend.
@@ -615,6 +619,7 @@ extern "C" fn ffxCreateContext(
         handle,
         Arc::new(Context {
             live: Mutex::new(true),
+            ending: std::sync::atomic::AtomicBool::new(false),
             first_dispatch: std::sync::Once::new(),
             creation: CreateChain {
                 description: upscale,
@@ -641,6 +646,7 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
         .get(&handle)
         .cloned();
     let Some(ctx) = ctx else { return PARAMETER };
+    ctx.ending.store(true, std::sync::atomic::Ordering::Release);
     let mut live = ctx.live.lock().unwrap_or_else(|e| e.into_inner());
     if !*live {
         return PARAMETER;
@@ -660,6 +666,8 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
         {
             contexts.remove(&handle);
         }
+    } else {
+        ctx.ending.store(false, std::sync::atomic::Ordering::Release);
     }
     code
 }
@@ -778,6 +786,12 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
             "FidelityFX rejected dispatch dimensions outside the context's allocations");
         return stretch_instead(&title, PARAMETER);
     };
+    // Lists written down (`VICTORY_THIN=1`): recorded when the list's calls
+    // are translated, on a thread of ours.
+    if victory_gpu::external::later(title.list) {
+        drop(live);
+        return dispatch_later(host, context, ctx, title, output_size);
+    }
     let mut dispatch = title;
     let recorded = victory_gpu::external::record(title.list, |list| {
         record_dispatch(list, host, context, &ctx, &mut dispatch, output_size)
@@ -790,6 +804,87 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
             once!(warn, "FidelityFX could not record to the title command list");
             stretch_instead(&title, PARAMETER)
         }
+    }
+}
+
+/// What a dispatch recorded later takes along: plain copies of the title's
+/// description and of its context's handle.
+struct Later {
+    dispatch: DispatchUpscale,
+    handle: usize,
+}
+
+// SAFETY: plain values; the pointers in them name the title's command list
+// and textures (alive until the list has run) and the provider's context
+// (alive until its destroy, which is looked at before it is used).
+unsafe impl Send for Later {}
+
+/// The upscaling of a title list whose calls are written down: the work is
+/// written down at its place (`victory_gpu::external::record_later`) with
+/// copies of what it reads, and done on the list of ours the calls are
+/// translated on. The title is told it went; what does not reach the
+/// provider then is stretched instead, as [`stretch_instead`] does, and a
+/// provider's refusal is logged by [`record_dispatch`].
+fn dispatch_later(
+    host: &'static Host,
+    context: *mut *mut c_void,
+    ctx: Arc<Context>,
+    title: DispatchUpscale,
+    output_size: [u32; 2],
+) -> u32 {
+    let mut dispatch = title;
+    if !dispatch.header.next.is_null() {
+        // (The title's chained descriptions need not live until then.)
+        once!(warn, "FidelityFX: a dispatch recorded later leaves out the descriptions chained to it");
+        dispatch.header.next = null_mut();
+    }
+    // SAFETY: the title passes its context slot, read at the call.
+    let later = Later { dispatch, handle: unsafe { *context } as usize };
+    let (colour, output, render) =
+        (title.resources[0].resource as usize, title.resources[6].resource as usize, title.render_size);
+    let placed = victory_gpu::external::record_later(title.list, move |list| {
+        // (The whole of it is taken along, not its fields one by one.)
+        let later = later;
+        let Later { mut dispatch, handle } = later;
+        let stretch = || list.stretch(colour as *const c_void, output as *const c_void, render);
+        let Some(live) = live_later(&ctx) else {
+            return stretch();
+        };
+        let mut slot = handle as *mut c_void;
+        let recorded = record_dispatch(list, host, &raw mut slot, &ctx, &mut dispatch, output_size);
+        drop(live);
+        match recorded {
+            Some(_) => true,
+            None => {
+                once!(warn, "FidelityFX: an upscaling recorded later could not reach the provider; stretched instead");
+                stretch();
+                true
+            }
+        }
+    });
+    if placed { OK } else { stretch_instead(&title, PARAMETER) }
+}
+
+/// The context's lock for a dispatch recorded later, on a thread of ours;
+/// `None` once its destroy has begun (which holds the lock while it waits
+/// for the lists submitted, perhaps for the one this thread translates) or
+/// it is gone. Another such dispatch of the context holds the lock only
+/// while it records.
+fn live_later(ctx: &Context) -> Option<std::sync::MutexGuard<'_, bool>> {
+    use std::sync::TryLockError;
+    loop {
+        if ctx.ending.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let live = match ctx.live.try_lock() {
+            Ok(live) => live,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                std::thread::yield_now();
+                continue;
+            }
+        };
+        return (*live).then_some(live);
     }
 }
 
