@@ -817,6 +817,42 @@ mod sent_runs_tests {
     }
 }
 
+/// Copies of memory (from, to, bytes: apart), on several threads if they are
+/// many (`crate::host::send`).
+pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
+    let bytes: usize = copies.iter().map(|c| c.2).sum();
+    if bytes > 4 << 20 {
+        wide(copy_jobs(copies));
+        return;
+    }
+    for (src, dst, len) in copies {
+        // SAFETY: the caller's ranges.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+    }
+}
+
+/// With `VICTORY_SEND_OWN=1`: a title buffer copy was done on the CPU into
+/// `[dst, dst + len)`: all of it goes up to the copies in the card's memory
+/// that hold it, whether their CPU side held the same before or not (the
+/// card side may hold another submission's value there). Left out is what
+/// shaders in the air may be writing (such a copy waits for them, or is
+/// done on the card).
+pub(crate) fn send_copied(dst: usize, len: usize) {
+    let carded: Vec<Arc<Shadow>> = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect();
+    for shadow in carded {
+        let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+        let (from, to) = (dst.max(start), (dst + len).min(end));
+        if from >= to {
+            continue;
+        }
+        let busy: Vec<(usize, usize)> =
+            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+        for (a, b) in outside(from, to, busy) {
+            shadow.copy_all_up(a, b);
+        }
+    }
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
@@ -5053,6 +5089,29 @@ impl Shadow {
             crate::ram_trim::maybe_shrink_scratch_vec(&mut now, n, 8 * crate::ram_trim::MIB);
             true
         })
+    }
+
+    /// [`send_copied`]: title memory `[from, to)`, cut to the buffer, into
+    /// the copy's CPU side, and all of it noted for the card, as
+    /// [`Shadow::copy`] does without its ways of sending less (only what
+    /// changed, windows that hold the same).
+    fn copy_all_up(&self, from: usize, to: usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return;
+        }
+        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+        let at = unsafe { self.data.add(from - start) };
+        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        self.changed(from - start, to - start);
+        self.card_changed(from - start, to - start);
+    }
+
+    /// Of a copy in the card's memory: where its CPU side is
+    /// (`crate::host::send`).
+    pub(crate) fn card_data(&self) -> *const u8 {
+        self.data
     }
 
     /// Whether shaders read and write this copy in the card's own memory

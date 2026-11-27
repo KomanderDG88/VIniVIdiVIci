@@ -3004,6 +3004,9 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
+    /// With [`send`] (`VICTORY_SEND_OWN=1`): the memory its sends come
+    /// from, kept until the submission has run.
+    sends: Option<send::Memory>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -4827,6 +4830,17 @@ fn late_line(frames: f64) {
     fill_ahead::line(frames);
     card_steps::log(frames);
     crate::port::log(frames);
+    if send::own() {
+        let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN=1): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
+             taking them out of the CPU sides",
+            t[0] / (1 << 20) as f64,
+            t[1],
+            t[2],
+            t[3] / 1000.0,
+        );
+    }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4945,6 +4959,7 @@ fn late_line(frames: f64) {
 pub(crate) mod awake;
 mod card_steps;
 mod merging;
+mod send;
 pub(crate) use merging::{merge_fence_asked, merge_send, merge_signal, merge_wait};
 
 #[cfg(test)]
@@ -5644,12 +5659,18 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // With `VICTORY_SEND_OWN=1` ([`send`]): the bytes as they are now,
+        // whatever later submissions put there, in memory of this
+        // submission's own; the card copies them from there, and neither
+        // the CPU sides nor the copy queue's landing are read. Unset: None,
+        // and everything below is as before.
+        let own = if send::own() { send::take(self, &dirty) } else { None };
         // The changed bytes through the copy queue (`VICTORY_QUEUE2` bit
         // 2): the landing buffer they are in, in the order of `dirty`'s
         // ranges, once the direct queue has waited. `None`: straight from
         // the PC's memory on the direct queue, as before.
         let mut landed: Option<ID3D12Resource> = None;
-        if let Some(second) = crate::queue2::second().filter(|s| s.uploads()) {
+        if let Some(second) = crate::queue2::second().filter(|s| s.uploads() && own.is_none()) {
             let bytes: u64 = dirty
                 .iter()
                 .filter(|(shadow, _)| shadow.carded())
@@ -5726,9 +5747,10 @@ impl Host {
                     // the declared pieces and flags those whose hash is another.
                     let hashes = |list: &ID3D12GraphicsCommandList, group: &[Synced]| {
                         // (a copy promoted the buffer to a copy destination)
+                        // (With `own` its record left them readable.)
                         let moves: Vec<_> = group
                             .iter()
-                            .filter(|w| w.before.is_some() && !w.ranges.is_empty())
+                            .filter(|w| own.is_none() && w.before.is_some() && !w.ranges.is_empty())
                             .map(|w| transition(&w.shadow.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
                             .collect();
                         if !moves.is_empty() {
@@ -5758,7 +5780,7 @@ impl Host {
                             // sends up hundreds of short ranges a frame,
                             // several in one 64 KiB piece, and each had a
                             // pass of its own over that piece.
-                            let runs = if rehash_runs() || card_steps::stage() > 0 {
+                            let runs = if rehash_runs() || card_steps::stage() > 0 || own.is_some() {
                                 crate::shadow::joined_piece_runs(runs)
                             } else {
                                 runs
@@ -5772,12 +5794,16 @@ impl Host {
                             }
                         }
                     };
+                    if let Some(own) = &own {
+                        own.record(self, list, &dirty);
+                    }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
                         for &(a, b) in ranges {
                             match &landed {
+                                _ if own.is_some() => {}
                                 Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
                                 None => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
                             }
@@ -5822,6 +5848,7 @@ impl Host {
             sent_as,
             inflight: false,
             inflight_landed: 0,
+            sends: own.map(send::Own::memory),
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5997,6 +6024,9 @@ impl Host {
         };
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
+        }
+        if let Some(memory) = plan.sends {
+            send::give_back(memory);
         }
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results

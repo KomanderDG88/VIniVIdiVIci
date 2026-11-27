@@ -1507,6 +1507,11 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    // With `VICTORY_SEND_OWN=1`: what the card holds there
+                    // may be another value although ours did not change.
+                    if super::send::own() {
+                        crate::shadow::send_copied(dst, len);
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len, _) => {
