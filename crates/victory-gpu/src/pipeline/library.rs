@@ -251,6 +251,30 @@ pub(crate) static TRIMMED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// often and when a save of this run last renamed a new library over the
 /// mapped file: for [`removal_note`].
 static TRIMMED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Trims made under low memory (`VICTORY_LIBRARY_TRIM_LOW_MB`).
+static LOW_TRIMS: AtomicU64 = AtomicU64::new(0);
+
+/// The least time between two trims under low memory.
+const LOW_EVERY_MS: u64 = 2_000;
+
+/// `VICTORY_LIBRARY_TRIM_LOW_MB`, if set to a number above 0.
+fn low_mb() -> Option<u64> {
+    static MB: OnceLock<Option<u64>> = OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_LIBRARY_TRIM_LOW_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&mb| mb > 0)
+    })
+}
+
+/// Whether a trim under low memory is due: the switch set, the available
+/// memory known and under it, and the last trim at least [`LOW_EVERY_MS`]
+/// ago. Unset: never.
+fn low_due(now: u64, avail: Option<u64>, low_mb: Option<u64>, last_trim_at: u64) -> bool {
+    match (low_mb, avail) {
+        (Some(mb), Some(avail)) => avail < mb << 20 && (last_trim_at == 0 || now >= last_trim_at + LOW_EVERY_MS),
+        _ => false,
+    }
+}
 static REPLACED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The library calls running now: thread, what (load, make, store,
@@ -372,6 +396,14 @@ pub(crate) fn removal_note() -> String {
 /// Called once a second by the sweep; does its work on a thread of its own
 /// (hundreds of thousands of pages), once after each burst of loads.
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
+///
+/// `VICTORY_LIBRARY_TRIM_LOW_MB=<n>` (off by default): while the PC's
+/// available memory is under `n` MB the pages go even while pipelines keep
+/// loading, at most once every [`LOW_EVERY_MS`]. The world's load makes the
+/// title's buffer shadows grow by gigabytes in seconds while the early
+/// pipelines still load, so the quiet wait never ends then: run 202755 hit
+/// 255 MB free and the lab's guard; run 200803 made the same climb and
+/// lived because the quiet wait happened to end at its top (+1.7 GB).
 pub(crate) fn trim() {
     static ON: OnceLock<bool> = OnceLock::new();
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
@@ -381,11 +413,28 @@ pub(crate) fn trim() {
     {
         return;
     }
-    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
-        || TRIMMED.swap(true, Ordering::Relaxed)
+    let avail = crate::host::available_physical_ram();
+    let now = crate::host::now_ms();
+    let quiet_ms = crate::host::ram_idle_ms(avail);
+    let low = low_due(now, avail, low_mb(), TRIMMED_AT.load(Ordering::Relaxed));
+    if !low
+        && (now < LOADED_AT.load(Ordering::Relaxed) + quiet_ms || TRIMMED.load(Ordering::Relaxed))
     {
         return;
+    }
+    if TRIMMED.swap(true, Ordering::Relaxed) && !low {
+        return;
+    }
+    if low {
+        // Claimed now, so that the next sweep does not start another.
+        TRIMMED_AT.store(now, Ordering::Relaxed);
+        let n = LOW_TRIMS.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(
+            "pipeline library: its mapped pages let go while pipelines still load, the PC's available memory              being {} MB, under {} MB (VICTORY_LIBRARY_TRIM_LOW_MB; {} MB of view; {n} such so far)",
+            avail.unwrap_or(0) >> 20,
+            low_mb().unwrap_or(0),
+            len >> 20,
+        );
     }
     let work = move || {
         // SAFETY: the view lives as long as the library, which is never
@@ -767,6 +816,25 @@ pub(crate) fn note_used(key: &str) {
     let set = used.get_or_insert_with(HashSet::new);
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod low_trim_tests {
+    use super::low_due;
+
+    #[test]
+    fn a_trim_under_low_memory_is_due_only_with_the_switch_and_its_pace() {
+        let mb = 1u64 << 20;
+        // Unset, or the memory unknown: never.
+        assert!(!low_due(10_000, Some(100 * mb), None, 0));
+        assert!(!low_due(10_000, None, Some(2048), 0));
+        // Above the line: not due.
+        assert!(!low_due(10_000, Some(3000 * mb), Some(2048), 0));
+        // Under it: due, the first time and again 2 s after the last.
+        assert!(low_due(10_000, Some(1000 * mb), Some(2048), 0));
+        assert!(!low_due(10_000, Some(1000 * mb), Some(2048), 9_000));
+        assert!(low_due(11_000, Some(1000 * mb), Some(2048), 9_000));
     }
 }
 
