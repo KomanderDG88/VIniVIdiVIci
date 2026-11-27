@@ -1431,6 +1431,12 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// The next [`HostList::first_use`] of `key` is a first one again: its
+    /// host copy was replaced (`crate::resource::card_will_write`).
+    pub(crate) fn use_again(&self, key: usize) {
+        self.deferred().textures.remove(&key);
+    }
+
     pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
         let view = view.as_raw() as usize;
         let source = source.as_raw() as usize;

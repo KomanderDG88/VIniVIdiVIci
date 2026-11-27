@@ -4756,7 +4756,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
                 if let Some(d) = desc.as_mut() {
-                    shift_view_levels(crate::resource::dropped(resource), d);
+                    // With held levels (`crate::resource::held_only`), by
+                    // the level count of the copy in hand: a copy with more
+                    // levels may have taken its place since it was handed
+                    // out (`crate::resource::want_level`), and the view
+                    // must fit the copy it is made of.
+                    let drop = if crate::resource::held_only() {
+                        crate::resource::copy_dropped(resource, texture)
+                    } else {
+                        crate::resource::dropped(resource)
+                    };
+                    shift_view_levels(drop, d);
                 }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
@@ -4954,6 +4964,10 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
+    // Held levels (`VICTORY_HELD_LEVELS=1`): a copy without the level this
+    // view starts at is replaced by one with it. After edsuuu/VI-BR-PORT
+    // 8bb5142d.
+    crate::resource::want_level(texture, crate::resource::first_mip(desc));
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
