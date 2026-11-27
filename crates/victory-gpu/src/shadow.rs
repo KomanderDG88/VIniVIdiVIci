@@ -2911,11 +2911,11 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 
 /// [`dword_runs`] with no gap, the fast way where it can be: a frame compares
 /// 12 MB this way and finds 80,000 runs (VI-BR-PORT's measure).
-fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+fn under_word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
     if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
-        return unsafe { word_runs_avx2(title, held) };
+        return unsafe { under_word_runs_avx2(title, held) };
     }
     dword_runs(at, title, held, 0)
 }
@@ -2924,7 +2924,7 @@ fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
 /// AVX2, and two slices of one length, whole words.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn word_runs_avx2(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+unsafe fn under_word_runs_avx2(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     use std::arch::x86_64::*;
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut push = |from: usize, len: usize| match runs.last_mut() {
@@ -3115,7 +3115,7 @@ fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_bytes, changed_runs_wide, dword_runs, word_runs};
+    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_bytes, changed_runs_wide, dword_runs, under_word_runs};
 
     #[test]
     fn word_runs_are_the_dword_runs() {
@@ -3140,7 +3140,7 @@ mod merge_tests {
                     *b = random() as u8;
                 }
             }
-            assert_eq!(word_runs(0x1000, &now, &was), dword_runs(0x1000, &now, &was, 0), "round {round}");
+            assert_eq!(under_word_runs(0x1000, &now, &was), dword_runs(0x1000, &now, &was, 0), "round {round}");
         }
     }
 
@@ -4704,7 +4704,7 @@ impl Shadow {
                     // as pairs, all of them in one dispatch: only what is a
                     // copy of its own counts (`crate::host::words_under`).
                     let words = crate::host::words_under();
-                    let runs = if words { word_runs(lo, title, held) } else { joined_over(changed_runs(title, held), merge_gap()) };
+                    let runs = if words { under_word_runs(lo, title, held) } else { joined_over(changed_runs(title, held), merge_gap()) };
                     let copies = if words {
                         runs.iter().filter(|&&(r, m)| !crate::host::goes_as_words(at + r, m)).count()
                     } else {
@@ -4857,7 +4857,7 @@ impl Shadow {
             // SAFETY: inside the mapping of the copy's CPU side; the caller's.
             let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
             let words = crate::host::words_under();
-            let runs = if words { word_runs(lo, title, held) } else { joined_over(changed_runs(title, held), merge_gap()) };
+            let runs = if words { under_word_runs(lo, title, held) } else { joined_over(changed_runs(title, held), merge_gap()) };
             let copies = if words {
                 runs.iter().filter(|&&(r, m)| !crate::host::goes_as_words(at + r, m)).count()
             } else {
