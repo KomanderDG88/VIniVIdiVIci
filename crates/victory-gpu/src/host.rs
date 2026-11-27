@@ -4960,6 +4960,7 @@ pub(crate) mod awake;
 mod card_steps;
 mod merging;
 mod send;
+pub(crate) use send::{goes_as_words, words_under};
 pub(crate) use merging::{merge_fence_asked, merge_send, merge_signal, merge_wait};
 
 #[cfg(test)]
