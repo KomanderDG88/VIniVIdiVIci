@@ -404,7 +404,9 @@ fn map_one(r: &mut Record, page: usize) -> bool {
         entry.viewed = true;
         // Its section page can be stored to through this view from now on
         // with no fault: the copies that took it untouched take it again
-        // (before the faulting store goes on, under the record's lock).
+        // (before the faulting store goes on, under the record's lock). The
+        // page's other addresses the caller tells once the lock is let go
+        // ([`tell_viewed`]).
         r.gens.touched(entry.key());
     }
     count(C::TouchViews, 1);
@@ -434,7 +436,27 @@ fn touch(at: usize, write: bool) -> Touch {
         // made read-only is the guard's.
         return if allowed(at, write) { Touch::Allowed } else { Touch::No };
     }
-    if map_one(&mut r, page) { Touch::Mapped } else { Touch::No }
+    let mapped = map_one(&mut r, page);
+    drop(r);
+    if !mapped {
+        return Touch::No;
+    }
+    tell_viewed(&[page]);
+    Touch::Mapped
+}
+
+/// Recorded pages [`map_one`] has just given views, for the GPU side's
+/// guards, before the store that faulted (or the system call's write) goes
+/// on: their section pages can be stored to through those views now with
+/// no fault of ours, so every other address of each (a guarded view
+/// counted clean, a recorded page counted untouched) is told written
+/// (`victory_gpu::title_memory_viewed`). The [`Gens`] bump alone reached
+/// the untouched recorded pages only. Called with the record's lock let go:
+/// the guards' lock comes before it.
+fn tell_viewed(pages: &[usize]) {
+    for &page in pages {
+        victory_gpu::title_memory_viewed(page, PAGE);
+    }
 }
 
 /// Whether the memory at `at` allows the access now.
@@ -567,7 +589,17 @@ pub(crate) fn materialize(at: usize, len: usize) -> bool {
     let (first, end) = (at & !(PAGE - 1), at.saturating_add(len));
     let mut r = record();
     let due: Vec<usize> = r.pages.range(first..end).filter(|(_, e)| !e.viewed).map(|(&p, _)| p).collect();
-    due.into_iter().all(|page| map_one(&mut r, page))
+    let mut viewed = Vec::with_capacity(due.len());
+    let all = due.into_iter().all(|page| {
+        let mapped = map_one(&mut r, page);
+        if mapped {
+            viewed.push(page);
+        }
+        mapped
+    });
+    drop(r);
+    tell_viewed(&viewed);
+    all
 }
 
 /// The section page `at` shows, eager view or recorded page.

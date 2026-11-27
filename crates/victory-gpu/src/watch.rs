@@ -976,7 +976,8 @@ struct Guards {
 /// views [`hold_untouched`] has made read-only), our writes and the
 /// kernel's ([`writing`], [`recorded_written`]), the runtime's writes into
 /// physical pages ([`title_memory_written`]), a view of the page mapped
-/// ([`views_mapped`]) and a mapping changed there
+/// ([`views_mapped`]), a recorded page of it given one
+/// ([`title_memory_viewed`]) and a mapping changed there
 /// ([`title_memory_remapped`]). Without the switch it stays empty, and
 /// every answer is as before.
 struct Untouched(BTreeMap<usize, u64>);
@@ -2730,6 +2731,45 @@ pub(crate) fn recorded_written(at: usize, len: usize) {
     g.untouched.forget(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
 }
 
+/// The runtime has just given the recorded pages of `[at, at + len)` a view
+/// (`VICTORY_LAZY_REMAP=1`, `victory-hle` xmem's `lazy::map_one`: the
+/// processor touched one, or a system call is to write it), read-write,
+/// before the access goes on. While a page was a placeholder no guard
+/// could make it read-only ([`protect_alias`] fails there), so a block at
+/// another address of the same section page may stand clean, and what is
+/// stored through the new view would never reach it: its copies would keep
+/// the bytes from before. Every address of each page (the page's own, every
+/// other view, every other recorded page, however many) is opened and
+/// noted written: not clean, not untouched ([`Untouched`]), as a write
+/// fault at an aliased block opens them all ([`open`]). Called with the
+/// runtime's record let go (the guards' lock is taken before it, in
+/// [`guard_run`]); the guards' lock is never held over an access to title
+/// memory, as the write fault's handler takes it too.
+pub fn title_memory_viewed(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, end) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    for block in first..end {
+        let mut shown: Vec<usize> =
+            crate::inplace::pages_of(block * BLOCK).iter().map(|&at| at / BLOCK).collect();
+        if !shown.contains(&block) {
+            shown.push(block);
+        }
+        for alias in shown {
+            // The light refresh: no view of the page is known by its bit
+            // once one of them can be written (as in [`open`]).
+            if light_kept() {
+                PUBLISHED.clear(alias);
+            }
+            open_here(&mut g, alias * BLOCK, (alias * BLOCK).saturating_add(BLOCK));
+            g.clean.remove(&alias);
+            g.aliased.remove(&alias);
+        }
+    }
+}
+
 /// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
 /// not see once its bytes are there ([`title_memory_written`]), as bits:
 /// 1, the guarded blocks under it are opened and count as written (host
@@ -3649,6 +3689,9 @@ pub(crate) mod tests {
         let fourth = map(3);
         assert_eq!(guard_at(from, to, 1_101, 0), Some(pages(3).collect()));
         assert_eq!(guard_at(from, to, 1_101, KEEP), Some(Vec::new()));
+        // Told before the memory goes: told after, it would wipe what a
+        // test running beside this one guards where its fresh views land.
+        title_memory_remapped(p, 4 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             for view in [first, second, third, fourth] {
@@ -3659,7 +3702,6 @@ pub(crate) mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 4 * BLOCK);
     }
 
     /// A pagefile section mapped twice: two views of the same physical
@@ -3686,6 +3728,11 @@ pub(crate) mod tests {
             let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
             assert_ne!(one, 0);
             assert_ne!(two, 0);
+            // Told mapped first, as the runtime does: whatever another test
+            // left noted where the views landed (memory it let go without a
+            // word) is forgotten, and this test's state is its own.
+            title_memory_remapped(one, bytes);
+            title_memory_remapped(two, bytes);
             crate::inplace::title_memory_view(one, bytes, section as usize, 0);
             crate::inplace::title_memory_view(two, bytes, section as usize, 0);
             (section as usize, one, two)
@@ -3881,6 +3928,49 @@ pub(crate) mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
         REST_IN_TEST.set(std::time::Duration::ZERO);
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// `VICTORY_LAZY_REMAP=1`: another address of a section page whose view
+    /// here stands clean, a recorded page, is given a view by the runtime
+    /// (the processor touched it). Stores through that view fault nowhere;
+    /// told (`title_memory_viewed`, before the store goes on), the clean
+    /// view is reported written at its next check, and a recorded page of
+    /// the section page noted untouched is so no longer. The recorded page
+    /// is played by the second view made writable by hand, as the runtime's
+    /// fresh view is. The state is the test's own: its fresh addresses.
+    #[test]
+    fn a_recorded_page_given_a_view_has_every_other_address_written() {
+        use windows_sys::Win32::System::Memory::VirtualProtect;
+        let (section, clean, recorded) = two_views(BLOCK);
+        let page = clean / PAGE;
+        assert_eq!(guard(clean, clean + BLOCK), Some(vec![page]));
+        assert_eq!(guard(clean, clean + BLOCK), Some(Vec::new()), "clean");
+        let mapped = || {
+            let mut old = 0;
+            // SAFETY: our view; only its protection changes.
+            let set = unsafe { VirtualProtect(recorded as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            assert_ne!(set, 0);
+        };
+        // Mapped and stored to with no word: nothing sees it (the hole the
+        // runtime's word closes).
+        mapped();
+        // SAFETY (all): our view, writable.
+        unsafe { ((recorded + 8) as *mut u8).write(1) };
+        assert_eq!(guard(clean, clean + BLOCK), Some(Vec::new()), "unseen without a word");
+        // Told, as the runtime does once the view stands.
+        guards().untouched.note(clean / BLOCK, 1);
+        mapped();
+        title_memory_viewed(recorded, BLOCK);
+        assert!(!guards().untouched.holds(clean / BLOCK), "untouched no longer");
+        assert!(writable(clean) && writable(recorded), "every address opened");
+        unsafe { ((recorded + 8) as *mut u8).write(2) };
+        assert_eq!(guard(clean, clean + BLOCK), Some(vec![page]), "the clean view is written");
+        assert_eq!(guard(clean, clean + BLOCK), Some(Vec::new()));
+        // Guarded together again now: a store through the view faults, and
+        // reaches the other address as any aliased write does.
+        unsafe { ((recorded + 8) as *mut u8).write(3) };
+        assert_eq!(guard(clean, clean + BLOCK), Some(vec![page]));
+        drop_views(section, &[clean, recorded], BLOCK);
     }
 
     /// A page shown in more than `MANY_VIEWS` views is guarded at each by
@@ -4268,6 +4358,9 @@ pub(crate) mod tests {
         assert_eq!(guard_at(plain, plain + BLOCK, 50, u64::MAX), Some(Vec::new()), "the note is 48 ms old");
         assert_eq!(guard_at(plain, plain + BLOCK, 2 + UNSURE_MS, u64::MAX), Some(vec![plain / PAGE]), "the note is old");
         title_memory_remapped(plain, BLOCK);
+        // Before the memory goes, as in
+        // `a_block_noted_uncommitted_is_asked_about_again_only_when_its_note_is_old`.
+        title_memory_remapped(p, 4 * BLOCK);
         // SAFETY: our views, placeholder and reservation.
         unsafe {
             VirtualFree(plain as *mut _, 0, MEM_RELEASE);
@@ -4279,7 +4372,6 @@ pub(crate) mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 4 * BLOCK);
     }
 
     /// A copy has nothing new to take of a range known by its bits when it
