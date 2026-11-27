@@ -195,11 +195,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         let frame = crate::frame::current();
         // The first 600 frames (loading) make theirs whatever it costs; later
         // frames only while they are under `compute_cap`.
-        let early = frame < 600;
-        if p.graphics.is_none() && (early || (compute_waits() && compute_room(frame))) {
+        let capped = compute_cap().is_some();
+        let early = capped && frame < 600;
+        if p.graphics.is_none() && (early || (compute_waits() && (!capped || compute_room(frame)))) {
             let began = std::time::Instant::now();
             p.make();
-            if !early {
+            if capped && !early {
                 compute_spent(frame, began.elapsed());
             }
         } else {
@@ -255,14 +256,16 @@ fn compute_waits() -> bool {
 /// over by the makes already started on other threads (seconds each):
 /// `VICTORY_PIPELINE_COMPUTE_WAIT_MS`, 8,000 by default, leaves room for
 /// that under the watchdog's 30 s.
-fn compute_cap() -> std::time::Duration {
-    static MS: OnceLock<u64> = OnceLock::new();
-    std::time::Duration::from_millis(*MS.get_or_init(|| {
-        std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_MS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(8_000)
-    }))
+///
+/// Here the cap is off unless the variable is set (`=8000` as upstream's
+/// default): unset, a dispatch makes its compute pipeline whatever it costs,
+/// as before, and the first-600-frames rule below does not apply either.
+fn compute_cap() -> Option<std::time::Duration> {
+    static MS: OnceLock<Option<u64>> = OnceLock::new();
+    MS.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok())
+    })
+    .map(std::time::Duration::from_millis)
 }
 
 /// The frame whose compute waits are counted, and the microseconds counted.
@@ -274,13 +277,14 @@ fn compute_room(frame: u64) -> bool {
     if w.0 != frame {
         *w = (frame, 0);
     }
-    let room = u128::from(w.1) < compute_cap().as_micros();
+    let Some(cap) = compute_cap() else { return true };
+    let room = u128::from(w.1) < cap.as_micros();
     if !room {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 frame,
-                cap_ms = u64::try_from(compute_cap().as_millis()).unwrap_or(u64::MAX),
+                cap_ms = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX),
                 "a frame waited its cap for compute pipelines; the rest wait within its budget (said once)"
             );
         }
